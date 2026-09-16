@@ -625,6 +625,31 @@ async fn run_connect(o: ConnectOpts) -> i32 {
         ..Default::default()
     });
 
+    // Provider identities (002 FR-003/004/005): reuse healthy stored
+    // identities, auto-register when none is stored, refresh-or-reregister
+    // once on refusal, rotate in-window MASQUE credentials. Fail-closed
+    // (exit 2) when the provider is unreachable or refuses.
+    let id_opts = qcore_core::identity::register::ProviderOptions {
+        provider_base: qcore_core::identity::register::DEFAULT_PROVIDER_BASE.to_string(),
+        timeout_secs: 20,
+        family: o.family.clone(),
+    };
+    match engine.preconnect_identity(&specs, &id_opts, None).await {
+        Ok(Some(notice)) => {
+            if !o.globals_quiet {
+                eprintln!("qcore: {notice}");
+            }
+        }
+        Ok(None) => {}
+        Err(report) => {
+            if o.json {
+                println!("{}", report.to_json());
+            }
+            eprintln!("qcore: identity unavailable: {}", report.cause);
+            return report.exit_code();
+        }
+    }
+
     // Obfuscation chain-default (US5 T073 `-O`): hops without an explicit
     // `obfuscation=` key inherit the profile; validation names mismatches.
     if let Some(profile) = o.obfuscation.as_deref() {

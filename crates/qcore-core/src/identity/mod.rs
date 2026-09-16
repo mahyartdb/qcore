@@ -10,6 +10,7 @@
 
 pub mod gool;
 pub mod https;
+pub mod inject;
 pub mod masque;
 pub mod model;
 pub mod register;

@@ -44,6 +44,10 @@ pub struct BringUpMaterials<'a> {
     /// US5 obfuscation applications per hop id.
     pub obfuscation:
         &'a std::collections::HashMap<String, crate::config::obfuscation::ObfApplication>,
+    /// 002 identity material per hop id (stored identities + cached
+    /// endpoints for warp/masque hops).
+    pub identities:
+        &'a std::collections::HashMap<String, crate::identity::inject::IdentityMaterial>,
 }
 
 /// Bring up every hop in declared order before `deadline`
@@ -92,6 +96,14 @@ pub async fn bring_up(
         fcfg.fields.insert("hop_id".into(), spec.id.clone());
         // US2: explicit chain values win; import material fills the rest.
         if let Some(material) = materials.imports.get(&spec.id) {
+            for (k, v) in &material.fields {
+                fcfg.fields.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+        }
+        // 002: registered identity + cached endpoint material fills
+        // whatever is still unset (endpoint/keys for warp hops, endpoint
+        // for masque hops); chain and imports still win.
+        if let Some(material) = materials.identities.get(&spec.id) {
             for (k, v) in &material.fields {
                 fcfg.fields.entry(k.clone()).or_insert_with(|| v.clone());
             }

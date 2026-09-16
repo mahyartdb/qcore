@@ -173,6 +173,15 @@ impl Engine {
                 "validation",
             )
         })?;
+        // 002: merge stored identities + cached endpoints into warp/masque
+        // hops (in memory only). Fail-closed naming the hop and the fix
+        // before any socket opens.
+        let identities =
+            crate::identity::inject::materials_for_chain(&self.config.dirs, &chain.hops).map_err(
+                |(hop_id, msg)| {
+                    FailureReport::new(FailureLayer::Validation, hop_id, msg, "identity")
+                },
+            )?;
         let started = lifecycle::bring_up(
             &self.registry,
             &chain,
@@ -183,6 +192,7 @@ impl Engine {
             lifecycle::BringUpMaterials {
                 imports: &imports,
                 obfuscation: &obfuscation,
+                identities: &identities,
             },
         )
         .await?;

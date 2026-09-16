@@ -1,0 +1,10 @@
+[package]
+name = "qcore"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+qcore-core = { path = "../qcore-core" }
+qcore-transport-api = { path = "../qcore-transport-api" }
+

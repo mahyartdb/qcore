@@ -1,0 +1,15 @@
+[package]
+name = "qcore-transport-wireguard"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+qcore-transport-api = { path = "../../qcore-transport-api" }
+async-trait = { workspace = true }
+boringtun = { workspace = true }
+getrandom = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

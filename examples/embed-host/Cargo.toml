@@ -1,0 +1,11 @@
+[package]
+name = "embed-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+qcore = { path = "../../crates/qcore" }
+# The host links the transports it embeds; mock keeps this example offline.
+qcore-transports = { path = "../../crates/qcore-transports", default-features = false, features = ["mock"] }
+tokio = { workspace = true }

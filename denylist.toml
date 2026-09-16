@@ -1,0 +1,26 @@
+# cargo-deny policy (T004): pinned deps + provenance bans.
+[graph]
+targets = [
+  { triple = "i686-pc-windows-msvc" },
+  { triple = "x86_64-pc-windows-msvc" },
+  { triple = "aarch64-pc-windows-msvc" },
+  { triple = "x86_64-unknown-linux-gnu" },
+  { triple = "i686-unknown-linux-gnu" },
+  { triple = "aarch64-unknown-linux-gnu" },
+  { triple = "armv7-unknown-linux-gnueabihf" },
+  { triple = "aarch64-linux-android" },
+  { triple = "armv7-linux-androideabi" },
+]
+
+[licenses]
+allow = ["MIT", "Apache-2.0", "ISC", "BSD-2-Clause", "BSD-3-Clause", "Unicode-DFS-2016", "CC0-1.0"]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "deny"
+wildcards = "deny"
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

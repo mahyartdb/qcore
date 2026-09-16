@@ -1,0 +1,3 @@
+# Release lever alias (AGENTS.md): `cargo xtask <build|smoke|package|release|abi-diff|ci>`.
+[alias]
+xtask = "run --quiet -p xtask --"

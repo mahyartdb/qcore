@@ -1,0 +1,22 @@
+[package]
+name = "qcore-transports"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["wireguard", "masque", "relay", "psiphon", "mock"]
+wireguard = ["dep:transport-wireguard"]
+masque = ["dep:transport-masque"]
+relay = ["dep:transport-relay"]
+tor = ["dep:transport-tor"]
+psiphon = ["dep:transport-psiphon"]
+mock = ["dep:transport-mock"]
+
+[dependencies]
+transport-wireguard = { package = "qcore-transport-wireguard", path = "transport-wireguard", optional = true }
+transport-masque = { package = "qcore-transport-masque", path = "transport-masque", optional = true }
+transport-relay = { package = "qcore-transport-relay", path = "transport-relay", optional = true }
+transport-tor = { package = "qcore-transport-tor", path = "transport-tor", optional = true }
+transport-psiphon = { package = "qcore-transport-psiphon", path = "transport-psiphon", optional = true }
+transport-mock = { package = "qcore-transport-mock", path = "transport-mock", optional = true }

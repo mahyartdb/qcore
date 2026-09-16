@@ -1,0 +1,32 @@
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  # Tier A (every PR): native host unit/contract, lint, secret scan, native stub-peer smoke.
+  gate:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo nextest run --all-features
+      - run: cargo nextest run -p tests-conformance
+      - run: cargo xtask abi-diff
+      - run: cargo deny check
+      - run: cargo semver-checks
+      # T087 static secret-scan gate: git-aware scan plus a filesystem scan
+      # over the working tree (build artifacts, reports, state files, crash
+      # output). Either scanner failing blocks the gate (SC-006).
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: secret scan (trufflehog filesystem)
+        uses: trufflesecurity/trufflehog@v3.88.4
+        with:
+          path: ./
+          extra_args: --only-verified --fail
+      - run: cargo xtask smoke --target native

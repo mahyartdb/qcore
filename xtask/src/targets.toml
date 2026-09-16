@@ -1,0 +1,71 @@
+# Authoritative target list (constitution: Platform Parity & Target List).
+# 9 platform/arch combos; gnu+musl are libc variants of one target, not
+# separate targets. Consumed by CI, `xtask smoke`, docs and release.
+# Removing or demoting a target requires a constitution amendment.
+
+[[target]]
+triple = "i686-pc-windows-msvc"
+platform = "windows"
+arch = "x86"
+runner = "windows-2022"
+delivery = ["cli-zip", "dll"]
+
+[[target]]
+triple = "x86_64-pc-windows-msvc"
+platform = "windows"
+arch = "x64"
+runner = "windows-2022"
+delivery = ["cli-zip", "dll"]
+
+[[target]]
+triple = "aarch64-pc-windows-msvc"
+platform = "windows"
+arch = "arm64"
+runner = "windows-11-arm"
+delivery = ["cli-zip", "dll"]
+
+[[target]]
+triple = "x86_64-unknown-linux-gnu"
+platform = "linux"
+arch = "x64"
+libc = "gnu"
+runner = "ubuntu-22.04"
+delivery = ["cli-targz", "so"]
+
+[[target]]
+triple = "i686-unknown-linux-gnu"
+platform = "linux"
+arch = "x86"
+libc = "gnu"
+runner = "ubuntu-22.04"
+delivery = ["cli-targz", "so"]
+
+[[target]]
+triple = "aarch64-unknown-linux-gnu"
+platform = "linux"
+arch = "arm64"
+libc = "gnu"
+runner = "ubuntu-22.04"
+delivery = ["cli-targz", "so"]
+
+[[target]]
+triple = "armv7-unknown-linux-gnueabihf"
+platform = "linux"
+arch = "arm"
+libc = "gnu"
+runner = "ubuntu-22.04"
+delivery = ["cli-targz", "so"]
+
+[[target]]
+triple = "aarch64-linux-android"
+platform = "android"
+arch = "arm64"
+runner = "ubuntu-22.04"
+delivery = ["termux-cli", "cdylib-jni"]
+
+[[target]]
+triple = "armv7-linux-androideabi"
+platform = "android"
+arch = "arm"
+runner = "ubuntu-22.04"
+delivery = ["termux-cli", "cdylib-jni"]

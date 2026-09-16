@@ -1,0 +1,25 @@
+# Rust
+target/
+debug/
+release/
+*.rs.bk
+*.rlib
+*.prof*
+*.pdb
+
+# Env / secrets (never commit; see FR-026)
+.env*
+
+# Logs / local state
+*.log
+logs/
+session.json
+endpoints.json
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+*.tmp
+.DS_Store
+Thumbs.db

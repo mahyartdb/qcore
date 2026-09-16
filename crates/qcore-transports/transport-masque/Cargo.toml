@@ -1,0 +1,16 @@
+[package]
+name = "qcore-transport-masque"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+qcore-transport-api = { path = "../../qcore-transport-api" }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+h2 = { workspace = true }
+http = { workspace = true }
+quinn = { workspace = true }
+rustls = { workspace = true }
+rustls-native-certs = { workspace = true }
+tokio = { workspace = true }

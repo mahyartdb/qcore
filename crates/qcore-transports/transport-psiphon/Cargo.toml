@@ -1,0 +1,20 @@
+[package]
+name = "qcore-transport-psiphon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "fake-sidecar"
+path = "src/bin/fake_sidecar.rs"
+
+[dependencies]
+qcore-transport-api = { path = "../../qcore-transport-api" }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+qcore-core = { path = "../../qcore-core" }
+qcore-transports = { path = ".." }
+transport-mock = { package = "qcore-transport-mock", path = "../transport-mock" }
+tokio = { workspace = true }

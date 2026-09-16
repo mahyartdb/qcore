@@ -1,0 +1,31 @@
+# Scan profiles (US4 T067): exactly `turbo`, `balanced` (default), `stealth`.
+#
+# concurrency = probe parallelism bound; rtt_budget_ms discards slower
+# endpoints; probe_kind = handshake (fast, uncertain) vs data-plane
+# (traffic-validated, verified); family_order = probe order per family;
+# stealth spaces probes out (slower, quieter).
+#
+# [discovery.<transport>] seeds candidate endpoints for `qcore scan`
+# (provider-supplied; empty by default — the scanner is the sieve,
+# discovery providers plug in here).
+
+[turbo]
+concurrency = 64
+rtt_budget_ms = 200
+probe_kind = "handshake"
+family_order = ["ipv4", "ipv6"]
+stealth = false
+
+[balanced]
+concurrency = 32
+rtt_budget_ms = 400
+probe_kind = "data-plane"
+family_order = ["ipv4", "ipv6"]
+stealth = false
+
+[stealth]
+concurrency = 1
+rtt_budget_ms = 1500
+probe_kind = "data-plane"
+family_order = ["ipv6", "ipv4"]
+stealth = true

@@ -1,0 +1,74 @@
+[package]
+name = "tests-conformance"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+qcore-core = { path = "../../crates/qcore-core" }
+qcore-transport-api = { path = "../../crates/qcore-transport-api" }
+qcore-transports = { path = "../../crates/qcore-transports" }
+serde_json = { workspace = true }
+transport-mock = { package = "qcore-transport-mock", path = "../../crates/qcore-transports/transport-mock" }
+transport-masque = { package = "qcore-transport-masque", path = "../../crates/qcore-transports/transport-masque" }
+transport-wireguard = { package = "qcore-transport-wireguard", path = "../../crates/qcore-transports/transport-wireguard" }
+transport-tor = { package = "qcore-transport-tor", path = "../../crates/qcore-transports/transport-tor" }
+transport-psiphon = { package = "qcore-transport-psiphon", path = "../../crates/qcore-transports/transport-psiphon" }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+qcore-ffi = { path = "../../crates/qcore-ffi" }
+
+[dev-dependencies]
+rcgen = "0.13"
+
+[[test]]
+name = "matrix_generated"
+path = "tests/matrix_generated.rs"
+
+[[test]]
+name = "wireguard"
+path = "tests/wireguard.rs"
+
+[[test]]
+name = "masque"
+path = "tests/masque.rs"
+
+[[test]]
+name = "tor_psiphon"
+path = "tests/tor_psiphon.rs"
+
+[[test]]
+name = "failure_report"
+path = "tests/failure_report.rs"
+
+[[test]]
+name = "single_stack"
+path = "tests/single_stack.rs"
+
+[[test]]
+name = "scan"
+path = "tests/scan.rs"
+
+[[test]]
+name = "obfuscation"
+path = "tests/obfuscation.rs"
+
+[[test]]
+name = "extensibility"
+path = "tests/extensibility.rs"
+
+[[test]]
+name = "cli_api_parity"
+path = "tests/cli_api_parity.rs"
+
+[[test]]
+name = "secret_hygiene"
+path = "tests/secret_hygiene.rs"
+
+[[test]]
+name = "abi_consumer"
+path = "tests/abi_consumer.rs"
+
+[[test]]
+name = "throughput"
+path = "tests/throughput.rs"

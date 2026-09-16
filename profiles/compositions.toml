@@ -1,0 +1,55 @@
+# Shipped composition presets (US3 T053). Data, not code: gool = two
+# wireguard peer=warp hops, mim = two masque alpn=h3 hops, tor-warp =
+# tor,relay,wireguard peer=warp. Presets expand exactly one level; depth is
+# plain hop counting after expansion. Presets MUST NOT embed secrets.
+# `qcore-core` parses this file for profile-dir overrides and gates
+# data/code parity (this file MUST equal `builtin_presets()`).
+
+[[preset]]
+name = "gool"
+
+[[preset.hop]]
+id = "gool-0"
+kind = "wireguard"
+peer = "warp"
+family = "dual"
+
+[[preset.hop]]
+id = "gool-1"
+kind = "wireguard"
+peer = "warp"
+family = "dual"
+
+[[preset]]
+name = "mim"
+
+[[preset.hop]]
+id = "mim-0"
+kind = "masque"
+alpn = "h3"
+family = "dual"
+
+[[preset.hop]]
+id = "mim-1"
+kind = "masque"
+alpn = "h3"
+family = "dual"
+
+[[preset]]
+name = "tor-warp"
+
+[[preset.hop]]
+id = "tor-0"
+kind = "tor"
+family = "dual"
+
+[[preset.hop]]
+id = "relay-0"
+kind = "relay"
+family = "dual"
+
+[[preset.hop]]
+id = "warp-0"
+kind = "wireguard"
+peer = "warp"
+family = "dual"

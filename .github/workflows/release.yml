@@ -1,0 +1,27 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  # Tier C (tag): every listed target built and smoked; publish blocked unless green.
+  # Conventional commits -> release-plz / git-cliff changelog.
+  matrix:
+    strategy:
+      matrix:
+        target:
+          - i686-pc-windows-msvc
+          - x86_64-pc-windows-msvc
+          - aarch64-pc-windows-msvc
+    runs-on: ${{ contains(matrix.target, 'aarch64') && 'windows-11-arm' || 'windows-2022' }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo xtask build --target ${{ matrix.target }}
+      - run: cargo xtask smoke --target ${{ matrix.target }}
+  publish:
+    needs: [matrix]
+    runs-on: ubuntu-22.04
+    steps:
+      - run: cargo xtask package
+      - uses: sigstore/cosign-installer@v3
+      - run: cargo xtask release

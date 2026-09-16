@@ -1,0 +1,10 @@
+[package]
+name = "qcore-transport-mock"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+qcore-transport-api = { path = "../../qcore-transport-api" }
+async-trait = { workspace = true }
+tokio = { workspace = true }

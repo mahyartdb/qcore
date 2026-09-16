@@ -1,0 +1,87 @@
+# Obfuscation profiles (US5 T072): data, not code branches (AGENTS.md).
+#
+# family = noize (Aether junk/CPS, applies to wireguard + masque modes) or
+# awg (AmneziaWG params, `peer=awg` against a supporting peer only).
+# compatible_modes entries match { kind } plus peer (wireguard) or alpn
+# (masque) when given. Selecting a profile whose compatible_modes excludes
+# the hop mode is rejected (FR-021).
+#
+# params value shapes: int, [min, max] range array (resolves to the midpoint,
+# deterministic), bool, or string.
+
+["masque-balanced"]
+family = "noize"
+compatible_modes = [
+  { kind = "masque", alpn = "h3" },
+  { kind = "masque", alpn = "h2" },
+  { kind = "wireguard", peer = "warp" },
+  { kind = "wireguard", peer = "imported" },
+]
+
+["masque-balanced".params]
+junk_before = 1
+junk_size = [32, 96]
+
+["masque-aggressive"]
+family = "noize"
+compatible_modes = [
+  { kind = "masque", alpn = "h2" },
+  { kind = "masque", alpn = "h3" },
+  { kind = "wireguard", peer = "warp" },
+]
+
+["masque-aggressive".params]
+junk_before = 4
+junk_size = [64, 256]
+fragment = 512
+
+["awg-balanced"]
+family = "awg"
+compatible_modes = [{ kind = "wireguard", peer = "awg" }]
+
+["awg-balanced".params]
+header_protection = true
+s1 = [16, 32]
+s2 = [16, 32]
+s3 = [16, 32]
+s4 = [16, 32]
+jc = 6
+jmin = 64
+jmax = 256
+i1 = "quic"
+i2 = "dns"
+i3 = "ntp"
+content_padding = [0, 96]
+random_trailers = true
+disable_cookies = true
+
+["awg-aggressive"]
+family = "awg"
+compatible_modes = [{ kind = "wireguard", peer = "awg" }]
+
+["awg-aggressive".params]
+header_protection = true
+s1 = [32, 64]
+s2 = [32, 64]
+s3 = [32, 64]
+s4 = [32, 64]
+jc = 12
+jmin = 128
+jmax = 512
+i1 = "quic"
+i2 = "dns"
+i3 = "ntp"
+i4 = "stun"
+content_padding = [64, 128]
+random_trailers = true
+disable_cookies = true
+
+["awg-off"]
+family = "awg"
+compatible_modes = [{ kind = "wireguard", peer = "awg" }]
+
+["awg-off".params]
+header_protection = false
+jc = 0
+random_trailers = false
+disable_cookies = false

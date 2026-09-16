@@ -257,14 +257,7 @@ async fn exchange(
 }
 
 async fn tls_wrap(host: &str, tcp: tokio::net::TcpStream) -> Result<Box<dyn ReadWrite>, HttpError> {
-    let mut roots = rustls::RootCertStore::empty();
-    for cert in rustls_native_certs::load_native_certs().certs {
-        let _ = roots.add(cert);
-    }
-    let config = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));
+    let connector = tokio_rustls::TlsConnector::from(tls_config()?);
     let name = rustls::pki_types::ServerName::try_from(host.to_owned())
         .map_err(|_| HttpError::Usage(format!("https to `{host}` needs a DNS name")))?;
     let tls = connector
@@ -272,6 +265,25 @@ async fn tls_wrap(host: &str, tcp: tokio::net::TcpStream) -> Result<Box<dyn Read
         .await
         .map_err(|e| HttpError::Blocked(format!("TLS to {host}: {e}")))?;
     Ok(Box::new(tls))
+}
+
+/// TLS client config with an explicit crypto provider. `ClientConfig::
+/// builder()` panics at runtime when the tree enables both `ring` and
+/// `aws-lc-rs` (ours does: quinn vs arti) because no process default can be
+/// auto-picked — so we name `ring` explicitly and touch no global state.
+fn tls_config() -> Result<std::sync::Arc<rustls::ClientConfig>, HttpError> {
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in rustls_native_certs::load_native_certs().certs {
+        let _ = roots.add(cert);
+    }
+    let config = rustls::ClientConfig::builder_with_provider(
+        rustls::crypto::ring::default_provider().into(),
+    )
+    .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+    .map_err(|e| HttpError::Blocked(format!("TLS setup: {e}")))?
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    Ok(std::sync::Arc::new(config))
 }
 
 fn parse_response(raw: &[u8]) -> Result<HttpResponse, HttpError> {
@@ -362,8 +374,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn plaintext_only_to_loopback() {
-        assert!(parse_url("https://api.example.com/reg").is_ok());
+    fn tls_config_builds_without_a_process_default() {
+        // Regression: ClientConfig::builder() panics when the tree enables
+        // both ring and aws-lc-rs (quinn vs arti). The explicit provider
+        // must build with no global installed and no network.
+        tls_config().expect("explicit ring provider builds");
+    }
+
+    #[test]
+    fn plaintext_only_to_loopback() {        assert!(parse_url("https://api.example.com/reg").is_ok());
         assert!(parse_url("http://127.0.0.1:9/fixture").is_ok());
         assert!(parse_url("http://[::1]:9/x").is_ok());
         assert!(parse_url("http://example.com/reg").is_err());

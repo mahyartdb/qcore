@@ -196,6 +196,42 @@ enum Commands {
         #[arg(index = 1)]
         file: String,
     },
+    /// Provision a WARP identity (license optional; --gool for outer+inner).
+    Register {
+        /// Provider license key for this operation only (warns: visible to
+        /// other processes; prefer --license-file).
+        #[arg(long)]
+        license_key: Option<String>,
+        /// Read the license key from this file (scripts).
+        #[arg(long)]
+        license_file: Option<std::path::PathBuf>,
+        /// Provision the GOOL outer+inner pair.
+        #[arg(long)]
+        gool: bool,
+        /// Test-only provider override (fixture doubles; never stable).
+        #[arg(long, hide = true)]
+        provider: Option<String>,
+    },
+    /// Refresh an identity in place (re-register on refusal; --masque-only
+    /// rotates just the MASQUE credential; --hop selects a GOOL hop).
+    Renew {
+        /// Only the MASQUE credential (enroll when missing, rotate in-window).
+        #[arg(long)]
+        masque_only: bool,
+        /// Which identity: outer | inner | both (default both).
+        #[arg(long, default_value = "both")]
+        hop: String,
+        /// Provider license key for this operation only (warns: visible to
+        /// other processes; prefer --license-file).
+        #[arg(long)]
+        license_key: Option<String>,
+        /// Read the license key from this file (scripts).
+        #[arg(long)]
+        license_file: Option<std::path::PathBuf>,
+        /// Test-only provider override (fixture doubles; never stable).
+        #[arg(long, hide = true)]
+        provider: Option<String>,
+    },
     /// Round-trip an imported config (values reproduced, secrets redacted).
     Export {
         /// Import ref from `import`.
@@ -289,6 +325,42 @@ async fn async_main(cli: Cli) -> i32 {
             cmd::profiles::run(&engine, &dirs)
         }
         Commands::Import { file } => cmd::import::run_import(&file, cli.json, &dirs, globals.quiet),
+        Commands::Register {
+            license_key,
+            license_file,
+            gool,
+            provider,
+        } => {
+            cmd::register::run(cmd::register::RegisterArgs {
+                license_key,
+                license_file,
+                gool,
+                provider,
+                json: cli.json,
+                non_interactive: cli.non_interactive,
+                dirs,
+            })
+            .await
+        }
+        Commands::Renew {
+            masque_only,
+            hop,
+            license_key,
+            license_file,
+            provider,
+        } => {
+            cmd::renew::run(cmd::renew::RenewArgs {
+                masque_only,
+                hop,
+                license_key,
+                license_file,
+                provider,
+                json: cli.json,
+                non_interactive: cli.non_interactive,
+                dirs,
+            })
+            .await
+        }
         Commands::Export { import_ref } => cmd::import::run_export(&import_ref, cli.json, &dirs),
         Commands::Legal => help::run(cli.json),
         Commands::External(args) => {
@@ -590,7 +662,9 @@ async fn run_connect(o: ConnectOpts) -> i32 {
                     qcore_core::chain::ExpandedHop::Preset(_) => None,
                 })
                 .unwrap_or_else(|| "wireguard".to_string());
-            match qcore_core::scan::load_profile(&dirs, "balanced") {
+            // Zero-config default (002 FR-014): warp.toml's scan choice.
+            let default_profile = qcore_core::session::reconnect::default_scan_profile(&dirs);
+            match qcore_core::scan::load_profile(&dirs, &default_profile) {
                 Ok(profile) => {
                     match cmd::scan::run_scan_request(&dirs, &transport, profile, &o.family).await {
                         Ok(report) if !report.ranked.is_empty() => {
@@ -646,7 +720,8 @@ async fn run_connect(o: ConnectOpts) -> i32 {
         .rev()
         .find_map(|h| h.obfuscation.clone());
     if discovery_ran {
-        report.active_scan_profile = Some("balanced".to_string());
+        report.active_scan_profile =
+            Some(qcore_core::session::reconnect::default_scan_profile(&dirs));
     }
 
     // Rendezvous for status/stop: control listener, then durable records.

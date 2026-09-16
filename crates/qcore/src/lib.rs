@@ -6,7 +6,7 @@
 //! `qcore-transports` meta-crate (feature-gated); the engine discovers them
 //! through the [`registry`], never by matching on a kind.
 
-pub use qcore_core::{api, chain, config, diag, registry, scan, session};
+pub use qcore_core::{api, chain, config, diag, identity, registry, scan, session};
 
 pub use qcore_core::api::{
     Engine, EngineConfig, Preflight, ABI_VERSION, API_VERSION, SCHEMA_VERSION,

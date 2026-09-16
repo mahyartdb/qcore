@@ -16,6 +16,10 @@ logs/
 session.json
 endpoints.json
 
+# Provider identities + secret fallback files (hold secrets; FR-002/FR-012)
+identity-*.toml
+*.secret
+
 # Editors / OS
 .idea/
 .vscode/

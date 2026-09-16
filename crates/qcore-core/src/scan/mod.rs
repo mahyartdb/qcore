@@ -6,6 +6,9 @@
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 
+pub mod cache;
+pub mod seeds;
+
 /// Scan profile (data-model). Exactly `turbo`, `balanced` (default), `stealth`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanProfile {

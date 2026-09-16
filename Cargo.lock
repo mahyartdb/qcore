@@ -3039,12 +3039,19 @@ name = "qcore-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
+ "boringtun",
+ "getrandom 0.2.17",
  "inventory",
  "keyring",
  "qcore-transport-api",
+ "rcgen",
+ "rustls",
+ "rustls-native-certs",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-rustls",
  "toml 0.8.23",
 ]
 
@@ -4241,6 +4248,7 @@ name = "tests-conformance"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "qcore-core",
  "qcore-ffi",
  "qcore-transport-api",
@@ -4377,6 +4385,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.5",
+]
+
+[[package]]
+name = "tokio-rustls"
+version = "0.26.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b0c85f2c3ef0b1cd58b36682f4b17aaa995f0e5db534d85692b4903abce21f67"
+dependencies = [
+ "rustls",
+ "tokio",
 ]
 
 [[package]]

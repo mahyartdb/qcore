@@ -5,9 +5,11 @@
 //! reconnect sink.
 
 use qcore_core::config::profile_dir::ProfileDirs;
+use qcore_core::identity::model::now_ms;
 use qcore_core::scan::{
-    discovery_seeds, evict_stale_lkg, load_profile, persist_verified, ScanReport, ScanRequest,
-    Scanner,
+    cache, discovery_seeds, evict_stale_lkg, load_profile, persist_verified,
+    seeds::{candidates_for, load_warp_profiles},
+    ScanReport, ScanRequest, Scanner,
 };
 
 use crate::exit;
@@ -20,14 +22,46 @@ pub fn profile_named(
     load_profile(dirs, name)
 }
 
-/// Run one scan: LKG (family-matching) first, then discovery seeds.
-/// Verified winners are cached; a fully-failed scan evicts stale LKG.
+/// Run one scan (002 FR-006/007/008/014).
+///
+/// - Per-transport winner re-verify (fast path — full scan skipped while
+///   the cached winner answers);
+/// - else full scan over legacy LKG + warp.toml seeds + scan.toml
+///   discovery seeds; winners cached per transport (and legacy LKG).
+///
+/// Verified winners are cached; a fully-failed scan evicts stale state.
 pub async fn run_scan_request(
     dirs: &ProfileDirs,
     transport: &str,
     profile: qcore_core::scan::ScanProfile,
     family: &str,
 ) -> Result<ScanReport, String> {
+    let budget = std::time::Duration::from_millis(profile.rtt_budget_ms.clamp(1, 5000));
+    if let Some((addr, latency_ms)) =
+        cache::verify_winner_first(dirs, transport, family, budget).await
+    {
+        // Fast path: the recorded winner still answers. It was
+        // traffic-verified when recorded; the re-verify confirms continued
+        // reachability, so the Verified verdict stands without a rescan.
+        return Ok(ScanReport {
+            transport: transport.to_string(),
+            profile: profile.name.clone(),
+            ranked: vec![qcore_core::scan::EndpointCandidate {
+                address: addr,
+                family: if addr.is_ipv4() {
+                    "ipv4".to_string()
+                } else {
+                    "ipv6".to_string()
+                },
+                latency_ms,
+                reachability: qcore_core::scan::Reachability::Passed,
+                confidence: qcore_core::scan::Confidence::Verified,
+                last_known_good: true,
+            }],
+            failed: 0,
+            elapsed_ms: latency_ms,
+        });
+    }
     let mut candidates = Vec::new();
     if let Some(lkg) = qcore_core::session::reconnect::last_known_good(dirs) {
         let ok = match family {
@@ -39,7 +73,14 @@ pub async fn run_scan_request(
             candidates.push(lkg);
         }
     }
+    // Seeded candidates (FR-014): malformed/empty warp data selects nothing
+    // rather than failing the scan — discovery seeds still run.
+    if let Ok(warp) = load_warp_profiles(dirs) {
+        candidates.extend(candidates_for(&warp, transport, family));
+    }
     candidates.extend(discovery_seeds(dirs, transport));
+    candidates.sort();
+    candidates.dedup();
     let report = Scanner::scan(ScanRequest {
         transport: transport.to_string(),
         profile,
@@ -51,6 +92,18 @@ pub async fn run_scan_request(
         evict_stale_lkg(dirs, &report)?;
     } else {
         persist_verified(dirs, &report)?;
+        if let Some(top) = report.ranked.first() {
+            let _ = cache::record_winner(
+                dirs,
+                transport,
+                cache::TransportWinner {
+                    address: top.address.to_string(),
+                    profile: report.profile.clone(),
+                    verified_at_ms: now_ms(),
+                    family: top.family.clone(),
+                },
+            );
+        }
     }
     Ok(report)
 }

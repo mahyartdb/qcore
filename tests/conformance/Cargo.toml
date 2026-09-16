@@ -17,6 +17,7 @@ transport-psiphon = { package = "qcore-transport-psiphon", path = "../../crates/
 tokio = { workspace = true }
 async-trait = { workspace = true }
 qcore-ffi = { path = "../../crates/qcore-ffi" }
+base64 = { workspace = true }
 
 [dev-dependencies]
 rcgen = "0.13"
@@ -72,3 +73,23 @@ path = "tests/abi_consumer.rs"
 [[test]]
 name = "throughput"
 path = "tests/throughput.rs"
+
+[[test]]
+name = "registration"
+path = "tests/registration.rs"
+
+[[test]]
+name = "auto_register"
+path = "tests/auto_register.rs"
+
+[[test]]
+name = "scan_providers"
+path = "tests/scan_providers.rs"
+
+[[test]]
+name = "renewal"
+path = "tests/renewal.rs"
+
+[[test]]
+name = "masque_enroll"
+path = "tests/masque_enroll.rs"

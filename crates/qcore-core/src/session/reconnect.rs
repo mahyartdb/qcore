@@ -45,6 +45,13 @@ pub fn default_chain_spec() -> Vec<ExpandedHop> {
     vec![ExpandedHop::Hop(spec)]
 }
 
+/// Zero-config default scan profile (002 FR-014/SC-007): the warp.toml
+/// choice when the user picks none. Reads the shipped/override default;
+/// never fails (falls back to `balanced`).
+pub fn default_scan_profile(dirs: &ProfileDirs) -> String {
+    crate::scan::seeds::default_scan_profile_name(dirs)
+}
+
 /// Reader half of the last-known-good cache: the verified endpoint US4 T068
 /// persists to `endpoints.json` (`{"last_known_good": "<ip:port>"}`). `None`
 /// until the first verified scan.

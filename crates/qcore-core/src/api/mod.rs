@@ -6,5 +6,5 @@
 pub mod engine;
 pub mod version;
 
-pub use engine::{Engine, EngineConfig, Preflight};
+pub use engine::{Engine, EngineConfig, EnsureWarp, Preflight};
 pub use version::{ABI_VERSION, API_VERSION, SCHEMA_VERSION};

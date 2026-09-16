@@ -149,3 +149,103 @@ fn fail_closed_placeholder_emits_metadata_only() {
     assert!(line.contains("\"dropped\":true"));
     assert!(!line.contains("xT4vN7qW"));
 }
+
+// --- 002 T034: registration artifacts (SC-005) ------------------------------
+// Identity records, RegistrationReports (register/renew/MASQUE), refusal
+// causes, and the endpoint cache must carry zero secret plaintext: device
+// keys, access tokens, MASQUE keys, and the per-operation license key.
+
+use qcore_core::identity::register::ProviderOptions;
+use qcore_core::identity::renew::renew_role;
+use qcore_core::identity::report::ReportAction;
+use qcore_core::identity::store::IdentityRole;
+use tests_conformance::fixture::{Fixture, FixtureMode};
+
+fn identity_opts(fx: &Fixture) -> ProviderOptions {
+    ProviderOptions {
+        provider_base: fx.base_url().to_string(),
+        timeout_secs: 10,
+        family: "dual".to_string(),
+    }
+}
+
+#[tokio::test]
+async fn registration_artifacts_carry_no_secrets() {
+    const KEY: &str = "HYGIENE-PROBE-KEY-9d4c1a7e";
+    let dirs = work("identity");
+    dirs.ensure_dirs().expect("dirs");
+    let _ = qcore_transports::linked_kinds();
+    let engine = Engine::new(EngineConfig {
+        dirs: dirs.clone(),
+        ..Default::default()
+    });
+    let accept = Fixture::start(FixtureMode::Accept).await;
+
+    // Register with a license key, then enroll MASQUE: every new secret
+    // class exists from here on (device key, token, MASQUE key, license).
+    let license = qcore_core::config::secret::SecretString::new(KEY);
+    let reg = engine
+        .register_warp(IdentityRole::Outer, &identity_opts(&accept), Some(&license))
+        .await;
+    assert_eq!(reg.action, ReportAction::Registered);
+    drop(license);
+    let enrolled = renew_role(
+        &dirs,
+        IdentityRole::Outer,
+        &identity_opts(&accept),
+        None,
+        true,
+    )
+    .await;
+    assert_eq!(enrolled.action, ReportAction::Rotated);
+
+    let stored = engine.load_identity(IdentityRole::Outer).expect("stored");
+    let mut secrets = vec![KEY.to_string()];
+    secrets.push(String::from_utf8_lossy(stored.access_token.expose()).into_owned());
+    secrets.push(String::from_utf8_lossy(stored.private_key_b64.expose()).into_owned());
+    let masque = stored.masque.expect("credential");
+    secrets.push(String::from_utf8_lossy(masque.key_pem.expose()).into_owned());
+    assert!(secrets.iter().all(|s| !s.is_empty()));
+
+    // Reports (JSON is the wire shape) carry none of them.
+    assert_clean("register report", &reg.to_json(), &secrets);
+    assert_clean("masque report", &enrolled.to_json(), &secrets);
+
+    // The TOML record carries none either (secrets live in the secret
+    // store, never beside the record).
+    let record_path = qcore_core::identity::store::identity_file(&dirs, IdentityRole::Outer);
+    let record = std::fs::read_to_string(&record_path).expect("record");
+    assert_clean("identity record", &record, &secrets);
+
+    // Refusal causes name the next step, never credentials: renew against
+    // the refusing provider with a license key offered.
+    let refuse = Fixture::start(FixtureMode::RefuseIdentity).await;
+    let license2 = qcore_core::config::secret::SecretString::new(KEY);
+    let renewed = renew_role(
+        &dirs,
+        IdentityRole::Outer,
+        &identity_opts(&refuse),
+        Some(&license2),
+        false,
+    )
+    .await;
+    drop(license2);
+    assert_eq!(renewed.action, ReportAction::ReRegistered);
+    // The fresh identity minted a new token: hunt for that one too.
+    let fresh = engine.load_identity(IdentityRole::Outer).expect("fresh");
+    secrets.push(String::from_utf8_lossy(fresh.access_token.expose()).into_owned());
+    assert_clean("renew report", &renewed.to_json(), &secrets);
+    let record2 = std::fs::read_to_string(&record_path).expect("record");
+    assert_clean("renewed record", &record2, &secrets);
+
+    // Record files are user-only on unix (0600).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&record_path)
+            .expect("meta")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "identity record is 0600");
+    }
+}

@@ -41,6 +41,18 @@ pub fn run(engine: &Engine, dirs: &qcore_core::config::profile_dir::ProfileDirs)
             Err(e) => println!("  {name}  (unavailable: {e})"),
         }
     }
+    println!("endpoint candidates (warp.toml):");
+    match qcore_core::scan::seeds::load_warp_profiles(dirs) {
+        Ok(wp) => {
+            let warp_n = qcore_core::scan::seeds::candidates_for(&wp, "warp", "dual").len();
+            let masque_n = qcore_core::scan::seeds::candidates_for(&wp, "masque", "dual").len();
+            println!(
+                "  warp: {warp_n} candidates  masque: {masque_n} candidates  default scan profile: {}",
+                wp.default_scan_profile
+            );
+        }
+        Err(e) => println!("  (unavailable: {e})"),
+    }
     println!("obfuscation profiles:");
     match qcore_core::config::obfuscation::load_profiles(dirs) {
         Ok(profiles) => {

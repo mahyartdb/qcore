@@ -183,3 +183,68 @@ async fn balanced_scan_finishes_inside_budget() {
     assert!(t.elapsed().as_secs() < 30, "SC-005: balanced < 30 s");
     assert_eq!(report.ranked.len(), 1);
 }
+
+// --- 002 T018: per-transport winner cache (FR-008) -------------------------
+
+use qcore_core::scan::cache::{read_winners, record_winner, verify_winner_first, TransportWinner};
+
+fn winner_for(addr: SocketAddr) -> TransportWinner {
+    TransportWinner {
+        address: addr.to_string(),
+        profile: "balanced".to_string(),
+        verified_at_ms: qcore_core::identity::model::now_ms(),
+        family: if addr.is_ipv4() {
+            "ipv4".to_string()
+        } else {
+            "ipv6".to_string()
+        },
+    }
+}
+
+#[tokio::test]
+async fn per_transport_winner_reverified_first() {
+    let d = dirs("winner");
+    let live = echo_listener().await;
+    record_winner(&d, "warp", winner_for(live)).expect("records");
+
+    // Healthy winner: fast-path hit, no full scan needed downstream.
+    let hit = verify_winner_first(&d, "warp", "ipv4", std::time::Duration::from_secs(2)).await;
+    let (addr, latency_ms) = hit.expect("winner re-verifies");
+    assert_eq!(addr, live);
+    assert!(latency_ms < 2000, "re-verify is the fast path");
+
+    // Transports are independent namespaces.
+    assert!(!read_winners(&d).contains_key("masque"));
+    assert_eq!(
+        read_winners(&d).get("warp").unwrap().address,
+        live.to_string()
+    );
+}
+
+#[tokio::test]
+async fn dead_winner_evicts_instead_of_reuse() {
+    let d = dirs("evict");
+    let dead: SocketAddr = "127.0.0.1:1".parse().unwrap();
+    record_winner(&d, "warp", winner_for(dead)).expect("records");
+
+    // Dead winner: miss + eviction, so the caller runs a full scan.
+    let hit = verify_winner_first(&d, "warp", "ipv4", std::time::Duration::from_secs(2)).await;
+    assert!(hit.is_none(), "dead winner is not reused");
+    assert!(
+        !read_winners(&d).contains_key("warp"),
+        "dead winner evicted"
+    );
+}
+
+#[tokio::test]
+async fn winner_family_mismatch_keeps_entry() {
+    let d = dirs("famkeep");
+    let live = echo_listener().await;
+    record_winner(&d, "warp", winner_for(live)).expect("records");
+
+    // Wrong family for this scan: miss, but the entry survives for its own
+    // family's next scan (no destruction on a non-applicable lookup).
+    let hit = verify_winner_first(&d, "warp", "ipv6", std::time::Duration::from_secs(2)).await;
+    assert!(hit.is_none());
+    assert!(read_winners(&d).contains_key("warp"), "entry kept");
+}

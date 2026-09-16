@@ -8,6 +8,7 @@ pub mod api;
 pub mod chain;
 pub mod config;
 pub mod diag;
+pub mod identity;
 pub mod registry;
 pub mod scan;
 pub mod session;

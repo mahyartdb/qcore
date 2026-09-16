@@ -14,7 +14,10 @@
 //! not_running exit 10 / dead exit 1 / unverifiable exit 12 (fail closed).
 
 pub mod import;
+pub mod license;
 pub mod preflight;
 pub mod profiles;
+pub mod register;
+pub mod renew;
 pub mod scan;
 pub mod shortcuts;

@@ -8,6 +8,7 @@ use crate::api::version::{ABI_VERSION, API_VERSION, SCHEMA_VERSION};
 use crate::chain::{ChainBuilder, ChainError, ExpandedHop};
 use crate::config::profile_dir::ProfileDirs;
 use crate::config::HopSpec;
+use crate::identity::report::report_for_error as to_report;
 use crate::registry::TransportRegistry;
 use crate::session::lifecycle;
 use crate::session::net::{root_dialer, FamilyPolicy, KeepalivePolicy};
@@ -46,6 +47,16 @@ impl Default for EngineConfig {
 pub enum Preflight {
     Ok { depth: usize },
     Rejected(ChainError),
+}
+
+/// Outcome of [`Engine::ensure_warp_for_specs`]: whether anything was
+/// freshly registered, which roles are now ready, and a human notice for
+/// stderr when registration happened inline.
+#[derive(Debug)]
+pub struct EnsureWarp {
+    pub fresh: bool,
+    pub roles: Vec<crate::identity::store::IdentityRole>,
+    pub notice: Option<String>,
 }
 
 /// The engine. Owns config + registry; sessions are built per start.
@@ -246,6 +257,294 @@ impl Engine {
             self.stop_session(&id).await?;
         }
         Ok(())
+    }
+
+    /// Load a stored provider identity (002). `None` on missing, corrupt,
+    /// partial, or secret-missing records — the caller re-registers.
+    pub fn load_identity(
+        &self,
+        role: crate::identity::store::IdentityRole,
+    ) -> Option<crate::identity::model::ProviderIdentity> {
+        crate::identity::store::load(&self.config.dirs, role)
+    }
+
+    /// Persist a provider identity atomically (002 FR-002).
+    pub fn save_identity(
+        &self,
+        role: crate::identity::store::IdentityRole,
+        id: &crate::identity::model::ProviderIdentity,
+    ) -> Result<(), String> {
+        crate::identity::store::save(&self.config.dirs, role, id)
+    }
+
+    /// How many WARP identities these specs need: WARP hops without
+    /// endpoint/import material, capped at 2 (outer + inner for GOOL-like
+    /// pairs). Read-only: presets resolve from dirs, zero sockets (FR-003).
+    pub fn warp_identities_needed(&self, specs: &[ExpandedHop]) -> Result<usize, ChainError> {
+        let presets = crate::chain::preset::resolve_presets(&self.config.dirs)?;
+        let hops = crate::chain::preset::expand(specs.to_vec(), &presets)?;
+        let mut need = 0;
+        for h in &hops {
+            if let crate::config::HopConfig::Wireguard(c) = &h.config {
+                if c.peer == "warp" && c.endpoint.is_none() && c.import_ref.is_none() {
+                    need += 1;
+                }
+            }
+        }
+        Ok(need.min(2))
+    }
+
+    /// Ensure stored-or-fresh identities for what `specs` needs (002 FR-003):
+    /// reuse healthy stored identities, auto-register when none is stored
+    /// (or the stored one is refused). GOOL-shaped specs get the outer+inner
+    /// pair. Fails closed with a `RegistrationReport` (blocked vs refused).
+    pub async fn ensure_warp_for_specs(
+        &self,
+        specs: &[ExpandedHop],
+        opts: &crate::identity::register::ProviderOptions,
+        license: Option<&crate::config::secret::SecretString>,
+    ) -> Result<EnsureWarp, crate::identity::report::RegistrationReport> {
+        use crate::identity::report::{RegistrationReport, ReportAction};
+        let needed = self
+            .warp_identities_needed(specs)
+            .map_err(|e| RegistrationReport {
+                action: ReportAction::Blocked,
+                identity: None,
+                endpoint: None,
+                cause: format!("cannot resolve chain presets: {e}"),
+                license_applied: false,
+            })?;
+        if needed == 0 {
+            return Ok(EnsureWarp {
+                fresh: false,
+                roles: Vec::new(),
+                notice: None,
+            });
+        }
+        let roles: Vec<crate::identity::store::IdentityRole> = if needed >= 2 {
+            vec![
+                crate::identity::store::IdentityRole::Outer,
+                crate::identity::store::IdentityRole::Inner,
+            ]
+        } else {
+            vec![crate::identity::store::IdentityRole::Outer]
+        };
+        // Snapshot to detect fresh provisioning (reuse leaves ids untouched).
+        let before: Vec<Option<String>> = roles
+            .iter()
+            .map(|r| self.load_identity(*r).map(|id| id.device_id))
+            .collect();
+        if roles.len() == 2 {
+            crate::identity::gool::provision_pair(&self.config.dirs, opts, license, true)
+                .await
+                .map_err(to_report)?;
+        } else {
+            crate::identity::gool::provision_role(
+                &self.config.dirs,
+                crate::identity::store::IdentityRole::Outer,
+                opts,
+                license,
+                true,
+            )
+            .await
+            .map_err(to_report)?;
+        }
+        let fresh = roles
+            .iter()
+            .zip(before.iter())
+            .any(|(r, prev)| self.load_identity(*r).map(|id| id.device_id) != *prev);
+        Ok(EnsureWarp {
+            fresh,
+            roles: roles.clone(),
+            notice: if fresh {
+                Some(format!(
+                    "registered fresh WARP identity ({})",
+                    roles
+                        .iter()
+                        .map(|r| match r {
+                            crate::identity::store::IdentityRole::Outer => "outer",
+                            crate::identity::store::IdentityRole::Inner => "inner",
+                        })
+                        .collect::<Vec<_>>()
+                        .join("+")
+                ))
+            } else {
+                None
+            },
+        })
+    }
+
+    /// Register one fresh identity into a role (002 US1): the `register`
+    /// command's engine half. Thin, public, and CLI-parity covered.
+    pub async fn register_warp(
+        &self,
+        role: crate::identity::store::IdentityRole,
+        opts: &crate::identity::register::ProviderOptions,
+        license: Option<&crate::config::secret::SecretString>,
+    ) -> crate::identity::report::RegistrationReport {
+        use crate::identity::report::{RegistrationReport, ReportAction};
+        let outcome = match crate::identity::register::register_fresh(opts, license).await {
+            Ok(o) => o,
+            Err(e) => return to_report(e),
+        };
+        if let Err(e) = self.save_identity(role, &outcome.identity) {
+            return RegistrationReport {
+                action: ReportAction::Blocked,
+                identity: None,
+                endpoint: None,
+                cause: format!("identity store failed: {e}"),
+                license_applied: false,
+            };
+        }
+        let mut cause = format!(
+            "fresh identity provisioned and stored via {}",
+            outcome.family
+        );
+        if let Some(note) = outcome.license_note {
+            cause.push_str(&format!(" ({note})"));
+        }
+        RegistrationReport {
+            action: ReportAction::Registered,
+            identity: Some(outcome.identity.device_id.clone()),
+            endpoint: None,
+            cause,
+            license_applied: outcome.license_applied,
+        }
+    }
+
+    /// Pre-connect identity check (002 FR-004/FR-005/T028/T032): ensure
+    /// identities, then refresh each stored (non-fresh) role once. A refusal
+    /// renews automatically (single re-registration, then the caller
+    /// proceeds); anything else keeps the identity and the connect
+    /// continues — the failure, if real, surfaces from the tunnel itself.
+    /// MASQUE credentials inside the rotation window rotate inline when the
+    /// chain needs MASQUE (failures defer with a notice — the credential is
+    /// still valid until expiry). Returns stderr notices or a fatal report.
+    pub async fn preconnect_identity(
+        &self,
+        specs: &[ExpandedHop],
+        opts: &crate::identity::register::ProviderOptions,
+        license: Option<&crate::config::secret::SecretString>,
+    ) -> Result<Option<String>, crate::identity::report::RegistrationReport> {
+        use crate::identity::report::ReportAction;
+        use crate::identity::store::IdentityRole;
+        // Pre-ensure snapshot: per-role freshness + whether a MASQUE
+        // credential is about to be lost to re-registration.
+        let snapshot: Vec<(IdentityRole, Option<String>, bool)> =
+            [IdentityRole::Outer, IdentityRole::Inner]
+                .iter()
+                .map(|r| {
+                    let loaded = self.load_identity(*r);
+                    let had_masque = loaded.as_ref().is_some_and(|id| id.masque.is_some());
+                    (*r, loaded.map(|id| id.device_id), had_masque)
+                })
+                .collect();
+        let ensured = self.ensure_warp_for_specs(specs, opts, license).await?;
+        let mut notices = Vec::new();
+        if let Some(n) = ensured.notice {
+            notices.push(n);
+        }
+        let masque_needed = self.specs_need_masque(specs);
+        for role in &ensured.roles {
+            let (prev_id, had_masque) = snapshot
+                .iter()
+                .find(|(r, _, _)| r == role)
+                .map(|(_, id, m)| (id.clone(), *m))
+                .unwrap_or((None, false));
+            let current_id = self.load_identity(*role).map(|id| id.device_id);
+            let fresh_this_role = current_id != prev_id;
+            if fresh_this_role {
+                if had_masque {
+                    notices.push(
+                        "re-registered with a fresh identity; MASQUE credential needs re-enrollment (`qcore renew --masque-only`)".to_string(),
+                    );
+                }
+            } else {
+                let report = crate::identity::renew::renew_role(
+                    &self.config.dirs,
+                    *role,
+                    opts,
+                    license,
+                    false,
+                )
+                .await;
+                match report.action {
+                    ReportAction::Reused => {}
+                    ReportAction::Blocked => return Err(report),
+                    ReportAction::ReRegistered if had_masque => {
+                        notices.push(report.cause.clone());
+                        notices.push(
+                            "previous MASQUE credential did not carry over; re-enroll with `qcore renew --masque-only`".to_string(),
+                        );
+                    }
+                    _ => notices.push(format!(
+                        "{}: {}",
+                        match role {
+                            IdentityRole::Outer => "warp",
+                            IdentityRole::Inner => "warp-inner",
+                        },
+                        report.cause
+                    )),
+                }
+            }
+            // Connect-time MASQUE rotation (FR-005): only when the chain
+            // needs MASQUE and the credential sits inside its window.
+            if masque_needed {
+                let in_window = self
+                    .load_identity(*role)
+                    .and_then(|id| id.masque)
+                    .is_some_and(|c| c.needs_rotation(crate::identity::model::now_ms()));
+                if in_window {
+                    let rotated = crate::identity::renew::renew_role(
+                        &self.config.dirs,
+                        *role,
+                        opts,
+                        None,
+                        true,
+                    )
+                    .await;
+                    match rotated.action {
+                        ReportAction::Reused => {}
+                        ReportAction::Rotated => notices.push(rotated.cause),
+                        _ => notices.push(format!(
+                            "MASQUE rotation deferred ({}); proceeding with the current credential",
+                            rotated.cause
+                        )),
+                    }
+                }
+            }
+        }
+        if notices.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(notices.join("; ")))
+        }
+    }
+
+    /// Whether these specs need MASQUE (a concrete masque hop or the `mim`
+    /// preset). Read-only; resolution failures mean validation fails later
+    /// anyway, so they answer `false` here.
+    fn specs_need_masque(&self, specs: &[ExpandedHop]) -> bool {
+        let Ok(presets) = crate::chain::preset::resolve_presets(&self.config.dirs) else {
+            return false;
+        };
+        let Ok(hops) = crate::chain::preset::expand(specs.to_vec(), &presets) else {
+            return false;
+        };
+        hops.iter()
+            .any(|h| matches!(h.config, crate::config::HopConfig::Masque(_)))
+    }
+
+    /// Enroll (or confirm) the MASQUE credential for a role (002
+    /// FR-005/T033): enrolls when missing, rotates inside the window,
+    /// confirms otherwise. Thin over the MASQUE-only renewal path so the
+    /// `register` flow and `renew --masque-only` share one implementation.
+    pub async fn enroll_masque(
+        &self,
+        role: crate::identity::store::IdentityRole,
+        opts: &crate::identity::register::ProviderOptions,
+    ) -> crate::identity::report::RegistrationReport {
+        crate::identity::renew::renew_role(&self.config.dirs, role, opts, None, true).await
     }
 
     /// Parse user-authored hop specs (single-hop CLI form; full grammar in US3).

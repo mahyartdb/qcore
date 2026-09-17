@@ -2,6 +2,10 @@
 //!
 //! Typed-field-first: secret fields are always redacted by key.
 //! Entropy-and-denylist scanning second, for free-form values.
+//! Scope: the entropy scan detects random-looking blobs (16+ chars), whole
+//! or embedded as whitespace-delimited tokens. Short or human-readable
+//! credentials under innocuous keys are NOT detected — those must use a
+//! typed secret key or a denylist entry.
 //! Fail-closed: a value that cannot be classified safe and cannot be proven
 //! secret is NOT emitted — the whole record is dropped and a placeholder with
 //! metadata only is written.
@@ -135,11 +139,20 @@ pub fn masked_value(key: &str, value: &str) -> String {
 /// closed). Shared by CLI-facing cause builders (registration reports).
 pub fn prefixed_cause(prefix: &str, detail: &str) -> String {
     match redact_value("cause", detail) {
-        Redaction::Keep(_) => format!("{prefix}{detail}"),
+        Redaction::Keep(masked) => format!("{prefix}{masked}"),
         Redaction::Redacted => format!("{prefix}<redacted>"),
     }
 }
 /// Classify one key/value pair.
+///
+/// Whole-value checks first (typed keys, denylist, whole-value entropy),
+/// then a token scan: a secret embedded in longer low-entropy prose dilutes
+/// whole-value entropy below threshold, so secret-like whitespace-delimited
+/// tokens are masked in place and the sentence is kept with context intact.
+/// Scope: only random-looking blobs of [`MIN_RANDOM_LEN`]+ chars are
+/// detected. Short or human-readable credentials under innocuous keys are
+/// NOT caught by this heuristic — those need a typed secret key or a
+/// denylist entry.
 pub fn redact_value(key: &str, value: &str) -> Redaction {
     if key_is_secret(key) || value_matches_denylist(value) {
         return Redaction::Redacted;
@@ -149,7 +162,30 @@ pub fn redact_value(key: &str, value: &str) -> Redaction {
     if looks_random(value) {
         return Redaction::Redacted;
     }
+    if value.split(char::is_whitespace).any(looks_random) {
+        return Redaction::Keep(mask_secret_tokens(value));
+    }
     Redaction::Keep(value.to_string())
+}
+
+/// Replace secret-like whitespace-delimited tokens with `<redacted>`,
+/// preserving every other byte (including separator runs) exactly, so a
+/// value with no secret-like token round-trips byte-identical.
+fn mask_secret_tokens(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for span in value.split_inclusive(char::is_whitespace) {
+        // trim_end_matches strips the trailing separator run; the remainder
+        // is one token. (Separator matching is the same char::is_whitespace
+        // predicate as the split, so word + sep == span.)
+        let (word, sep) = span.split_at(span.trim_end_matches(char::is_whitespace).len());
+        out.push_str(if looks_random(word) {
+            "<redacted>"
+        } else {
+            word
+        });
+        out.push_str(sep);
+    }
+    out
 }
 
 /// Redact a whole record. Returns the redacted map, or a [`DroppedRecord`]
@@ -260,5 +296,33 @@ mod tests {
             ),
             "provider refused: <redacted>"
         );
+    }
+
+    const ECHO_44: &str = "xT4vN7qW2zR5uY8iO1pA3sD6fG9hJ0kL2mN4bV6cX8dE0gH2==";
+
+    #[test]
+    fn embedded_secret_in_prose_is_masked_in_place() {
+        // ~190 chars of low-entropy boilerplate around one 48-char secret:
+        // well within the 220-char provider-body budget, whole-value entropy
+        // dilutes below threshold -> pre-fix this leaks verbatim (Keep).
+        let detail = format!("ref {} {ECHO_44} end", "ok ".repeat(60));
+        let out = masked_value("cause", &detail);
+        assert!(!out.contains(ECHO_44), "embedded secret leaked: {out}");
+        assert!(out.contains("<redacted>"), "nothing masked: {out}");
+        assert!(out.contains("end"), "context lost: {out}");
+    }
+
+    #[test]
+    fn prefixed_cause_masks_embedded_secret_keeps_prefix() {
+        let detail = format!("{} {ECHO_44} done", "note ".repeat(40));
+        let out = prefixed_cause("provider refused: ", &detail);
+        assert!(out.starts_with("provider refused: "), "prefix lost: {out}");
+        assert!(!out.contains(ECHO_44), "embedded secret leaked: {out}");
+    }
+
+    #[test]
+    fn benign_prose_passes_through_byte_identical() {
+        let msg = "connection reset by peer after idle timeout exceeded";
+        assert_eq!(masked_value("cause", msg), msg);
     }
 }

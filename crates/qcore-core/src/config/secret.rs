@@ -96,6 +96,19 @@ impl SecretStore {
         }
     }
 
+    /// Best-effort removal of one account from the OS keyring only. The file
+    /// fallback is namespace-independent — legacy and current stores share
+    /// the same fallback dir and account files — so deleting files here
+    /// would destroy current-namespace secrets. Only used for
+    /// post-migration cleanup of legacy-namespace keyring copies; failures
+    /// are silently ignored (leftovers are inert — loads prefer the current
+    /// namespace).
+    pub fn delete_keyring(&self, account: &str) {
+        if let Ok(entry) = keyring::Entry::new(&self.service, account) {
+            let _ = entry.delete_credential();
+        }
+    }
+
     fn account_path(&self, account: &str) -> std::path::PathBuf {
         let safe: String = account
             .chars()
@@ -182,6 +195,26 @@ mod tests {
             .get("import/wg-home/interface.private_key")
             .expect("get");
         assert_eq!(back.expose(), b"round-trip-value");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_keyring_never_touches_files() {
+        // The file fallback is namespace-independent: legacy and current
+        // stores share it. Keyring cleanup must therefore never delete
+        // files, or it would destroy current-namespace secrets.
+        let dir = std::env::temp_dir().join(format!("qcore-secret-del-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("setup");
+        std::fs::write(dir.join("sentinel"), "stay").expect("setup");
+        let store = SecretStore::new("qcore-test-nonexistent", dir.clone());
+        store.delete_keyring("warp-outer/access_token");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("sentinel")).expect("sentinel"),
+            "stay"
+        );
+        let entries: Vec<_> = std::fs::read_dir(&dir).expect("readdir").collect();
+        assert_eq!(entries.len(), 1, "cleanup created residue: {entries:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

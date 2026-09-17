@@ -9,6 +9,15 @@ use std::net::SocketAddr;
 pub mod cache;
 pub mod seeds;
 
+/// Upper bound for profile `concurrency`: discovery caps at 512 candidates
+/// (`seeds::MAX_SEEDED_CANDIDATES`), so more permits buy no parallelism —
+/// only in-flight sockets. 8x the shipped max (64).
+pub const MAX_CONCURRENCY: u32 = 512;
+/// Upper bound for profile `rtt_budget_ms`: 40x the shipped max (1500 ms),
+/// 12x the CLI fast-path cap (5000 ms). A per-probe minute is the absurdity
+/// ceiling, not a tuning choice.
+pub const MAX_RTT_BUDGET_MS: u64 = 60_000;
+
 /// Scan profile (data-model). Exactly `turbo`, `balanced` (default), `stealth`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanProfile {
@@ -123,24 +132,42 @@ fn parse_scan_toml(text: &str, name: &str) -> Result<ScanProfile, String> {
         })
         .collect::<Result<Vec<_>, _>>()?;
     // Bounds are validated here, not just clamped downstream: a negative
-    // TOML integer would wrap to u64::MAX on cast (unbounded scan budget /
-    // unbounded semaphore permits). Fail closed naming the field.
-    let concurrency = get("concurrency")?
+    // TOML integer would wrap on cast (unbounded scan budget / unbounded
+    // semaphore permits), and a huge one would truncate (`as u32` wraps) or
+    // hang (292M-year budget). Fail closed naming the field. Scanner::scan
+    // additionally floors defensively: ScanProfile fields are pub and
+    // directly constructible, bypassing this gate.
+    let raw_concurrency = get("concurrency")?
         .as_integer()
         .ok_or_else(|| format!("scan profile `{name}` concurrency must be an integer"))?;
-    if concurrency < 1 {
+    if raw_concurrency < 1 {
         return Err(format!("scan profile `{name}` concurrency must be >= 1"));
     }
-    let rtt_budget_ms = get("rtt_budget_ms")?
+    if raw_concurrency > MAX_CONCURRENCY as i64 {
+        return Err(format!(
+            "scan profile `{name}` concurrency must be <= {MAX_CONCURRENCY}"
+        ));
+    }
+    // Infallible after the bounds above; try_from (never `as`) documents it.
+    let concurrency = u32::try_from(raw_concurrency)
+        .map_err(|_| format!("scan profile `{name}` concurrency must be >= 1"))?;
+    let raw_budget = get("rtt_budget_ms")?
         .as_integer()
         .ok_or_else(|| format!("scan profile `{name}` rtt_budget_ms must be an integer"))?;
-    if rtt_budget_ms < 1 {
+    if raw_budget < 1 {
         return Err(format!("scan profile `{name}` rtt_budget_ms must be >= 1"));
     }
+    if raw_budget > MAX_RTT_BUDGET_MS as i64 {
+        return Err(format!(
+            "scan profile `{name}` rtt_budget_ms must be <= {MAX_RTT_BUDGET_MS}"
+        ));
+    }
+    let rtt_budget_ms = u64::try_from(raw_budget)
+        .map_err(|_| format!("scan profile `{name}` rtt_budget_ms must be >= 1"))?;
     Ok(ScanProfile {
         name: name.to_string(),
-        concurrency: concurrency as u32,
-        rtt_budget_ms: rtt_budget_ms as u64,
+        concurrency,
+        rtt_budget_ms,
         probe_kind,
         family_order,
         stealth: get("stealth")?
@@ -467,5 +494,30 @@ mod tests {
             err.contains("rtt_budget_ms") && err.contains(">= 1"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn absurd_profile_bounds_rejected() {
+        let base = |concurrency: &str, rtt: &str| {
+            format!(
+                "[p]\nconcurrency = {concurrency}\nrtt_budget_ms = {rtt}\nprobe_kind = \"handshake\"\nfamily_order = [\"ipv4\"]\nstealth = false\n"
+            )
+        };
+        // 2^32 would truncate to 0 semaphore permits (hang) on a lossy cast.
+        let err = parse_scan_toml(&base("4294967296", "500"), "p").unwrap_err();
+        assert!(
+            err.contains("concurrency") && err.contains("512"),
+            "got: {err}"
+        );
+        // A ~292M-year per-probe budget is never a tuning choice.
+        let err = parse_scan_toml(&base("4", "60001"), "p").unwrap_err();
+        assert!(
+            err.contains("rtt_budget_ms") && err.contains("60000"),
+            "got: {err}"
+        );
+        // Boundary values still parse (inclusive).
+        let ok = parse_scan_toml(&base("512", "60000"), "p").expect("bounds inclusive");
+        assert_eq!(ok.concurrency, 512);
+        assert_eq!(ok.rtt_budget_ms, 60_000);
     }
 }

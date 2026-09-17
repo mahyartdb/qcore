@@ -42,8 +42,10 @@ fn redact_json(key: &str, value: &mut serde_json::Value) -> bool {
             if drops_record(key, s) {
                 return true;
             }
-            if let Redaction::Redacted = redact_value(key, s) {
-                *s = "<redacted>".to_string();
+            match redact_value(key, s) {
+                Redaction::Redacted => *s = "<redacted>".to_string(),
+                // Keep payload may carry in-place token masking.
+                Redaction::Keep(masked) => *s = masked,
             }
             false
         }

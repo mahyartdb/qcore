@@ -180,8 +180,10 @@ pub unsafe extern "system" fn Java_com_qcore_Qcore_engineStart(
             crate::qcore_engine_start(e, chain_c.as_ptr(), &mut out, &mut err)
         });
         take_error(err);
+        // Reclaim unconditionally (see scanJson): `take_string` is a no-op
+        // on null, so this is free insurance against payload-on-error paths.
+        let s = take_string(out);
         if code == 0 {
-            let s = take_string(out);
             rust_to_j(env, &s)
         } else {
             std::ptr::null_mut()
@@ -210,8 +212,10 @@ pub unsafe extern "system" fn Java_com_qcore_Qcore_engineStatusJson(
             crate::qcore_engine_status_json(e, id_c.as_ptr(), &mut out, &mut err)
         });
         take_error(err);
+        // Reclaim unconditionally (see scanJson): `take_string` is a no-op
+        // on null, so this is free insurance against payload-on-error paths.
+        let s = take_string(out);
         if code == 0 {
-            let s = take_string(out);
             rust_to_j(env, &s)
         } else {
             std::ptr::null_mut()
@@ -296,8 +300,11 @@ pub unsafe extern "system" fn Java_com_qcore_Qcore_scanJson(
             )
         });
         take_error(err);
+        // Always reclaim `out`: qcore_scan allocates it even on its
+        // payload-on-error path (empty discovery, code 4), so freeing only
+        // on success leaks one JSON string per empty scan from Java.
+        let s = take_string(out);
         if code == 0 {
-            let s = take_string(out);
             rust_to_j(env, &s)
         } else {
             std::ptr::null_mut()
@@ -326,8 +333,10 @@ pub unsafe extern "system" fn Java_com_qcore_Qcore_importConfig(
             crate::qcore_import_config(e, path_c.as_ptr(), &mut out, &mut err)
         });
         take_error(err);
+        // Reclaim unconditionally (see scanJson): `take_string` is a no-op
+        // on null, so this is free insurance against payload-on-error paths.
+        let s = take_string(out);
         if code == 0 {
-            let s = take_string(out);
             rust_to_j(env, &s)
         } else {
             std::ptr::null_mut()
@@ -356,8 +365,10 @@ pub unsafe extern "system" fn Java_com_qcore_Qcore_exportConfig(
             crate::qcore_export_config(e, ref_c.as_ptr(), &mut out, &mut err)
         });
         take_error(err);
+        // Reclaim unconditionally (see scanJson): `take_string` is a no-op
+        // on null, so this is free insurance against payload-on-error paths.
+        let s = take_string(out);
         if code == 0 {
-            let s = take_string(out);
             rust_to_j(env, &s)
         } else {
             std::ptr::null_mut()

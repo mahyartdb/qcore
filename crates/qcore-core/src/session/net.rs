@@ -323,10 +323,11 @@ impl Default for KeepalivePolicy {
 
 /// Spawn the keepalive watcher for one hop. Only aborting the returned
 /// handle stops the ticks — dropping a `JoinHandle` detaches (the task keeps
-/// running), so the owner must abort on teardown. In practice the linger is
-/// bounded: the next tick (≤ one interval) observes the stopped hop as
-/// non-healthy, emits one final event, and breaks. Callers that need prompt
-/// release must abort the handle (structural follow-up recorded in 003 T019).
+/// running). The owner stores `handle.abort_handle()` in `StartedHop` and
+/// aborts on teardown (`unwind`, `SessionHandle::stop_all`); the linger is
+/// then bounded by abort delivery, not by the next tick. A missing bus
+/// receiver deliberately does NOT stop the watcher: receivers attach
+/// transiently, so explicit abort is the only stop signal.
 pub fn spawn_keepalive(
     hop_id: String,
     hop: std::sync::Arc<dyn qcore_transport_api::RunningHop>,

@@ -1,9 +1,10 @@
 //! Reconnect + cold start (US1 T048).
 //!
 //! The first `qcore up` creates `identity.toml` and connects via the default
-//! endpoint without editing a file (SC-003). Scan-once-and-cache plus the
-//! verified-endpoint preference land in US4 (T068) and are consumed here via
-//! [`last_known_good`]; until then the default endpoint is used directly.
+//! endpoint without editing a file (SC-003). Scan-once-and-cache (US4 T068)
+//! feeds the verified-endpoint preference consumed here via
+//! [`last_known_good`]; the zero-config default scan profile comes from
+//! `warp.toml` (002 FR-014) via [`default_scan_profile`].
 
 use crate::chain::ExpandedHop;
 use crate::config::profile_dir::ProfileDirs;

@@ -33,11 +33,13 @@ Three structural decisions drive everything:
 **Language/Version**: Rust stable, pinned MSRV in `rust-toolchain.toml`
 (1.97.1), edition 2021 — same workspace, no new toolchain.
 
-**Primary Dependencies**: existing workspace only, plus two small pure-Rust
-adds: `rcgen` (self-signed P-256 MASQUE credential generation) and no new
-HTTP stack — registration uses a minimal vendored HTTPS/1.1 client over the
-already-vetted `rustls`/`tokio` (see research.md R1). X25519 keygen reuses
-`boringtun`; randomness reuses `getrandom`; secrets reuse the keyring +
+**Primary Dependencies**: existing workspace only, plus small pure-Rust
+adds, all already in the lockfile (zero new locked crates): `rcgen`
+(self-signed P-256 MASQUE credential generation), `base64` (key encoding),
+and `tokio-rustls` (thin TLS adapter over the already-vetted
+`rustls`/`tokio` — not an HTTP stack; registration uses a minimal vendored
+HTTPS/1.1 client, see research.md R1). X25519 keygen reuses `boringtun`;
+randomness reuses `getrandom`; secrets reuse the keyring +
 zeroizing wrappers.
 
 **Storage**: Profile dir (FR-028 model): `identity-warp.toml`,

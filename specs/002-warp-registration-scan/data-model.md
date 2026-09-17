@@ -47,7 +47,7 @@ rotation is a connect-time error naming renewal.
 Rule: cache hit is re-verified (fast path) before use; failure evicts
 and triggers full scan (FR-008).
 
-## RegistrationReport (machine-readable, FR-025 shape)
+## RegistrationReport (machine-readable, 001 FR-025 shape)
 
 | Field | Type | Notes |
 |---|---|---|

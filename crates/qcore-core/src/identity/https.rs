@@ -382,7 +382,8 @@ mod tests {
     }
 
     #[test]
-    fn plaintext_only_to_loopback() {        assert!(parse_url("https://api.example.com/reg").is_ok());
+    fn plaintext_only_to_loopback() {
+        assert!(parse_url("https://api.example.com/reg").is_ok());
         assert!(parse_url("http://127.0.0.1:9/fixture").is_ok());
         assert!(parse_url("http://[::1]:9/x").is_ok());
         assert!(parse_url("http://example.com/reg").is_err());

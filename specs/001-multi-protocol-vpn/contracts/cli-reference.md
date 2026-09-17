@@ -26,6 +26,8 @@ qcore help [command]
 | Command | Aliases | Purpose |
 |---|---|---|
 | `connect` | `up` | Validate a chain and bring up a session |
+| `register` | — | Provision a WARP identity (+ MASQUE enrollment; `--gool` for the pair) |
+| `renew` | — | Refresh in place, re-register on refusal (`--masque-only`, `--hop`) |
 | `stop` | `down` | Tear down the current session |
 | `preflight` | `check` | Validate with zero sockets (FR-029) |
 | `scan` | — | Discover + traffic-validate endpoints |

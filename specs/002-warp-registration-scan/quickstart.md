@@ -42,11 +42,16 @@ artifacts passes; clippy/fmt clean.
 
 ```bash
 qcore register --json                 # SC-001 < 60 s, unblocked net
-qcore scan --transport warp --json    # SC-002 ranked + latency
-qcore up --chain "wireguard peer=warp" --json   # SC-003 carries traffic
-qcore up --chain "gool" --json        # outer+inner identities
-qcore connect --chain "masque alpn=h3" --json   # SC-006 (then alpn=h2)
+qcore scan --transport masque --json  # SC-002 ranked + latency (:443 scans)
+qcore up --chain "wireguard peer=warp endpoint=<scanned-or-known>:2408" --json   # SC-003
+qcore up --chain "gool" --json        # outer+inner identities (endpoints as above)
+qcore connect --chain "masque alpn=h3 endpoint=<scanned>:443" --json   # SC-006 (then alpn=h2)
 ```
 
+Notes: WARP endpoints are UDP and never validate in the TCP scanner —
+supply a known endpoint (`162.159.192.1:2408`) or a previously cached
+winner; `up` merges it with the stored identity's keys automatically.
 Live failures from blocked networks are reported (blocked vs refused),
-never retried as renewals.
+never retried as renewals. Data-plane egress past the handshake is a
+known gap (see spec Assumptions) — the nightly run proves registration,
+handshake, and discovery, not end-to-end traffic.

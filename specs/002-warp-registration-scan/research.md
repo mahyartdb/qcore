@@ -36,6 +36,12 @@ plus workspace fit analysis. Format: Decision / Rationale / Alternatives.
   testable against a loopback fixture.
 - **Alternatives**: reqwest (heavy, duplicates a vetted TLS stack);
   shelling curl (non-Rust process, untestable offline, FR-001 spirit).
+- **Post-implementation note**: TLS runs through `tokio-rustls`, a thin
+  adapter already in the lockfile (not an HTTP stack — the HTTP/1.1 framing
+  stays vendored). The tree also enables rustls's `aws-lc-rs` backend via
+  arti, so the client names `ring` explicitly instead of relying on a
+  process-default provider (which panics when both backends are compiled
+  in).
 
 ## R2. Identity store format
 

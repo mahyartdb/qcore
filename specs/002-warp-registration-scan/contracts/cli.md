@@ -40,6 +40,18 @@ exit 4 with no silent fallback.
 - Refusal signals mid-connect → auto re-register once, then retry
   (FR-004); other failures keep identity, rescan/retry.
 - MASQUE credential in rotation window → auto-rotate inline (FR-005).
+- Inline events print one stderr notice line (`qcore: ...`); fatal
+  identity failures exit 2 with the cause (and the report under `--json`).
+- At start, stored identities and cached endpoints merge into warp/masque
+  hops in memory (explicit chain values always win): a WARP hop needs a
+  stored identity (`register` first) plus an endpoint — its own
+  `endpoint=`, else the newest family-matching cached winner, else exit 2
+  naming `scan`. A MASQUE hop needs a cached endpoint the same way
+  (its credential is account-level and rides enrollment, not the hop).
+- WARP endpoints are UDP and cannot be TCP-probed: live warp scans find
+  nothing (exit 4, correctly). Until UDP handshake probing exists, supply
+  warp endpoints explicitly (`endpoint=162.159.192.1:2408`) or rely on a
+  previously cached winner; MASQUE `:443` endpoints scan normally.
 
 ## RegistrationReport JSON (all register/renew outcomes)
 

@@ -4,7 +4,7 @@
 
 **Created**: 2026-09-16
 
-**Status**: Draft
+**Status**: Implemented (2026-09-17, tasks T001–T037 all complete)
 
 **Input**: User description: "warp registeration for both warp and gool and masque. i want the ability to register and renew these. i also want the ability to scan working endpoints for these. the aether core and oblivion and pattn has these features we can research these and borrow from them"
 
@@ -170,15 +170,18 @@ alpn=h2` through a scanned endpoint and carry traffic on each.
 - **FR-009**: The client MUST support GOOL operation with two separately
   registered identities: one for the outer hop, one for the inner hop,
   each renewable independently (decided: option A). Renewal addresses
-  each identity independently; one command renews the pair only when
-  explicitly asked for both.
+  each identity independently; one command renews the pair when asked for
+  both — explicit `--hop both`, or the default with a stored pair (the
+  default renews every stored identity, never demanding a pair).
 - **FR-010**: The client MUST accept an optional provider license key via
   a command-line flag, an interactive prompt, or a key-file path, and
   apply it to that operation's identity upgrade. Flag use MUST print a
   one-line stderr warning that the key is visible to other processes. The
-  key is a credential: used for the operation, never echoed, logged,
-  reported, or persisted (decided: option B — accepted per operation, not
-  persisted; clarified 2026-09-16: flag form also supported with warning).
+  key is a credential: used for the operation, never written to stdout,
+  logs, reports, or files (the interactive TTY prompt may echo input —
+  scripts and the cautious use `--license-file`) (decided: option B —
+  accepted per operation, not persisted; clarified 2026-09-16: flag form
+  also supported with warning).
 - **FR-011**: Registration, renewal, and scanning traffic MUST use direct
   connections to the provider. Where the provider is unreachable, the
   client MUST fail closed with a report distinguishing "network blocked"
@@ -240,3 +243,14 @@ alpn=h2` through a scanned endpoint and carry traffic on each.
 - Live-network tests are supplementary (nightly); gating tests use fixtures
   and loopback doubles per constitution II.
 - Single-user, single-device: no identity sync or multi-device management.
+- Live validation 2026-09-17 (release binary, unblocked egress): real
+  registration + MASQUE enrollment accepted by the provider, WireGuard
+  handshake completes against a live edge, MASQUE `:443` discovery ranks
+  live endpoints. Data-plane egress past the handshake stalls: the data
+  plane is a channel protocol with no exit translation to real IP
+  forwarding (pre-existing 001 gap) — SC-003/SC-006/SC-007 "carries
+  traffic" holds against doubles only. Exit translation is a new-cycle
+  candidate, not a 002 defect.
+- WARP endpoints are UDP and never validate in the TCP scanner (exit 4 is
+  the correct answer there); live WARP connects supply explicit endpoints
+  or previously cached winners.

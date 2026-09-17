@@ -7,7 +7,7 @@ Stack: Rust stable (pinned MSRV in `rust-toolchain.toml`), tokio, boringtun,
 quinn + rustls/ring + h2, arti-client, `inventory`, serde/TOML/JSON.
 
 Constitution (`.specify/memory/constitution.md`, v1.1.0) wins on any conflict.
-Spec tasks T001–T094 are all complete — this file routes; it does not restate.
+Spec tasks T001-T094 (001) and T001-T037 (002) are all complete; this file routes, it DOES NOT restate.
 
 ## Commands
 
@@ -49,7 +49,7 @@ crates/qcore-core/src/registry.rs       TransportRegistry from inventory
 crates/qcore-core/src/chain/            parse.rs, preset.rs, validate.rs, mod.rs
 crates/qcore-core/src/config/           hop.rs, import.rs, export.rs, obfuscation.rs, secret.rs, chain_file.rs
 crates/qcore-core/src/session/          lifecycle.rs, net.rs, report.rs, reconnect.rs
-crates/qcore-core/src/identity/         model.rs, store.rs, https.rs, register.rs, renew.rs, masque.rs, gool.rs, report.rs
+crates/qcore-core/src/identity/         model.rs, store.rs, https.rs, register.rs, renew.rs, masque.rs, gool.rs, inject.rs, report.rs
 crates/qcore-core/src/scan/             mod.rs Scanner, seeds.rs warp.toml candidates, cache.rs per-transport winners
 crates/qcore-cli/src/cmd/               register.rs, renew.rs (+ license.rs shared key input)
 crates/qcore-core/src/diag/             redact.rs, events.rs (NDJSON stream)
@@ -74,3 +74,7 @@ xtask/src/                             build, smoke, package, release, abi_diff
 - Verify through execution (`xtask ci` or the scoped command), not by re-reading.
 - Docs and code disagree? Code describes behavior, constitution decides policy —
   surface the conflict, never silently pick a side.
+
+## Skills
+
+use related rust skills when writing or editing rust code.

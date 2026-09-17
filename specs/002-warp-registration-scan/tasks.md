@@ -115,7 +115,7 @@ Rust workspace per plan.md (extends the 001 layout, no new crates/binaries):
 
 - [X] T025 [P] [US3] Implement refusal classifier in `crates/qcore-core/src/identity/renew.rs` (re-register ONLY on explicit provider-refusal signals; timeouts/handshake-silence/TLS-errors/empty-scans keep identity and rescan/retry — Aether-type table, research R3)
 - [X] T026 [US3] Implement renewal flow in `crates/qcore-core/src/identity/renew.rs` (refresh-in-place when accepted, fresh re-register on refusal, previous identity intact on midway failure — same file as T025, runs after it)
-- [X] T027 [US3] Implement `renew` CLI command (+ `--masque-only`) in `crates/qcore-cli/src/cmd/renew.rs`; GOOL pairs renew per-hop (outer/inner selectable, default: the hop named by the chain), never touching the sibling identity
+- [X] T027 [US3] Implement `renew` CLI command (+ `--masque-only`) in `crates/qcore-cli/src/cmd/renew.rs`; GOOL pairs renew per-hop (outer/inner selectable via `--hop`; default renews every stored identity, never demanding a pair), never touching the sibling identity
 - [X] T028 [US3] Implement mid-connect auto re-register-once on refusal in `crates/qcore-core/src/api/engine.rs` (extends T014 integration)
 
 **Checkpoint**: US1 + US2 + US3 work — identities survive hostile networks without churn
@@ -250,3 +250,15 @@ With multiple developers (after Foundational):
 - Each story independently completable and testable (checkpoints list exact proofs from quickstart.md)
 - Commit after each task or logical group; stop at any checkpoint to validate story independently
 - Avoid: vague tasks, same-file conflicts, cross-story dependencies that break independence
+- Implementation notes (post-task additions, all committed):
+  - Bring-up injection (`identity/inject.rs`, unlisted at plan time): stored
+    identities + cached endpoints merge into warp/masque hop configs in
+    `Engine::start` — without it live connects fail demanding keys (the
+    "identity store milestone" the old error named).
+  - `preconnect_identity` was engine-only until live-test prep showed
+    `connect` never called it; wired into `run_connect` (fail-closed exit 2).
+  - rustls dual-provider panic (quinn `ring` vs arti `aws-lc-rs`): explicit
+    provider in the registration TLS client + regression test.
+  - Live 2026-09-17: registration, handshake, and MASQUE discovery verified
+    against the provider; data-plane egress stalls on the pre-existing 001
+    exit-translation gap (spec Assumptions record it; new-cycle candidate).

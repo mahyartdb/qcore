@@ -9,8 +9,8 @@ pub mod socks;
 pub mod supervisor;
 
 use qcore_transport_api::{
-    ByteStream, Capabilities, Dialer, HopConfig, HopError, HopErrorKind, HopEvent, HopHealth,
-    RunningHop, TransportDescriptor, UdpFlow,
+    unspecified_bind, ByteStream, Capabilities, Dialer, HopConfig, HopError, HopErrorKind,
+    HopEvent, HopHealth, RunningHop, TransportDescriptor, UdpFlow,
 };
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -135,17 +135,9 @@ impl Dialer for PsiphonDialer {
             )
         })?;
         // Hold the TCP control connection open for the flow's lifetime.
-        let socket = tokio::net::UdpSocket::bind(if dst.is_ipv4() {
-            "0.0.0.0:0"
-                .parse::<SocketAddr>()
-                .expect("unspecified IPv4 bind literal parses")
-        } else {
-            "[::]:0"
-                .parse::<SocketAddr>()
-                .expect("unspecified IPv6 bind literal parses")
-        })
-        .await
-        .map_err(HopError::from)?;
+        let socket = tokio::net::UdpSocket::bind(unspecified_bind(&dst))
+            .await
+            .map_err(HopError::from)?;
         Ok(Box::new(PsiphonUdpFlow {
             hop_id: self.hop_id.clone(),
             _control,

@@ -250,7 +250,10 @@ async fn renew_masque_only(
             action: ReportAction::Blocked,
             identity: Some(id.device_id.clone()),
             endpoint: None,
-            cause: format!("identity store failed ({e}); previous record intact"),
+            cause: format!(
+                "identity store failed ({}); previous record intact",
+                masked_value("cause", &e.to_string())
+            ),
             license_applied: false,
         };
     }

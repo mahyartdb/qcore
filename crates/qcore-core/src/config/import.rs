@@ -312,9 +312,12 @@ impl ConfigImport {
 }
 
 fn check_endpoint(ep: &str) -> Result<(), String> {
-    let (_, port) = ep
+    let (host, port) = ep
         .rsplit_once(':')
         .ok_or_else(|| format!("`{ep}` is not host:port"))?;
+    if host.is_empty() {
+        return Err(format!("`{ep}` has an empty host"));
+    }
     port.parse::<u16>()
         .map(|_| ())
         .map_err(|_| format!("port `{port}` is not numeric"))?;
@@ -881,6 +884,15 @@ mod tests {
     }
 
     #[test]
+    fn b64_rejection_shape_is_stable() {
+        // Rejection reasons surface in CLI output (`PrivateKey: ...`): the
+        // `base64: ` prefix is contractual, the crate's detail after it is
+        // not (it changed once already, hand-rolled strings to crate text).
+        let err = b64_decode("!!!").unwrap_err();
+        assert!(err.starts_with("base64: "), "got: {err}");
+    }
+
+    #[test]
     fn known_key_decodes() {
         // 32-byte keys are 44 base64 chars with single `=` padding.
         let k = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=";
@@ -920,6 +932,15 @@ mod tests {
             err.contains("jc") && err.contains("not a uint"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn endpoint_without_host_rejected() {
+        assert!(check_endpoint("203.0.113.10:51820").is_ok());
+        assert!(check_endpoint("[::1]:51820").is_ok());
+        let err = check_endpoint(":80").unwrap_err();
+        assert!(err.contains("empty host"), "got: {err}");
+        assert!(check_endpoint("no-port").is_err());
     }
 
     #[test]

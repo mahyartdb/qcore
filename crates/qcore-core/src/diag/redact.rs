@@ -63,10 +63,14 @@ pub struct DroppedRecord {
 
 impl std::fmt::Display for DroppedRecord {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Field names are not secrets: operators triaging a dropped record
+        // need to know which keys were present.
         write!(
             f,
-            "record dropped fail-closed ({} fields): {}",
-            self.field_count, self.reason
+            "record dropped fail-closed ({} fields: {}): {}",
+            self.field_count,
+            self.keys.join(", "),
+            self.reason
         )
     }
 }

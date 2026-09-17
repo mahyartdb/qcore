@@ -5,7 +5,7 @@
 //! IPv4 (configurable to IPv6). `AllowedIPs` honored exactly (no silent family
 //! expansion). DNS routed through the tunnel or refuse to start (FR-013c).
 
-use qcore_transport_api::{ByteStream, Capabilities, Dialer, HopError, UdpFlow};
+use qcore_transport_api::{unspecified_bind, ByteStream, Capabilities, Dialer, HopError, UdpFlow};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -237,16 +237,8 @@ impl Dialer for RootDialer {
     }
 
     async fn dial_udp(&self, dst: SocketAddr) -> Result<Box<dyn UdpFlow>, HopError> {
-        // Static unspecified-bind literals: unparsable only if edited wrong.
-        let bind: SocketAddr = if dst.is_ipv4() {
-            "0.0.0.0:0"
-                .parse()
-                .expect("IPv4 unspecified bind literal parses")
-        } else {
-            "[::]:0"
-                .parse()
-                .expect("IPv6 unspecified bind literal parses")
-        };
+        // Infallible unspecified bind (never parse constant socket literals).
+        let bind: SocketAddr = unspecified_bind(&dst);
         let socket = tokio::net::UdpSocket::bind(bind)
             .await
             .map_err(HopError::from)?;

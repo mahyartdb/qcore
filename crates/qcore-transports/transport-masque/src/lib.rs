@@ -15,8 +15,8 @@ pub mod test_support;
 
 use bytes::Bytes;
 use qcore_transport_api::{
-    ByteStream, Capabilities, Dialer, HopConfig, HopError, HopErrorKind, HopEvent, HopHealth,
-    ObfuscationFamily, RunningHop, TransportDescriptor, UdpFlow,
+    unspecified_bind, ByteStream, Capabilities, Dialer, HopConfig, HopError, HopErrorKind,
+    HopEvent, HopHealth, ObfuscationFamily, RunningHop, TransportDescriptor, UdpFlow,
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -117,16 +117,8 @@ impl MasqueHop {
         insecure: bool,
         carrier: Arc<dyn Dialer>,
     ) -> Result<Arc<dyn RunningHop>, HopError> {
-        let mut endpoint_builder = quinn::Endpoint::client(if endpoint.is_ipv4() {
-            "0.0.0.0:0"
-                .parse()
-                .expect("unspecified IPv4 bind literal parses")
-        } else {
-            "[::]:0"
-                .parse()
-                .expect("unspecified IPv6 bind literal parses")
-        })
-        .map_err(|e| HopError::transport(hop_id.clone(), format!("quinn bind: {e}")))?;
+        let mut endpoint_builder = quinn::Endpoint::client(unspecified_bind(&endpoint))
+            .map_err(|e| HopError::transport(hop_id.clone(), format!("quinn bind: {e}")))?;
         endpoint_builder.set_default_client_config(client_config(insecure)?);
         let local = endpoint_builder
             .local_addr()
@@ -200,15 +192,7 @@ impl MasqueHop {
                 let mut conn = conn;
                 let _ = (&mut conn).await;
             });
-            let local: SocketAddr = if endpoint.is_ipv4() {
-                "0.0.0.0:0"
-                    .parse()
-                    .expect("unspecified IPv4 bind literal parses")
-            } else {
-                "[::]:0"
-                    .parse()
-                    .expect("unspecified IPv6 bind literal parses")
-            };
+            let local: SocketAddr = unspecified_bind(&endpoint);
             (sender, task, local)
         } else {
             let tcp = tokio::time::timeout(
@@ -558,15 +542,7 @@ async fn h2_connect(
             let mut conn = conn;
             let _ = (&mut conn).await;
         });
-        let local: SocketAddr = if endpoint.is_ipv4() {
-            "0.0.0.0:0"
-                .parse()
-                .expect("unspecified IPv4 bind literal parses")
-        } else {
-            "[::]:0"
-                .parse()
-                .expect("unspecified IPv6 bind literal parses")
-        };
+        let local: SocketAddr = unspecified_bind(&endpoint);
         return Ok((sender, local));
     }
     let tcp = tokio::net::TcpStream::connect(endpoint)

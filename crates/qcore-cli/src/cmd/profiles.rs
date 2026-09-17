@@ -91,7 +91,10 @@ pub fn run(engine: &Engine, dirs: &qcore_core::config::profile_dir::ProfileDirs)
             presets
         }
         Err(e) => {
-            println!("  (unavailable: {e})");
+            // Name the fallback explicitly: the names below are builtins,
+            // not the effective configuration (every consumer of
+            // resolve_presets fails closed on this error).
+            println!("  (unavailable: {e}; showing builtin fallback)");
             qcore_core::chain::preset::builtin_presets()
         }
     };

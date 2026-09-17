@@ -138,6 +138,14 @@ fn fail_closed_placeholder_emits_metadata_only() {
     assert_eq!(dropped.field_count, 2);
     assert!(dropped.keys.contains(&"mystery".to_string()));
 
+    // The log rendering names the keys (triage aid; names are not secrets).
+    let rendered = format!("{dropped}");
+    assert!(
+        rendered.contains("mystery") && rendered.contains("hop_id"),
+        "got: {rendered}"
+    );
+    assert!(!rendered.contains("xT4vN7qW"), "value leaked: {rendered}");
+
     // Same guarantee through the NDJSON stream.
     let r = qcore_transport_api::FailureReport::new(
         qcore_transport_api::FailureLayer::Transport,

@@ -136,9 +136,13 @@ impl Dialer for PsiphonDialer {
         })?;
         // Hold the TCP control connection open for the flow's lifetime.
         let socket = tokio::net::UdpSocket::bind(if dst.is_ipv4() {
-            "0.0.0.0:0".parse::<SocketAddr>().unwrap()
+            "0.0.0.0:0"
+                .parse::<SocketAddr>()
+                .expect("unspecified IPv4 bind literal parses")
         } else {
-            "[::]:0".parse::<SocketAddr>().unwrap()
+            "[::]:0"
+                .parse::<SocketAddr>()
+                .expect("unspecified IPv6 bind literal parses")
         })
         .await
         .map_err(HopError::from)?;

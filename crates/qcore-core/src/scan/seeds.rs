@@ -194,10 +194,13 @@ fn sample_cidr_v4(cidr: &str) -> Vec<std::net::Ipv4Addr> {
     let usable = total - 2; // network + broadcast
     let count = usable.min(MAX_HOSTS_PER_RANGE as u64);
     let stride = (usable / count).max(1);
+    // Clamp to the last usable address: without this, high ranges (e.g.
+    // 255.255.0.0/16) overflow past u32::MAX and collapse onto broadcast.
+    let last_usable = base_u32 as u64 + total - 2;
     (0..count)
         .map(|i| {
-            let addr = base_u32 as u64 + 1 + i * stride;
-            std::net::Ipv4Addr::from(u32::try_from(addr).unwrap_or(u32::MAX))
+            let addr = (base_u32 as u64 + 1 + i * stride).min(last_usable);
+            std::net::Ipv4Addr::from(addr as u32)
         })
         .collect()
 }
@@ -263,6 +266,14 @@ mod tests {
         // Garbage selects nothing.
         assert!(sample_cidr_v4("nope").is_empty());
         assert!(sample_cidr_v4("1.2.3.4/33").is_empty());
+        // High ranges stay inside the CIDR: no overflow onto broadcast.
+        let high = sample_cidr_v4("255.255.0.0/16");
+        assert_eq!(high.len(), MAX_HOSTS_PER_RANGE);
+        let base = u32::from("255.255.0.0".parse::<std::net::Ipv4Addr>().unwrap());
+        assert!(high.iter().all(|h| {
+            let n = u32::from(*h);
+            n > base && n < base + 65534
+        }));
     }
 
     #[test]

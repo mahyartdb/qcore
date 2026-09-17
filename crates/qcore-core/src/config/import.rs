@@ -1,7 +1,7 @@
 //! WireGuard-family config import (US2 T061).
 //!
 //! Standard INI (`[Interface]` / `[Peer]`). Import preserves every recognized
-//! field field-for-field — including dual-stack `Address` and `AllowedIPs`
+//! field, field-for-field — including dual-stack `Address` and `AllowedIPs`
 //! exactly — and rejects unknown fields by name (FR-023). Absent AWG keys
 //! mean standard WireGuard behavior. Secrets (`PrivateKey`, `PresharedKey`)
 //! are parsed at the boundary into [`SecretString`] and never persist in the
@@ -267,20 +267,26 @@ impl ConfigImport {
         {
             imp.reject("missing `PrivateKey` in [Interface]".to_string());
         }
-        // Field-level validation (cloned first: reject() mutates).
-        for (i, peer) in imp.peers.clone().iter().enumerate() {
+        // Field-level validation (errors collected first: reject() takes
+        // &mut while peers are borrowed, so no clone-the-vec workaround).
+        let mut field_errors = Vec::new();
+        for (i, peer) in imp.peers.iter().enumerate() {
             if let Some(ep) = peer.get("endpoint") {
                 if let Err(e) = check_endpoint(ep) {
-                    imp.reject(format!("peer {i} `Endpoint`: {e}"));
+                    field_errors.push(format!("peer {i} `Endpoint`: {e}"));
                 }
             }
             if let Some(aips) = peer.get("allowed_ips") {
                 for part in aips.split(',').map(str::trim) {
                     if !part.contains('/') {
-                        imp.reject(format!("peer {i} `AllowedIPs` entry `{part}` is not CIDR"));
+                        field_errors
+                            .push(format!("peer {i} `AllowedIPs` entry `{part}` is not CIDR"));
                     }
                 }
             }
+        }
+        for e in field_errors {
+            imp.reject(e);
         }
         if let Some(addr) = imp.interface.get("address").cloned() {
             for part in addr.split(',').map(str::trim) {
@@ -549,12 +555,19 @@ impl StoredImport {
                 let t = a
                     .as_table()
                     .ok_or_else(|| "import record: awg is not a table".to_string())?;
+                // Missing or mistyped numerics are corruption, not zeros:
+                // records are machine-written complete, so fail closed.
                 let num = |k: &str| {
                     t.get(k)
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("0")
-                        .parse::<u32>()
-                        .map_err(|_| format!("import record: awg `{k}` not a uint"))
+                        .ok_or_else(|| format!("import record: awg `{k}` missing"))
+                        .and_then(|x| {
+                            x.as_str()
+                                .ok_or_else(|| format!("import record: awg `{k}` not a string"))
+                                .and_then(|s| {
+                                    s.parse::<u32>()
+                                        .map_err(|_| format!("import record: awg `{k}` not a uint"))
+                                })
+                        })
                 };
                 let opt = |k: &str| t.get(k).and_then(|x| x.as_str()).map(str::to_string);
                 Some(AwgParams {
@@ -797,76 +810,21 @@ pub fn b64_decode_32(s: &str) -> Result<[u8; 32], String> {
     Ok(out)
 }
 
-/// Minimal standard-base64 decoder (no external crate; WG keys canonical).
+/// Minimal standard-base64 decoder (WG keys canonical). Backed by the
+/// vetted `base64` crate (already linked); whitespace is stripped first so
+/// multi-line values behave as before.
 pub fn b64_decode(s: &str) -> Result<Vec<u8>, String> {
+    use base64::Engine as _;
     let s: String = s.chars().filter(|c| !c.is_whitespace()).collect();
-    if !s.len().is_multiple_of(4) {
-        return Err("base64 length must be a multiple of 4".to_string());
-    }
-    let val = |c: char| -> Result<u8, String> {
-        match c {
-            'A'..='Z' => Ok(c as u8 - b'A'),
-            'a'..='z' => Ok(c as u8 - b'a' + 26),
-            '0'..='9' => Ok(c as u8 - b'0' + 52),
-            '+' => Ok(62),
-            '/' => Ok(63),
-            _ => Err(format!("bad base64 char `{c}`")),
-        }
-    };
-    let mut out = Vec::new();
-    let b = s.as_bytes();
-    let mut i = 0;
-    while i < b.len() {
-        let mut sext = [0u8; 4];
-        let mut pad = 0;
-        for j in 0..4 {
-            let c = b[i + j] as char;
-            if c == '=' {
-                pad += 1;
-            } else {
-                if pad > 0 {
-                    return Err("base64 padding in the middle".to_string());
-                }
-                sext[j] = val(c)?;
-            }
-        }
-        if pad > 2 {
-            return Err("bad base64 padding".to_string());
-        }
-        // Mask before shifting: sextets are 6 bits, u8 shifts overflow.
-        out.push(sext[0] << 2 | sext[1] >> 4);
-        if pad < 2 {
-            out.push((sext[1] & 0x0f) << 4 | sext[2] >> 2);
-        }
-        if pad < 1 {
-            out.push((sext[2] & 0x03) << 6 | sext[3]);
-        }
-        i += 4;
-    }
-    Ok(out)
+    base64::engine::general_purpose::STANDARD
+        .decode(s)
+        .map_err(|e| format!("base64: {e}"))
 }
 
 /// Standard-base64 encode (tests + tooling; canonical WG alphabet).
 pub fn b64_encode(data: &[u8]) -> String {
-    const ALPHA: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut s = String::new();
-    for chunk in data.chunks(3) {
-        let mut n = [0u8; 3];
-        n[..chunk.len()].copy_from_slice(chunk);
-        s.push(ALPHA[(n[0] >> 2) as usize] as char);
-        s.push(ALPHA[(((n[0] & 3) << 4) | (n[1] >> 4)) as usize] as char);
-        if chunk.len() > 1 {
-            s.push(ALPHA[(((n[1] & 15) << 2) | (n[2] >> 6)) as usize] as char);
-        } else {
-            s.push('=');
-        }
-        if chunk.len() > 2 {
-            s.push(ALPHA[(n[2] & 63) as usize] as char);
-        } else {
-            s.push('=');
-        }
-    }
-    s
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(data)
 }
 
 pub fn hex_encode(data: &[u8]) -> String {
@@ -907,5 +865,15 @@ mod tests {
     fn bad_key_rejected() {
         assert!(b64_decode_32("zz").is_err());
         assert!(b64_decode_32(&b64_encode(&[1u8; 31])).is_err());
+    }
+
+    #[test]
+    fn truncated_awg_record_fails_closed() {
+        // A present-but-incomplete [awg] table is corruption: missing
+        // numerics error instead of silently defaulting to zero.
+        let text =
+            "ref_name = \"r\"\nsource_format = \"amneziawg\"\n[interface]\n[awg]\njc = \"1\"\n";
+        let err = StoredImport::from_toml(text).unwrap_err();
+        assert!(err.contains("awg `jmin` missing"), "got: {err}");
     }
 }

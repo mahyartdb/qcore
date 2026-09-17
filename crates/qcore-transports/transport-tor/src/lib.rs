@@ -158,7 +158,7 @@ impl Dialer for TorDialer {
         Err(HopError::new(
             HopErrorKind::Transport,
             Some(self.hop_id.clone()),
-            "tor is TCP-only; a UDP hop after tor needs `insert `relay` after `tor``",
+            "tor is TCP-only; a UDP hop after tor needs a relay hop after tor",
         ))
     }
 

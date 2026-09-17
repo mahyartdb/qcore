@@ -9,4 +9,6 @@ pub mod events;
 pub mod redact;
 
 pub use events::{to_ndjson, DiagEvent, DIAG_STREAM_VERSION};
-pub use redact::{drops_record, redact_record, redact_value, Redaction};
+pub use redact::{
+    drops_record, masked_value, prefixed_cause, redact_record, redact_value, Redaction,
+};

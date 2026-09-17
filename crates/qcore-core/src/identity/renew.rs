@@ -10,13 +10,14 @@
 
 use crate::config::profile_dir::ProfileDirs;
 use crate::config::secret::SecretString;
+use crate::diag::redact::masked_value;
 use crate::identity::masque::{enroll_credential, generate_credential};
 use crate::identity::model::{now_ms, MasqueCredential, ProviderIdentity};
 use crate::identity::register::{
     apply_license, refresh_stored, register_fresh, ProviderOptions, RegisterError,
 };
 use crate::identity::report::{report_for_error, RegistrationReport, ReportAction};
-use crate::identity::store::{load, save, IdentityRole};
+use crate::identity::store::{load, role_name, save, IdentityRole};
 
 /// Renewal verdict for a failed refresh.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,7 +90,10 @@ pub async fn renew_role(
                     action: ReportAction::Blocked,
                     identity: Some(id.device_id.clone()),
                     endpoint: None,
-                    cause: format!("identity store failed ({e}); previous record intact"),
+                    cause: format!(
+                        "identity store failed ({}); previous record intact",
+                        masked_value("cause", &e)
+                    ),
                     license_applied: false,
                 };
             }
@@ -122,7 +126,10 @@ pub async fn renew_role(
                 action: ReportAction::Reused,
                 identity: Some(id.device_id.clone()),
                 endpoint: None,
-                cause: format!("{e}; identity kept — rescan/retry instead of renewing"),
+                cause: format!(
+                    "{}; identity kept — rescan/retry instead of renewing",
+                    masked_value("cause", &e.to_string())
+                ),
                 license_applied: false,
             },
         },
@@ -148,7 +155,10 @@ async fn reregister(
             action: ReportAction::Blocked,
             identity: None,
             endpoint: None,
-            cause: format!("identity store failed ({e}); previous record intact"),
+            cause: format!(
+                "identity store failed ({}); previous record intact",
+                masked_value("cause", &e)
+            ),
             license_applied: false,
         };
     }
@@ -208,7 +218,7 @@ async fn renew_masque_only(
                 action: ReportAction::Blocked,
                 identity: Some(id.device_id.clone()),
                 endpoint: None,
-                cause: format!("{e}; warp identity intact"),
+                cause: format!("{}; warp identity intact", masked_value("cause", &e)),
                 license_applied: false,
             }
         }
@@ -221,7 +231,8 @@ async fn renew_masque_only(
                 identity: Some(id.device_id.clone()),
                 endpoint: None,
                 cause: format!(
-                    "credential not enrolled ({e}); warp identity intact — retry when reachable"
+                    "credential not enrolled ({}); warp identity intact — retry when reachable",
+                    masked_value("cause", &e.to_string())
                 ),
                 license_applied: false,
             }
@@ -253,13 +264,6 @@ async fn renew_masque_only(
             format!("MASQUE credential rotated via {family}")
         },
         license_applied: false,
-    }
-}
-
-fn role_name(role: IdentityRole) -> &'static str {
-    match role {
-        IdentityRole::Outer => "warp",
-        IdentityRole::Inner => "warp-inner",
     }
 }
 

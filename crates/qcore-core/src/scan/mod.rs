@@ -122,16 +122,25 @@ fn parse_scan_toml(text: &str, name: &str) -> Result<ScanProfile, String> {
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
+    // Bounds are validated here, not just clamped downstream: a negative
+    // TOML integer would wrap to u64::MAX on cast (unbounded scan budget /
+    // unbounded semaphore permits). Fail closed naming the field.
+    let concurrency = get("concurrency")?
+        .as_integer()
+        .ok_or_else(|| format!("scan profile `{name}` concurrency must be an integer"))?;
+    if concurrency < 1 {
+        return Err(format!("scan profile `{name}` concurrency must be >= 1"));
+    }
+    let rtt_budget_ms = get("rtt_budget_ms")?
+        .as_integer()
+        .ok_or_else(|| format!("scan profile `{name}` rtt_budget_ms must be an integer"))?;
+    if rtt_budget_ms < 1 {
+        return Err(format!("scan profile `{name}` rtt_budget_ms must be >= 1"));
+    }
     Ok(ScanProfile {
         name: name.to_string(),
-        concurrency: get("concurrency")?
-            .as_integer()
-            .ok_or_else(|| format!("scan profile `{name}` concurrency must be an integer"))?
-            as u32,
-        rtt_budget_ms: get("rtt_budget_ms")?
-            .as_integer()
-            .ok_or_else(|| format!("scan profile `{name}` rtt_budget_ms must be an integer"))?
-            as u64,
+        concurrency: concurrency as u32,
+        rtt_budget_ms: rtt_budget_ms as u64,
         probe_kind,
         family_order,
         stealth: get("stealth")?
@@ -437,5 +446,26 @@ mod tests {
     fn last_known_good_only_for_verified() {
         assert!(cand(1, Confidence::Verified, Reachability::Passed).last_known_good);
         assert!(!cand(1, Confidence::Uncertain, Reachability::Passed).last_known_good);
+    }
+
+    #[test]
+    fn negative_profile_bounds_rejected() {
+        // Negative TOML integers would wrap to u64::MAX on cast
+        // (unbounded budget / unbounded permits): fail closed instead.
+        let base = |concurrency: &str, rtt: &str| {
+            format!(
+                "[p]\nconcurrency = {concurrency}\nrtt_budget_ms = {rtt}\nprobe_kind = \"handshake\"\nfamily_order = [\"ipv4\"]\nstealth = false\n"
+            )
+        };
+        let err = parse_scan_toml(&base("-4", "500"), "p").unwrap_err();
+        assert!(
+            err.contains("concurrency") && err.contains(">= 1"),
+            "got: {err}"
+        );
+        let err = parse_scan_toml(&base("4", "-1"), "p").unwrap_err();
+        assert!(
+            err.contains("rtt_budget_ms") && err.contains(">= 1"),
+            "got: {err}"
+        );
     }
 }

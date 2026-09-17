@@ -249,3 +249,48 @@ async fn registration_artifacts_carry_no_secrets() {
         assert_eq!(mode & 0o777, 0o600, "identity record is 0600");
     }
 }
+
+// --- 003 T013: Wave-1 regression guards -------------------------------------
+// Provider-echoed secret-like details must be masked in CLI-facing causes
+// (identity RegistrationReport) and in text failure rendering (session
+// report), while actionable prefixes survive.
+
+#[test]
+fn refusal_cause_with_provider_echoed_secret_is_masked() {
+    use qcore_core::identity::register::RegisterError;
+    const ECHO: &str = "xT4vN7qW2zR5uY8iO1pA3sD6fG9hJ0kL2mN4bV6cX8dE0gH2==";
+    let r = qcore_core::identity::report::report_for_error(RegisterError::Refused(format!(
+        "quota gone {ECHO}"
+    )));
+    let json = r.to_json();
+    assert!(
+        !json.contains("xT4vN7qW"),
+        "refusal cause leaked provider echo"
+    );
+    assert!(
+        json.contains("provider refused: "),
+        "actionable prefix kept"
+    );
+    assert!(json.contains("<redacted>"));
+}
+
+#[test]
+fn text_failure_path_masks_secret_like_cause() {
+    const ECHO: &str = "xT4vN7qW2zR5uY8iO1pA3sD6fG9hJ0kL2mN4bV6cX8dE0gH2==";
+    let r = qcore_transport_api::FailureReport::new(
+        qcore_transport_api::FailureLayer::Transport,
+        "wg-0",
+        format!("boom {ECHO}"),
+        "transport",
+    );
+    let report = qcore_core::session::report::ConnectionReport {
+        failure: Some(r),
+        ..qcore_core::session::report::ConnectionReport::new(vec![], "wg-0")
+    };
+    let text = qcore_core::session::report::to_text(&report);
+    assert!(
+        !text.contains("xT4vN7qW"),
+        "text path leaked secret-like cause"
+    );
+    assert!(text.contains("cause=<redacted>"));
+}

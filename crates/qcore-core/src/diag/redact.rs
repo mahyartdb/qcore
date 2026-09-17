@@ -43,7 +43,7 @@ const DENYLIST: &[&str] = &[
 /// Redaction verdict for one value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Redaction {
-    /// Safe to emit (possibly masked length-preserving... no: emitted as-is).
+    /// Safe to emit as-is.
     Keep(String),
     /// Proven secret: replaced, never emitted.
     Redacted,
@@ -56,6 +56,24 @@ pub struct DroppedRecord {
     pub keys: Vec<String>,
     pub reason: &'static str,
 }
+
+impl std::fmt::Display for DroppedRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "record dropped fail-closed ({} fields): {}",
+            self.field_count, self.reason
+        )
+    }
+}
+
+/// Minimum byte length for a free-form value to count as secret-like.
+const MIN_RANDOM_LEN: usize = 16;
+/// Minimum Shannon entropy (bits/char) for a value to count as secret-like.
+const ENTROPY_BITS_PER_CHAR: f64 = 4.2;
+/// Minimum byte length for an unanchored secret-like value to drop the
+/// whole record fail-closed (shorter values are redacted in place).
+const MIN_DROP_LEN: usize = 44;
 
 fn key_is_secret(key: &str) -> bool {
     let k = key.to_lowercase().replace(['-', '_', ' '], "");
@@ -87,7 +105,9 @@ fn entropy(s: &str) -> f64 {
 }
 
 fn looks_random(s: &str) -> bool {
-    s.len() >= 16 && entropy(s) > 4.2 && s.bytes().any(|b| b.is_ascii_alphanumeric())
+    s.len() >= MIN_RANDOM_LEN
+        && entropy(s) > ENTROPY_BITS_PER_CHAR
+        && s.bytes().any(|b| b.is_ascii_alphanumeric())
 }
 
 /// Record-drop predicate shared by [`redact_record`] and the NDJSON event
@@ -97,9 +117,28 @@ pub fn drops_record(key: &str, value: &str) -> bool {
     !key_is_secret(key)
         && !value_matches_denylist(value)
         && looks_random(value)
-        && value.len() >= 44
+        && value.len() >= MIN_DROP_LEN
 }
 
+/// Mask a free-text value when it is secret-like, else return it
+/// unchanged. Shared by diagnostic sinks that render raw fields (session
+/// text/stderr reports, FFI error messages), which — unlike the NDJSON
+/// stream — have no per-field redaction pass.
+pub fn masked_value(key: &str, value: &str) -> String {
+    match redact_value(key, value) {
+        Redaction::Keep(s) => s,
+        Redaction::Redacted => "<redacted>".to_string(),
+    }
+}
+
+/// Keep an actionable `prefix` and mask a secret-like `detail` (fail
+/// closed). Shared by CLI-facing cause builders (registration reports).
+pub fn prefixed_cause(prefix: &str, detail: &str) -> String {
+    match redact_value("cause", detail) {
+        Redaction::Keep(_) => format!("{prefix}{detail}"),
+        Redaction::Redacted => format!("{prefix}<redacted>"),
+    }
+}
 /// Classify one key/value pair.
 pub fn redact_value(key: &str, value: &str) -> Redaction {
     if key_is_secret(key) || value_matches_denylist(value) {
@@ -195,5 +234,31 @@ mod tests {
         assert_eq!(out["kind"], "wireguard");
         assert_eq!(out["PrivateKey"], "<redacted>");
         assert!(!out["PrivateKey"].contains("cB6V"));
+    }
+
+    #[test]
+    fn sink_helpers_mask_only_secret_like_values() {
+        assert_eq!(
+            masked_value("cause", "connection refused"),
+            "connection refused"
+        );
+        assert_eq!(
+            masked_value(
+                "cause",
+                "boom xT4vN7qW2zR5uY8iO1pA3sD6fG9hJ0kL2mN4bV6cX8dE0gH2=="
+            ),
+            "<redacted>"
+        );
+        assert_eq!(
+            prefixed_cause("provider refused: ", "quota gone"),
+            "provider refused: quota gone"
+        );
+        assert_eq!(
+            prefixed_cause(
+                "provider refused: ",
+                "quota gone xT4vN7qW2zR5uY8iO1pA3sD6fG9hJ0kL2mN4bV6cX8dE0gH2=="
+            ),
+            "provider refused: <redacted>"
+        );
     }
 }

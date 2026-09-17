@@ -78,3 +78,5 @@ xtask/src/                             build, smoke, package, release, abi_diff
 ## Skills
 
 use related rust skills when writing or editing rust code.
+Per-area rule-to-check mapping (which skills govern each area + fastest
+verification command): `docs/rust-practices.md`.

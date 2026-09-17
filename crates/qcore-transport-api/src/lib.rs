@@ -1,7 +1,7 @@
 //! Public transport plugin boundary (plan: The Transport Interface).
 //!
 //! A transport is a plugin behind three traits plus static descriptor data.
-//! The engine reads descriptors from the [`registry`](crate::registry) and never
+//! The engine reads descriptors from its transport registry and never
 //! matches on a transport kind. Depends on tokio + async-trait only, so
 //! transport crates never pull in the engine.
 

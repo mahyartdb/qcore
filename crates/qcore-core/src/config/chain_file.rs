@@ -147,7 +147,8 @@ fn parse_file_hop(i: usize, hop: &toml::Value) -> Result<HopSpec, ChainError> {
             config: HopConfig::plugin(kind, &pairs),
         });
     }
-    let allowed = allowed_fields(kind).unwrap_or(&[]);
+    // Plugin kinds returned above, so this lookup always hits.
+    let allowed = allowed_fields(kind).expect("builtin kinds have field lists");
     for k in t.keys() {
         if k != "kind" && k != "id" && !allowed.contains(&k.as_str()) {
             return Err(err(format!(

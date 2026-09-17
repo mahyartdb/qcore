@@ -237,10 +237,15 @@ impl Dialer for RootDialer {
     }
 
     async fn dial_udp(&self, dst: SocketAddr) -> Result<Box<dyn UdpFlow>, HopError> {
+        // Static unspecified-bind literals: unparsable only if edited wrong.
         let bind: SocketAddr = if dst.is_ipv4() {
-            "0.0.0.0:0".parse().unwrap()
+            "0.0.0.0:0"
+                .parse()
+                .expect("IPv4 unspecified bind literal parses")
         } else {
-            "[::]:0".parse().unwrap()
+            "[::]:0"
+                .parse()
+                .expect("IPv6 unspecified bind literal parses")
         };
         let socket = tokio::net::UdpSocket::bind(bind)
             .await
@@ -316,8 +321,12 @@ impl Default for KeepalivePolicy {
     }
 }
 
-/// Spawn the keepalive watcher for one hop. Dropping/aborting the returned
-/// handle stops the ticks; session teardown aborts all watchers.
+/// Spawn the keepalive watcher for one hop. Only aborting the returned
+/// handle stops the ticks — dropping a `JoinHandle` detaches (the task keeps
+/// running), so the owner must abort on teardown. In practice the linger is
+/// bounded: the next tick (≤ one interval) observes the stopped hop as
+/// non-healthy, emits one final event, and breaks. Callers that need prompt
+/// release must abort the handle (structural follow-up recorded in 003 T019).
 pub fn spawn_keepalive(
     hop_id: String,
     hop: std::sync::Arc<dyn qcore_transport_api::RunningHop>,

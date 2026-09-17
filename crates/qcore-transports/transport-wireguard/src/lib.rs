@@ -205,9 +205,13 @@ impl WireguardHop {
             Arc::new(FlowSock { flow })
         } else {
             let bind: SocketAddr = if params.peer_endpoint.is_ipv4() {
-                "0.0.0.0:0".parse().unwrap()
+                "0.0.0.0:0"
+                    .parse()
+                    .expect("unspecified IPv4 bind literal parses")
             } else {
-                "[::]:0".parse().unwrap()
+                "[::]:0"
+                    .parse()
+                    .expect("unspecified IPv6 bind literal parses")
             };
             Arc::new(OsSock {
                 socket: Arc::new(

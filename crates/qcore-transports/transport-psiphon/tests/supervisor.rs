@@ -174,4 +174,6 @@ fn secret_debug_never_leaks() {
         payload: b"top-secret-bytes".to_vec(),
     };
     assert!(!format!("{s:?}").contains("top-secret"));
+    // Length is a side channel: the format is exactly `<redacted>`.
+    assert_eq!(format!("{s:?}"), "<redacted>");
 }

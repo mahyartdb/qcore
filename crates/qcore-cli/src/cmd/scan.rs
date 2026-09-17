@@ -130,7 +130,7 @@ pub async fn run(
         }
     };
     if !["ipv4", "ipv6", "dual"].contains(&family) {
-        eprintln!("qcore: --family must be ipv4|ipv6|dual");
+        eprintln!("qcore: --family must be ipv4|ipv6|dual (exit 6)");
         return exit::USAGE;
     }
     let report = match run_scan_request(dirs, transport, profile, family).await {

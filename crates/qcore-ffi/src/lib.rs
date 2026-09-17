@@ -12,6 +12,7 @@
 
 use qcore_core::api::{Engine, EngineConfig};
 use qcore_core::config::profile_dir::ProfileDirs;
+use qcore_core::diag::masked_value;
 use std::ffi::{c_char, c_int, CStr, CString};
 
 /// Opaque engine handle (see [`qcore_engine_new`]).
@@ -71,7 +72,17 @@ fn fail_report(err_out: *mut *mut QcoreError, r: &qcore_transport_api::FailureRe
         "unreachable" | "timeout" | "shutdown" => 3,
         _ => 3,
     };
-    fail(err_out, code, r.to_string())
+    // Same shape as FailureReport's Display, with the free-text cause masked:
+    // this message crosses into caller-owned buffers, which promise (module
+    // docs, FR-026) to never carry secrets.
+    let message = format!(
+        "layer={} hop={} kind={} cause={}",
+        r.layer,
+        r.hop_id,
+        r.kind,
+        masked_value("cause", &r.cause)
+    );
+    fail(err_out, code, message)
 }
 
 fn unwind_guard<F: FnOnce() -> c_int + std::panic::UnwindSafe>(f: F) -> c_int {
@@ -440,9 +451,54 @@ pub unsafe extern "C" fn qcore_error_free(err: *mut QcoreError) -> c_int {
     })
 }
 
-// Silence "unused" on the re-exported handle in rlib builds.
+// Compile-time proof that engine handles are thread-safe: C callers may
+// share a `QcoreEngine` across threads, so `Send + Sync` must hold.
 #[allow(dead_code)]
-fn _assert_send_sync(_: &QcoreEngine) {}
+fn _assert_thread_safe() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<QcoreEngine>();
+}
 
 /// Android JNI wrapper over this same C ABI (no Android-only core paths).
 pub mod jni;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fail_report_masks_secret_like_cause() {
+        let r = qcore_transport_api::FailureReport::new(
+            qcore_transport_api::FailureLayer::Transport,
+            "wg-0",
+            "boom xT4vN7qW2zR5uY8iO1pA3sD6fG9hJ0kL2mN4bV6cX8dE0gH2==",
+            "transport",
+        );
+        let mut err: *mut QcoreError = std::ptr::null_mut();
+        let code = fail_report(&mut err as *mut _, &r);
+        assert_eq!(code, 3);
+        assert!(!err.is_null());
+        let msg = unsafe { CStr::from_ptr((*err).message) }
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(!msg.contains("xT4vN7qW"), "cause leaked to caller buffer");
+        assert!(msg.contains("cause=<redacted>"), "got: {msg}");
+        assert_eq!(unsafe { qcore_error_free(err) }, 0);
+        // Ordinary causes pass through with the code mapping intact.
+        let r2 = qcore_transport_api::FailureReport::new(
+            qcore_transport_api::FailureLayer::Validation,
+            "h",
+            "bad option",
+            "validation",
+        );
+        let mut err2: *mut QcoreError = std::ptr::null_mut();
+        assert_eq!(fail_report(&mut err2 as *mut _, &r2), 2);
+        let msg2 = unsafe { CStr::from_ptr((*err2).message) }
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(msg2.contains("cause=bad option"), "got: {msg2}");
+        assert_eq!(unsafe { qcore_error_free(err2) }, 0);
+    }
+}

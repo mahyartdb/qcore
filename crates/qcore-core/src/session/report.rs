@@ -5,6 +5,7 @@
 //! enforces it and there is no setter (FR-026). Active-profile fields are
 //! populated by T068 (scan) / T073 (obfuscation); until then they are `None`.
 
+use crate::diag::redact::masked_value;
 use qcore_transport_api::{FailureLayer, FailureReport, HopHealth};
 
 /// Exit codes, single source (contracts/cli.md). The CLI re-exports these.
@@ -83,9 +84,13 @@ impl ConnectionReport {
     }
 }
 
-/// Exactly one JSON document (stdout contract).
+/// Exactly one JSON document (stdout contract). Serialization of this
+/// shape is infallible in practice; the fallback keeps the no-panic
+/// convention (and the one-document contract) on the impossible path.
 pub fn to_json(r: &ConnectionReport) -> String {
-    serde_json::to_string(r).expect("report serializes")
+    serde_json::to_string(r).unwrap_or_else(|_| {
+        "{\"ordered_chain\":[],\"exit_hop_id\":\"\",\"secret_redaction\":true,\"active_scan_profile\":null,\"active_obfuscation\":null,\"failure\":null}".to_string()
+    })
 }
 
 /// Human form (stdout; diagnostics stay on stderr).
@@ -106,7 +111,17 @@ pub fn to_text(r: &ConnectionReport) -> String {
         ));
     }
     if let Some(f) = &r.failure {
-        out.push_str(&format!("failure: {f}\n"));
+        // Same shape as FailureReport's Display, with the free-text cause
+        // passed through central redaction: unlike the NDJSON stream (which
+        // redacts), this text path renders raw fields, so a secret-like
+        // cause is masked here (fail closed, FR-026).
+        out.push_str(&format!(
+            "failure: layer={} hop={} kind={} cause={}\n",
+            f.layer,
+            f.hop_id,
+            f.kind,
+            masked_value("cause", &f.cause)
+        ));
     }
     out
 }
@@ -120,9 +135,16 @@ pub fn emit_report(r: &ConnectionReport, json: bool) {
     }
 }
 
-/// Emit a failure to stderr; returns the mapped exit code.
+/// Emit a failure to stderr; returns the mapped exit code. The cause is
+/// redacted like in [`to_text`]: stderr is an unredacted sink.
 pub fn emit_failure(r: &FailureReport) -> i32 {
-    eprintln!("qcore: {r}");
+    eprintln!(
+        "qcore: layer={} hop={} kind={} cause={}",
+        r.layer,
+        r.hop_id,
+        r.kind,
+        masked_value("cause", &r.cause)
+    );
     exit_code_for_failure(r)
 }
 
@@ -168,5 +190,41 @@ mod tests {
         let doc = to_json(&r);
         assert_eq!(doc.lines().count(), 1);
         assert!(doc.contains("secret_redaction"));
+    }
+
+    #[test]
+    fn text_failure_line_masks_secret_like_cause() {
+        let failure = FailureReport::new(
+            FailureLayer::Transport,
+            "wg-0",
+            "boom xT4vN7qW2zR5uY8iO1pA3sD6fG9hJ0kL2mN4bV6cX8dE0gH2==",
+            "transport",
+        );
+        let r = ConnectionReport {
+            failure: Some(failure),
+            ..ConnectionReport::new(vec![], "wg-0")
+        };
+        let text = to_text(&r);
+        assert!(
+            text.contains("failure: layer=transport hop=wg-0"),
+            "got: {text}"
+        );
+        assert!(
+            !text.contains("xT4vN7qW"),
+            "secret-like cause leaked: {text}"
+        );
+        assert!(text.contains("cause=<redacted>"), "got: {text}");
+        // Ordinary causes render exactly like FailureReport's Display.
+        let plain = FailureReport::new(
+            FailureLayer::Transport,
+            "wg-0",
+            "connection refused",
+            "transport",
+        );
+        let r2 = ConnectionReport {
+            failure: Some(plain.clone()),
+            ..ConnectionReport::new(vec![], "wg-0")
+        };
+        assert!(to_text(&r2).contains(&format!("failure: {plain}")));
     }
 }

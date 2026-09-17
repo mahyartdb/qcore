@@ -154,7 +154,7 @@ mod tests {
     }
 
     #[test]
-    fn typed_secret_key_is_masked_not_dropped() {
+    fn low_entropy_value_under_innocuous_key_is_kept() {
         let r = FailureReport::new(FailureLayer::Config, "wg-0", "bad token abc", "invalid");
         let line = to_ndjson(DiagEvent::Failure(&r));
         assert!(!line.contains("\"dropped\""), "got: {line}");

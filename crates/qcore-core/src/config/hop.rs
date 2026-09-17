@@ -86,11 +86,7 @@ pub fn parse_toml_strict(s: &str) -> Result<HopConfig, String> {
         .get("kind")
         .and_then(|k| k.as_str())
         .ok_or_else(|| "hop config is missing `kind`".to_string())?;
-    let Some(allowed) = ALLOWED_FIELDS
-        .iter()
-        .find(|(k, _)| *k == kind)
-        .map(|(_, f)| *f)
-    else {
+    let Some(allowed) = allowed_fields(kind) else {
         // Plugin kind (SC-002c): registry decides, schema stays untouched.
         if crate::registry::TransportRegistry::global()
             .get(kind)
@@ -303,39 +299,52 @@ impl<'de> Deserialize<'de> for HopConfig {
             "wireguard" => HopConfig::Wireguard(
                 serde_json::from_value(builtin(
                     value,
-                    &[
-                        "peer",
-                        "import_ref",
-                        "import",
-                        "obfuscation",
-                        "family",
-                        "endpoint",
-                    ],
+                    allowed_fields("wireguard").expect("builtin kinds have field lists"),
                 )?)
                 .map_err(D::Error::custom)?,
             ),
             "masque" => HopConfig::Masque(
                 serde_json::from_value(builtin(
                     value,
-                    &["alpn", "obfuscation", "family", "endpoint"],
+                    allowed_fields("masque").expect("builtin kinds have field lists"),
                 )?)
                 .map_err(D::Error::custom)?,
             ),
             "tor" => HopConfig::Tor(
-                serde_json::from_value(builtin(value, &["family"])?).map_err(D::Error::custom)?,
+                serde_json::from_value(builtin(
+                    value,
+                    allowed_fields("tor").expect("builtin kinds have field lists"),
+                )?)
+                .map_err(D::Error::custom)?,
             ),
             "psiphon" => HopConfig::Psiphon(
-                serde_json::from_value(builtin(value, &["sidecar_path", "family"])?)
-                    .map_err(D::Error::custom)?,
+                serde_json::from_value(builtin(
+                    value,
+                    allowed_fields("psiphon").expect("builtin kinds have field lists"),
+                )?)
+                .map_err(D::Error::custom)?,
             ),
             "relay" => HopConfig::Relay(
-                serde_json::from_value(builtin(value, &["family"])?).map_err(D::Error::custom)?,
+                serde_json::from_value(builtin(
+                    value,
+                    allowed_fields("relay").expect("builtin kinds have field lists"),
+                )?)
+                .map_err(D::Error::custom)?,
             ),
             "mock" => HopConfig::Mock(
-                serde_json::from_value(builtin(value, &["family"])?).map_err(D::Error::custom)?,
+                serde_json::from_value(builtin(
+                    value,
+                    allowed_fields("mock").expect("builtin kinds have field lists"),
+                )?)
+                .map_err(D::Error::custom)?,
             ),
             other => {
                 map.remove("id");
+                // Scalar coercion (deliberately more lenient than the TOML
+                // strict path, which rejects non-string fields): stored JSON
+                // round-trips must not fail on numbers/booleans serialized
+                // by older writers. Tables/arrays stringify; factories treat
+                // unexpected shapes as validation errors at build time.
                 let family = map
                     .remove("family")
                     .map(|v| scalar_string(&v))

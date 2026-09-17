@@ -16,8 +16,6 @@ use crate::config::profile_dir::ProfileDirs;
 use crate::config::secret::SecretStore;
 use crate::identity::model::{MasqueCredential, ProviderIdentity};
 use serde::{Deserialize, Serialize};
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 
 /// Which identity slot: outer (default WARP) or inner (GOOL second hop).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,15 +46,32 @@ pub fn identity_file(dirs: &ProfileDirs, role: IdentityRole) -> std::path::PathB
     dirs.config_dir.join(role.file_name())
 }
 
+/// Display name for a role in user-facing messages ("warp"/"warp-inner").
+/// Distinct from [`IdentityRole::account_prefix`] (secret-store namespace).
+pub(crate) fn role_name(role: IdentityRole) -> &'static str {
+    match role {
+        IdentityRole::Outer => "warp",
+        IdentityRole::Inner => "warp-inner",
+    }
+}
 fn secret_store(dirs: &ProfileDirs) -> SecretStore {
     // Per-dir service namespace: temp test dirs, parallel profiles, and the
-    // real profile never collide in a shared OS keyring.
-    let mut h = DefaultHasher::new();
-    dirs.config_dir.to_string_lossy().hash(&mut h);
-    SecretStore::new(
-        format!("qcore-identity-{:016x}", h.finish()),
-        dirs.config_dir.clone(),
-    )
+    // real profile never collide in a shared OS keyring. Stable FNV-1a —
+    // NOT DefaultHasher, whose output is explicitly unstable across
+    // releases and would silently orphan the namespace (forced
+    // re-registration) on toolchain upgrades.
+    let h = namespace_hash(&dirs.config_dir.to_string_lossy());
+    SecretStore::new(format!("qcore-identity-{h:016x}"), dirs.config_dir.clone())
+}
+
+/// Stable 64-bit FNV-1a (see [`secret_store`]).
+fn namespace_hash(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in s.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -303,5 +318,15 @@ mod tests {
             "no half-written store"
         );
         let _ = std::fs::remove_dir_all(&d.config_dir);
+    }
+
+    #[test]
+    fn namespace_hash_is_stable_known_answer() {
+        // Guards the keyring namespace against hasher swaps: DefaultHasher
+        // is release-unstable and would silently orphan stored identities.
+        assert_eq!(namespace_hash(""), 0xcbf29ce484222325);
+        let a = namespace_hash("/tmp/qcore-test-profile");
+        assert_eq!(a, namespace_hash("/tmp/qcore-test-profile"));
+        assert_ne!(a, namespace_hash("/tmp/qcore-test-profile-2"));
     }
 }

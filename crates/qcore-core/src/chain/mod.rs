@@ -151,17 +151,10 @@ pub fn parse_single_hop(kind: &str, opts: &str) -> Result<HopSpec, ChainError> {
         });
     }
     // Unknown keys fail closed, naming the field (typed per transport).
-    let known: &[&str] = match crate::config::allowed_fields(kind) {
-        Some(fields) => fields,
-        None => {
-            return Err(ChainError::new(
-                None,
-                None,
-                format!("unknown transport `{kind}`"),
-                Some("run `qcore ls` for registered transports".to_string()),
-            ))
-        }
-    };
+    // Plugin kinds returned above, so this lookup always hits: `allowed_fields`
+    // is the single source (same table the TOML/preset gates use).
+    let known: &[&str] =
+        crate::config::allowed_fields(kind).expect("builtin kinds have field lists");
     for k in pairs.keys() {
         if !known.contains(&k.as_str()) {
             return Err(ChainError::new(

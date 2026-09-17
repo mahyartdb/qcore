@@ -118,9 +118,13 @@ impl MasqueHop {
         carrier: Arc<dyn Dialer>,
     ) -> Result<Arc<dyn RunningHop>, HopError> {
         let mut endpoint_builder = quinn::Endpoint::client(if endpoint.is_ipv4() {
-            "0.0.0.0:0".parse().unwrap()
+            "0.0.0.0:0"
+                .parse()
+                .expect("unspecified IPv4 bind literal parses")
         } else {
-            "[::]:0".parse().unwrap()
+            "[::]:0"
+                .parse()
+                .expect("unspecified IPv6 bind literal parses")
         })
         .map_err(|e| HopError::transport(hop_id.clone(), format!("quinn bind: {e}")))?;
         endpoint_builder.set_default_client_config(client_config(insecure)?);
@@ -197,9 +201,13 @@ impl MasqueHop {
                 let _ = (&mut conn).await;
             });
             let local: SocketAddr = if endpoint.is_ipv4() {
-                "0.0.0.0:0".parse().unwrap()
+                "0.0.0.0:0"
+                    .parse()
+                    .expect("unspecified IPv4 bind literal parses")
             } else {
-                "[::]:0".parse().unwrap()
+                "[::]:0"
+                    .parse()
+                    .expect("unspecified IPv6 bind literal parses")
             };
             (sender, task, local)
         } else {
@@ -551,9 +559,13 @@ async fn h2_connect(
             let _ = (&mut conn).await;
         });
         let local: SocketAddr = if endpoint.is_ipv4() {
-            "0.0.0.0:0".parse().unwrap()
+            "0.0.0.0:0"
+                .parse()
+                .expect("unspecified IPv4 bind literal parses")
         } else {
-            "[::]:0".parse().unwrap()
+            "[::]:0"
+                .parse()
+                .expect("unspecified IPv6 bind literal parses")
         };
         return Ok((sender, local));
     }

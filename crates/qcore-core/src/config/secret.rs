@@ -1,7 +1,8 @@
 //! Secret storage (research R11, FR-026).
 //!
 //! Secrets are parsed at the boundary, held in zeroizing wrappers, and stored
-//! via the OS keyring when available with a 0600 file fallback. They are never
+//! via the OS keyring when available with a 0600 file fallback (Unix; on
+//! Windows the fallback file inherits the directory ACLs). They are never
 //! logged, persisted unencrypted elsewhere, or passed on process argv.
 
 use std::fmt;
@@ -38,7 +39,9 @@ impl Drop for SecretString {
 
 impl fmt::Debug for SecretString {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "<redacted {} bytes>", self.inner.len())
+        // Length omitted deliberately: secret length is a side channel
+        // (it distinguishes key sizes and aids brute-force sizing).
+        write!(f, "<redacted>")
     }
 }
 
@@ -145,6 +148,8 @@ mod tests {
     fn debug_never_leaks_value() {
         let s = SecretString::new("supersecret-private-key");
         assert!(!format!("{s:?}").contains("supersecret"));
+        // Length is a side channel: the format is exactly `<redacted>`.
+        assert_eq!(format!("{s:?}"), "<redacted>");
     }
 
     #[test]

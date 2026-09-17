@@ -90,11 +90,10 @@ pub fn expand(
                 let preset = presets.iter().find(|p| p.name == name).ok_or_else(|| {
                     ChainError::new(None, None, format!("unknown preset `{name}`"), None)
                 })?;
-                for hop in &preset.hops {
-                    // Preset hops are concrete specs by construction; a nested
-                    // preset reference here is a definition error naming both.
-                    let _ = hop;
-                }
+                // Preset hops are concrete `HopSpec`s by construction, so a
+                // nested preset reference is unrepresentable here by type;
+                // file-loaded definitions are checked in
+                // `parse_compositions_toml` via `validate_definition`.
                 out.extend(preset.hops.iter().cloned());
             }
         }
@@ -117,7 +116,33 @@ pub fn validate_definition(
             Some("flatten the inner preset into concrete hops".to_string()),
         ));
     }
-    let _ = hops;
+    // Presets must not embed secrets: any secret-like value (typed key or
+    // unclassifiable high-entropy value) fails the definition naming the
+    // preset, hop, and field.
+    for h in hops {
+        let cfg = h.config.to_factory_config();
+        for (k, v) in &cfg.fields {
+            if crate::diag::redact::drops_record(k, v)
+                || matches!(
+                    crate::diag::redact::redact_value(k, v),
+                    crate::diag::redact::Redaction::Redacted
+                )
+            {
+                return Err(ChainError::new(
+                    None,
+                    Some(name.to_string()),
+                    format!(
+                        "preset `{name}` hop `{}` embeds a secret-like value in field `{k}`",
+                        h.id
+                    ),
+                    Some(
+                        "presets must not embed secrets; reference them by import or identity"
+                            .to_string(),
+                    ),
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -151,18 +176,18 @@ pub fn parse_compositions_toml(s: &str) -> Result<Vec<CompositionPreset>, String
             hops: specs,
         });
     }
-    // Nested preset references name both names (FR-007a).
+    // Definition validation (FR-007a): nested preset references name both
+    // names; secret-like values are rejected (presets must not embed
+    // secrets). One gate for both, via `validate_definition`.
     let names: Vec<&str> = out.iter().map(|p| p.name.as_str()).collect();
     for p in &out {
-        for h in &p.hops {
-            if names.contains(&h.config.kind()) {
-                return Err(format!(
-                    "preset `{}` contains nested preset `{}`",
-                    p.name,
-                    h.config.kind()
-                ));
-            }
-        }
+        let nested: Vec<String> = p
+            .hops
+            .iter()
+            .map(|h| h.config.kind().to_string())
+            .filter(|k| names.contains(&k.as_str()))
+            .collect();
+        validate_definition(&p.name, &p.hops, &nested).map_err(|e| e.to_string())?;
     }
     Ok(out)
 }
@@ -223,36 +248,23 @@ fn parse_preset_hop(preset: &str, hop: &toml::Value) -> Result<HopSpec, String> 
             config: HopConfig::plugin(kind, &pairs),
         });
     }
-    let known: &[&str] = match kind {
-        "wireguard" => &[
-            "id",
-            "kind",
-            "peer",
-            "import_ref",
-            "obfuscation",
-            "family",
-            "endpoint",
-        ],
-        "masque" => &["id", "kind", "alpn", "obfuscation", "family", "endpoint"],
-        "tor" => &["id", "kind", "family"],
-        "psiphon" => &["id", "kind", "sidecar_path", "family"],
-        "relay" => &["id", "kind", "family"],
-        "mock" => &["id", "kind", "family"],
-        _ => {
-            return Err(format!(
-                "preset `{preset}` hop `{id}`: unknown transport `{kind}`"
-            ))
-        }
-    };
+    // Unknown fields fail closed naming the field. `allowed_fields` is the
+    // single source (same table the TOML/grammar gates use); `id`/`kind`
+    // ride alongside HopSpec, not the transport config. Plugin kinds
+    // returned above, so this lookup always hits.
+    let allowed = crate::config::allowed_fields(kind).expect("builtin kinds have field lists");
     for k in t.keys() {
-        if !known.contains(&k.as_str()) {
+        if k != "id" && k != "kind" && !allowed.contains(&k.as_str()) {
             return Err(format!("preset `{preset}` hop `{id}`: unknown field `{k}`"));
         }
     }
     let config = match kind {
         "wireguard" => HopConfig::Wireguard(WireguardConfig {
             peer: preset_field(hop, preset, &id, "peer")?.unwrap_or_else(|| "warp".into()),
-            import_ref: preset_field(hop, preset, &id, "import_ref")?,
+            // `import` is the documented alias the grammar accepts (mod.rs);
+            // the preset gate drifted by rejecting it — accept and map it.
+            import_ref: preset_field(hop, preset, &id, "import_ref")?
+                .or(preset_field(hop, preset, &id, "import")?),
             obfuscation: preset_field(hop, preset, &id, "obfuscation")?,
             family,
             endpoint: preset_field(hop, preset, &id, "endpoint")?,
@@ -374,5 +386,42 @@ kind = "mock"
             err.contains("outer") && err.contains("gool"),
             "names both: {err}"
         );
+    }
+
+    #[test]
+    fn secret_like_preset_value_rejected_naming_preset_hop_field() {
+        let bad = r#"
+[[preset]]
+name = "sneaky"
+[[preset.hop]]
+id = "s-0"
+kind = "wireguard"
+peer = "warp"
+endpoint = "203.0.113.10:51820"
+obfuscation = "xT4vN7qW2zR5uY8iO1pA3sD6fG9hJ0kL2mN4bV6cX8dE0gH2=="
+"#;
+        let err = parse_compositions_toml(bad).expect_err("secret in preset");
+        assert!(
+            err.contains("sneaky") && err.contains("obfuscation"),
+            "names preset and field: {err}"
+        );
+    }
+
+    #[test]
+    fn wireguard_import_alias_maps_to_import_ref() {
+        let toml = r#"
+[[preset]]
+name = "imp"
+[[preset.hop]]
+id = "w-0"
+kind = "wireguard"
+peer = "imported"
+import = "home"
+"#;
+        let parsed = parse_compositions_toml(toml).expect("import alias parses");
+        match &parsed[0].hops[0].config {
+            HopConfig::Wireguard(c) => assert_eq!(c.import_ref.as_deref(), Some("home")),
+            other => panic!("expected wireguard, got {}", other.kind()),
+        }
     }
 }

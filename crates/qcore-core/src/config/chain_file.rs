@@ -147,8 +147,11 @@ fn parse_file_hop(i: usize, hop: &toml::Value) -> Result<HopSpec, ChainError> {
             config: HopConfig::plugin(kind, &pairs),
         });
     }
-    // Plugin kinds returned above, so this lookup always hits.
-    let allowed = allowed_fields(kind).expect("builtin kinds have field lists");
+    // Plugin kinds returned above. A miss here means the field table
+    // drifted from the builtin arms below: fail closed, never panic on
+    // user input (the table-coverage test pins the table in CI).
+    let allowed = allowed_fields(kind)
+        .ok_or_else(|| err(format!("chain file: transport `{kind}` has no field list")))?;
     for k in t.keys() {
         if k != "kind" && k != "id" && !allowed.contains(&k.as_str()) {
             return Err(err(format!(
@@ -158,17 +161,18 @@ fn parse_file_hop(i: usize, hop: &toml::Value) -> Result<HopSpec, ChainError> {
     }
     let family = field(hop, i, &id, "family")?.unwrap_or_else(|| "dual".into());
     let config = match kind {
-        "wireguard" => {
-            let import_plain = field(hop, i, &id, "import")?;
-            let import_ref = field(hop, i, &id, "import_ref")?;
-            HopConfig::Wireguard(WireguardConfig {
-                peer: field(hop, i, &id, "peer")?.unwrap_or_else(|| "warp".into()),
-                import_ref: import_plain.or(import_ref),
-                obfuscation: field(hop, i, &id, "obfuscation")?,
-                family,
-                endpoint: field(hop, i, &id, "endpoint")?,
-            })
-        }
+        "wireguard" => HopConfig::Wireguard(WireguardConfig {
+            peer: field(hop, i, &id, "peer")?.unwrap_or_else(|| "warp".into()),
+            import_ref: resolve_import_ref(
+                field(hop, i, &id, "import")?,
+                field(hop, i, &id, "import_ref")?,
+                &format!("chain file hop `{id}`"),
+            )
+            .map_err(err)?,
+            obfuscation: field(hop, i, &id, "obfuscation")?,
+            family,
+            endpoint: field(hop, i, &id, "endpoint")?,
+        }),
         "masque" => HopConfig::Masque(MasqueConfig {
             alpn: field(hop, i, &id, "alpn")?.unwrap_or_else(|| "h3".into()),
             obfuscation: field(hop, i, &id, "obfuscation")?,
@@ -182,7 +186,9 @@ fn parse_file_hop(i: usize, hop: &toml::Value) -> Result<HopSpec, ChainError> {
         }),
         "relay" => HopConfig::Relay(RelayConfig { family }),
         "mock" => HopConfig::Mock(MockConfig { family }),
-        _ => unreachable!(),
+        // Table hit without an arm is programmer drift, not user input:
+        // fail closed like the gate above, never panic.
+        _ => return Err(err(format!("transport `{kind}` has no hop builder"))),
     };
     Ok(HopSpec { id, config })
 }

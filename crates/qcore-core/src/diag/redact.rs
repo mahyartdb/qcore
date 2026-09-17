@@ -84,6 +84,15 @@ fn key_is_secret(key: &str) -> bool {
     SECRET_KEYS.iter().any(|sk| k.contains(sk))
 }
 
+/// Typed-anchor check only (no entropy heuristic): true when the key is
+/// secret-named or the value matches the denylist. For validating
+/// operator-authored config, where the probabilistic entropy scan would
+/// false-positive on benign identifiers (and miss short secrets anyway —
+/// see `redact_value` scope). Heuristic hunting stays in diagnostic sinks.
+pub fn has_secret_anchor(key: &str, value: &str) -> bool {
+    key_is_secret(key) || value_matches_denylist(value)
+}
+
 fn value_matches_denylist(v: &str) -> bool {
     DENYLIST.iter().any(|d| v.contains(d))
 }
@@ -133,6 +142,21 @@ pub fn masked_value(key: &str, value: &str) -> String {
         Redaction::Keep(s) => s,
         Redaction::Redacted => "<redacted>".to_string(),
     }
+}
+
+/// One masked `layer=… hop=… kind=… cause=…` line shared by every sink that
+/// renders a failure report as text (session text/stderr reports, FFI error
+/// messages). The free-text cause is masked; the raw `Display` impl is never
+/// emitted to a sink. One format means a `FailureReport` shape change lands
+/// here, not in three hand-copied literals that silently diverge.
+pub fn masked_failure_line(f: &qcore_transport_api::FailureReport) -> String {
+    format!(
+        "layer={} hop={} kind={} cause={}",
+        f.layer,
+        f.hop_id,
+        f.kind,
+        masked_value("cause", &f.cause)
+    )
 }
 
 /// Keep an actionable `prefix` and mask a secret-like `detail` (fail
@@ -299,6 +323,23 @@ mod tests {
     }
 
     const ECHO_44: &str = "xT4vN7qW2zR5uY8iO1pA3sD6fG9hJ0kL2mN4bV6cX8dE0gH2==";
+
+    #[test]
+    fn masked_failure_line_masks_cause_keeps_shape() {
+        use qcore_transport_api::{FailureLayer, FailureReport};
+        let f = FailureReport::new(
+            FailureLayer::Transport,
+            "wg-0",
+            format!("boom {ECHO_44}"),
+            "transport",
+        );
+        let line = masked_failure_line(&f);
+        assert!(!line.contains(ECHO_44), "leaked: {line}");
+        assert_eq!(
+            line,
+            "layer=transport hop=wg-0 kind=transport cause=<redacted>"
+        );
+    }
 
     #[test]
     fn embedded_secret_in_prose_is_masked_in_place() {

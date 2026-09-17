@@ -261,8 +261,7 @@ fn effective_endpoint(spec: &crate::config::HopSpec) -> String {
 mod tests {
     use super::*;
     use qcore_transport_api::{
-        ByteStream, Capabilities, HopError, HopHealth, ObfuscationFamily, TransportDescriptor,
-        UdpFlow,
+        ByteStream, Capabilities, HopError, HopHealth, TransportDescriptor, UdpFlow,
     };
 
     struct StubDialer;

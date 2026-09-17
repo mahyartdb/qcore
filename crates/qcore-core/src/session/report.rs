@@ -5,7 +5,7 @@
 //! enforces it and there is no setter (FR-026). Active-profile fields are
 //! populated by T068 (scan) / T073 (obfuscation); until then they are `None`.
 
-use crate::diag::redact::masked_value;
+use crate::diag::redact::{masked_failure_line, masked_value};
 use qcore_transport_api::{FailureLayer, FailureReport, HopHealth};
 
 /// Exit codes, single source (contracts/cli.md). The CLI re-exports these.
@@ -136,17 +136,10 @@ pub fn to_text(r: &ConnectionReport) -> String {
         ));
     }
     if let Some(f) = &r.failure {
-        // Same shape as FailureReport's Display, with the free-text cause
-        // passed through central redaction: unlike the NDJSON stream (which
-        // redacts), this text path renders raw fields, so a secret-like
-        // cause is masked here (fail closed, FR-026).
-        out.push_str(&format!(
-            "failure: layer={} hop={} kind={} cause={}\n",
-            f.layer,
-            f.hop_id,
-            f.kind,
-            masked_value("cause", &f.cause)
-        ));
+        // Shared masked rendering (see `masked_failure_line`): unlike the
+        // NDJSON stream (which redacts), this text path renders raw fields,
+        // so a secret-like cause is masked here (fail closed, FR-026).
+        out.push_str(&format!("failure: {}\n", masked_failure_line(f)));
     }
     out
 }
@@ -161,15 +154,9 @@ pub fn emit_report(r: &ConnectionReport, json: bool) {
 }
 
 /// Emit a failure to stderr; returns the mapped exit code. The cause is
-/// redacted like in [`to_text`]: stderr is an unredacted sink.
+/// redacted via the shared helper: stderr is an unredacted sink.
 pub fn emit_failure(r: &FailureReport) -> i32 {
-    eprintln!(
-        "qcore: layer={} hop={} kind={} cause={}",
-        r.layer,
-        r.hop_id,
-        r.kind,
-        masked_value("cause", &r.cause)
-    );
+    eprintln!("qcore: {}", masked_failure_line(r));
     exit_code_for_failure(r)
 }
 
@@ -239,18 +226,24 @@ mod tests {
             "secret-like cause leaked: {text}"
         );
         assert!(text.contains("cause=<redacted>"), "got: {text}");
-        // Ordinary causes render exactly like FailureReport's Display.
+        // Ordinary causes render through the shared masked helper — pinned
+        // here, not against Display (Display renders the raw cause and must
+        // never reach a sink).
         let plain = FailureReport::new(
             FailureLayer::Transport,
             "wg-0",
             "connection refused",
             "transport",
         );
+        assert_eq!(
+            masked_failure_line(&plain),
+            "layer=transport hop=wg-0 kind=transport cause=connection refused"
+        );
         let r2 = ConnectionReport {
-            failure: Some(plain.clone()),
+            failure: Some(plain),
             ..ConnectionReport::new(vec![], "wg-0")
         };
-        assert!(to_text(&r2).contains(&format!("failure: {plain}")));
+        assert!(to_text(&r2).contains("failure: layer=transport hop=wg-0 kind=transport"));
     }
 
     #[test]

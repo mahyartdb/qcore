@@ -116,18 +116,20 @@ pub fn validate_definition(
             Some("flatten the inner preset into concrete hops".to_string()),
         ));
     }
-    // Presets must not embed secrets: any secret-like value (typed key or
-    // unclassifiable high-entropy value) fails the definition naming the
-    // preset, hop, and field.
+    // Presets must not embed secrets. Preset fields are never key material
+    // by construction (peer/family/endpoint/obfuscation/sidecar_path are
+    // names and locators), so the gate checks typed anchors only — pasted
+    // key blocks (denylist) or values under secret-named keys. No entropy
+    // heuristic: it false-positives on benign identifiers while missing
+    // short secrets, and a validator must be precise (a bogus high-entropy
+    // profile name already fails downstream as unknown). Enforcement lives
+    // at this file boundary — every in-repo preset source is validated-file
+    // or builtin constants; programmatic presets are the constructor's
+    // trust domain, like HopConfig values.
     for h in hops {
         let cfg = h.config.to_factory_config();
         for (k, v) in &cfg.fields {
-            if crate::diag::redact::drops_record(k, v)
-                || matches!(
-                    crate::diag::redact::redact_value(k, v),
-                    crate::diag::redact::Redaction::Redacted
-                )
-            {
+            if crate::diag::redact::has_secret_anchor(k, v) {
                 return Err(ChainError::new(
                     None,
                     Some(name.to_string()),
@@ -177,15 +179,25 @@ pub fn parse_compositions_toml(s: &str) -> Result<Vec<CompositionPreset>, String
         });
     }
     // Definition validation (FR-007a): nested preset references name both
-    // names; secret-like values are rejected (presets must not embed
+    // names; pasted key material is rejected (presets must not embed
     // secrets). One gate for both, via `validate_definition`.
     let names: Vec<&str> = out.iter().map(|p| p.name.as_str()).collect();
     for p in &out {
+        // Only names that cannot be concrete transports are even candidates
+        // for a preset reference: builtin and registered kinds always parse
+        // as transport hops (and anything else fails earlier as an unknown
+        // transport), so a hop kind matching a preset name is otherwise a
+        // legitimate hop, never a nesting.
+        let registry = crate::registry::TransportRegistry::global();
         let nested: Vec<String> = p
             .hops
             .iter()
             .map(|h| h.config.kind().to_string())
-            .filter(|k| names.contains(&k.as_str()))
+            .filter(|k| {
+                names.contains(&k.as_str())
+                    && crate::config::allowed_fields(k).is_none()
+                    && registry.get(k).is_none()
+            })
             .collect();
         validate_definition(&p.name, &p.hops, &nested).map_err(|e| e.to_string())?;
     }
@@ -251,8 +263,11 @@ fn parse_preset_hop(preset: &str, hop: &toml::Value) -> Result<HopSpec, String> 
     // Unknown fields fail closed naming the field. `allowed_fields` is the
     // single source (same table the TOML/grammar gates use); `id`/`kind`
     // ride alongside HopSpec, not the transport config. Plugin kinds
-    // returned above, so this lookup always hits.
-    let allowed = crate::config::allowed_fields(kind).expect("builtin kinds have field lists");
+    // returned above. A miss here means the field table drifted from the
+    // builtin arms below: fail closed, never panic on user input (the
+    // table-coverage test pins the table in CI).
+    let allowed = crate::config::allowed_fields(kind)
+        .ok_or_else(|| format!("preset `{preset}`: transport `{kind}` has no field list"))?;
     for k in t.keys() {
         if k != "id" && k != "kind" && !allowed.contains(&k.as_str()) {
             return Err(format!("preset `{preset}` hop `{id}`: unknown field `{k}`"));
@@ -263,8 +278,11 @@ fn parse_preset_hop(preset: &str, hop: &toml::Value) -> Result<HopSpec, String> 
             peer: preset_field(hop, preset, &id, "peer")?.unwrap_or_else(|| "warp".into()),
             // `import` is the documented alias the grammar accepts (mod.rs);
             // the preset gate drifted by rejecting it — accept and map it.
-            import_ref: preset_field(hop, preset, &id, "import_ref")?
-                .or(preset_field(hop, preset, &id, "import")?),
+            import_ref: crate::config::resolve_import_ref(
+                preset_field(hop, preset, &id, "import")?,
+                preset_field(hop, preset, &id, "import_ref")?,
+                &format!("preset `{preset}` hop `{id}`"),
+            )?,
             obfuscation: preset_field(hop, preset, &id, "obfuscation")?,
             family,
             endpoint: preset_field(hop, preset, &id, "endpoint")?,
@@ -282,7 +300,13 @@ fn parse_preset_hop(preset: &str, hop: &toml::Value) -> Result<HopSpec, String> 
         }),
         "relay" => HopConfig::Relay(RelayConfig { family }),
         "mock" => HopConfig::Mock(MockConfig { family }),
-        _ => unreachable!(),
+        // Table hit without an arm is programmer drift, not user input:
+        // fail closed like the gate above, never panic.
+        _ => {
+            return Err(format!(
+                "preset `{preset}` hop `{id}`: transport `{kind}` has no hop builder"
+            ))
+        }
     };
     Ok(HopSpec { id, config })
 }
@@ -368,7 +392,10 @@ bogus = "1"
     }
 
     #[test]
-    fn nested_preset_reference_names_both() {
+    fn non_transport_preset_kind_fails_closed_naming_both() {
+        // A hop kind naming a preset that is no transport cannot parse as
+        // a hop at all: it fails closed as an unknown transport (naming
+        // preset and name) before nesting validation is even reached.
         let bad = r#"
 [[preset]]
 name = "outer"
@@ -389,7 +416,7 @@ kind = "mock"
     }
 
     #[test]
-    fn secret_like_preset_value_rejected_naming_preset_hop_field() {
+    fn pasted_key_block_in_preset_rejected_naming_preset_hop_field() {
         let bad = r#"
 [[preset]]
 name = "sneaky"
@@ -397,14 +424,51 @@ name = "sneaky"
 id = "s-0"
 kind = "wireguard"
 peer = "warp"
-endpoint = "203.0.113.10:51820"
-obfuscation = "xT4vN7qW2zR5uY8iO1pA3sD6fG9hJ0kL2mN4bV6cX8dE0gH2=="
+endpoint = "xx BEGIN PRIVATE KEY----- yy"
 "#;
-        let err = parse_compositions_toml(bad).expect_err("secret in preset");
+        let err = parse_compositions_toml(bad).expect_err("key block in preset");
         assert!(
-            err.contains("sneaky") && err.contains("obfuscation"),
+            err.contains("sneaky") && err.contains("endpoint"),
             "names preset and field: {err}"
         );
+    }
+
+    #[test]
+    fn benign_high_entropy_preset_value_accepted() {
+        // The gate is typed-anchors-only (no entropy heuristic): a
+        // random-looking but non-secret identifier must not fail the
+        // definition (it fails downstream as an unknown profile instead).
+        let toml = r#"
+[[preset]]
+name = "ok"
+[[preset.hop]]
+id = "o-0"
+kind = "wireguard"
+peer = "warp"
+obfuscation = "xT4vN7qW2zR5uY8iO1pA3sD6fG9hJ0kL2mN4bV6cX8dE0gH2=="
+"#;
+        parse_compositions_toml(toml).expect("benign identifier parses");
+    }
+
+    #[test]
+    fn transport_kind_hop_is_not_a_nested_preset() {
+        // A hop whose kind is a concrete transport is never a preset
+        // reference — even when a preset shares the name. Only names that
+        // cannot be transports reach the nesting check (and those fail
+        // earlier as unknown transports).
+        let toml = r#"
+[[preset]]
+name = "tor"
+[[preset.hop]]
+id = "t-0"
+kind = "tor"
+[[preset]]
+name = "other"
+[[preset.hop]]
+id = "o-0"
+kind = "tor"
+"#;
+        parse_compositions_toml(toml).expect("transport hops are not refs");
     }
 
     #[test]

@@ -401,6 +401,25 @@ pub fn imports_dir(dirs: &ProfileDirs) -> PathBuf {
     dirs.config_dir.join("imports")
 }
 
+/// Resolve `<ref>.toml` inside the imports dir, rejecting refs that escape
+/// it (empty, NUL, separators, `.`/`..` segments). Read paths trust
+/// caller-supplied refs — chain files, `--export`, FFI/JNI — while the
+/// write path sanitizes instead, so reads guard containment rather than
+/// rewriting the ref: dots, spaces, and unicode names (incl. hand-placed
+/// files) keep working. Deliberately NOT `starts_with` on the joined path:
+/// `Path::starts_with` is lexical and matches through `..` segments.
+pub(crate) fn import_path(dirs: &ProfileDirs, import_ref: &str) -> Result<PathBuf, String> {
+    let escaped = import_ref.is_empty()
+        || import_ref.contains('\0')
+        || import_ref
+            .split(['/', '\\'])
+            .any(|seg| seg.is_empty() || seg == "." || seg == "..");
+    if escaped {
+        return Err(format!("invalid import ref `{import_ref}`"));
+    }
+    Ok(imports_dir(dirs).join(format!("{import_ref}.toml")))
+}
+
 fn secret_store(dirs: &ProfileDirs) -> SecretStore {
     SecretStore::new("qcore-imports", dirs.config_dir.join("secrets"))
 }
@@ -557,16 +576,24 @@ impl StoredImport {
                     .ok_or_else(|| "import record: awg is not a table".to_string())?;
                 // Missing or mistyped numerics are corruption, not zeros:
                 // records are machine-written complete, so fail closed.
+                // Integer-typed values parse like their string forms:
+                // TOML's natural encoding for numbers is integers, and
+                // hand-edited records may use bare `jc = 1`.
                 let num = |k: &str| {
-                    t.get(k)
-                        .ok_or_else(|| format!("import record: awg `{k}` missing"))
-                        .and_then(|x| {
-                            x.as_str()
-                                .ok_or_else(|| format!("import record: awg `{k}` not a string"))
-                                .and_then(|s| {
-                                    s.parse::<u32>()
-                                        .map_err(|_| format!("import record: awg `{k}` not a uint"))
-                                })
+                    let x = t
+                        .get(k)
+                        .ok_or_else(|| format!("import record: awg `{k}` missing"))?;
+                    if let Some(n) = x.as_integer() {
+                        return u32::try_from(n)
+                            .map_err(|_| format!("import record: awg `{k}` not a uint"));
+                    }
+                    x.as_str()
+                        .ok_or_else(|| {
+                            format!("import record: awg `{k}` neither a uint nor a string")
+                        })
+                        .and_then(|s| {
+                            s.parse::<u32>()
+                                .map_err(|_| format!("import record: awg `{k}` not a uint"))
                         })
                 };
                 let opt = |k: &str| t.get(k).and_then(|x| x.as_str()).map(str::to_string);
@@ -609,7 +636,7 @@ pub fn load_import(
     dirs: &ProfileDirs,
     import_ref: &str,
 ) -> Result<(StoredImport, BTreeMap<String, SecretString>), String> {
-    let path = imports_dir(dirs).join(format!("{import_ref}.toml"));
+    let path = import_path(dirs, import_ref)?;
     let text = std::fs::read_to_string(&path)
         .map_err(|_| format!("unknown import `{import_ref}` (see `qcore import`)"))?;
     let stored = StoredImport::from_toml(&text)?;
@@ -642,7 +669,8 @@ pub fn check_refs(dirs: &ProfileDirs, hops: &[crate::config::HopSpec]) -> Result
     for hop in hops {
         if let crate::config::HopConfig::Wireguard(c) = &hop.config {
             if let Some(import_ref) = c.import_ref.as_deref() {
-                let path = imports_dir(dirs).join(format!("{import_ref}.toml"));
+                let path = import_path(dirs, import_ref)
+                    .map_err(|e| ChainError::new(None, Some(hop.id.clone()), e, None))?;
                 if !path.exists() {
                     return Err(ChainError::new(
                         None,
@@ -875,5 +903,58 @@ mod tests {
             "ref_name = \"r\"\nsource_format = \"amneziawg\"\n[interface]\n[awg]\njc = \"1\"\n";
         let err = StoredImport::from_toml(text).unwrap_err();
         assert!(err.contains("awg `jmin` missing"), "got: {err}");
+    }
+
+    #[test]
+    fn integer_typed_awg_numerics_parse() {
+        // TOML's natural encoding for numbers is integers: hand-edited or
+        // older-writer records with bare `jc = 1` must parse like `"1"`.
+        let text = "ref_name = \"r\"\nsource_format = \"amneziawg\"\n[interface]\n[awg]\njc = 1\njmin = \"2\"\njmax = 3\ns1 = 0\ns2 = 0\ns3 = 0\ns4 = 0\nh1 = 0\nh2 = 0\nh3 = 0\nh4 = 0\n";
+        let rec = StoredImport::from_toml(text).expect("integer numerics parse");
+        let awg = rec.awg.expect("awg present");
+        assert_eq!((awg.jc, awg.jmin, awg.jmax), (1, 2, 3));
+        // Out-of-range integers still fail closed naming the field.
+        let bad = text.replace("jc = 1", "jc = 4294967296");
+        let err = StoredImport::from_toml(&bad).unwrap_err();
+        assert!(
+            err.contains("jc") && err.contains("not a uint"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn import_path_contains_refs_in_store() {
+        let base = std::env::temp_dir().join(format!("qcore-import-guard-{}", std::process::id()));
+        let dirs = ProfileDirs::resolve(Some(base), None);
+        // Ordinary refs resolve inside the store — including characters
+        // the write-time sanitizer rewrites, which hand-placed files may
+        // still use. Reads guard containment; they never rewrite the ref.
+        for ok in ["wg-home", "my.vpn", "with space", "uniçode", "a..b", "..."] {
+            let p = import_path(&dirs, ok).expect("ordinary ref resolves");
+            assert!(
+                p.starts_with(imports_dir(&dirs)),
+                "escaped the store: {}",
+                p.display()
+            );
+            assert_eq!(
+                p.file_name().unwrap().to_string_lossy(),
+                format!("{ok}.toml")
+            );
+        }
+        // Traversal, absolute, empty, and NUL refs fail closed.
+        for bad in [
+            "",
+            ".",
+            "..",
+            "../x",
+            "a/../../b",
+            "/abs",
+            "x/",
+            "a//b",
+            "nul\0byte",
+            "a\\..\\b",
+        ] {
+            assert!(import_path(&dirs, bad).is_err(), "accepted: {bad:?}");
+        }
     }
 }

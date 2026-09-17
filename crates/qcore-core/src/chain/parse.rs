@@ -273,7 +273,7 @@ fn build_hop(
         });
     }
     let allowed = crate::config::allowed_fields(kind)
-        .ok_or_else(|| err(format!("unknown transport `{kind}` (run `qcore ls`)")))?;
+        .ok_or_else(|| err(format!("transport `{kind}` has no field list")))?;
     for k in pairs.keys() {
         if !allowed.contains(&k.as_str()) {
             return Err(err(format!("unknown option `{k}` for transport `{kind}`")));
@@ -283,10 +283,12 @@ fn build_hop(
     let config = match kind {
         "wireguard" => HopConfig::Wireguard(WireguardConfig {
             peer: get(pairs, "peer", "warp"),
-            import_ref: pairs
-                .get("import")
-                .or_else(|| pairs.get("import_ref"))
-                .cloned(),
+            import_ref: crate::config::resolve_import_ref(
+                pairs.get("import").cloned(),
+                pairs.get("import_ref").cloned(),
+                &format!("chain: transport `{kind}`"),
+            )
+            .map_err(err)?,
             obfuscation: pairs.get("obfuscation").cloned(),
             family,
             endpoint: pairs.get("endpoint").cloned(),
@@ -304,7 +306,9 @@ fn build_hop(
         }),
         "relay" => HopConfig::Relay(RelayConfig { family }),
         "mock" => HopConfig::Mock(MockConfig { family }),
-        _ => unreachable!(),
+        // Table hit without an arm is programmer drift, not user input:
+        // fail closed like the gate above, never panic.
+        _ => return Err(err(format!("transport `{kind}` has no hop builder"))),
     };
     Ok(HopSpec {
         id: format!("{kind}-{index}"),

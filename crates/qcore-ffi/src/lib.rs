@@ -12,7 +12,6 @@
 
 use qcore_core::api::{Engine, EngineConfig};
 use qcore_core::config::profile_dir::ProfileDirs;
-use qcore_core::diag::masked_value;
 use std::ffi::{c_char, c_int, CStr, CString};
 
 /// Opaque engine handle (see [`qcore_engine_new`]).
@@ -72,16 +71,9 @@ fn fail_report(err_out: *mut *mut QcoreError, r: &qcore_transport_api::FailureRe
         "unreachable" | "timeout" | "shutdown" => 3,
         _ => 3,
     };
-    // Same shape as FailureReport's Display, with the free-text cause masked:
-    // this message crosses into caller-owned buffers, which promise (module
-    // docs, FR-026) to never carry secrets.
-    let message = format!(
-        "layer={} hop={} kind={} cause={}",
-        r.layer,
-        r.hop_id,
-        r.kind,
-        masked_value("cause", &r.cause)
-    );
+    // Shared masked rendering: this message crosses into caller-owned
+    // buffers, which promise (module docs, FR-026) to never carry secrets.
+    let message = qcore_core::diag::masked_failure_line(r);
     fail(err_out, code, message)
 }
 

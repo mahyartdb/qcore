@@ -15,9 +15,10 @@
 //! `String scanJson(long, String transport, String profile, String family)`,
 //! `String importConfig(long, String path)`, `String exportConfig(long,
 //! String ref)`, `void engineFree(long)`, `int abiVersion()`. Null/negative
-//! returns are failures (OOM or internal); error detail rides the C ABI.
+//! returns are failures (OOM, internal, or unusable JVM input); error
+//! detail rides the C ABI.
 
-use std::ffi::{c_char, c_void, CStr, CString};
+use std::ffi::{c_char, c_int, c_void, CStr, CString};
 
 /// Raw JNI aliases (public for signature visibility; opaque to callers).
 #[doc(hidden)]
@@ -108,6 +109,42 @@ fn take_error(ptr: *mut crate::QcoreError) {
     }
 }
 
+/// Run one string-returning C ABI call from a JNI entry point and convert
+/// its out-string to Java. `args` convert in order; a `None` argument (null
+/// Java string, failed pin, non-UTF-8 content) or an interior NUL fails the
+/// whole call with null — JVM input problems never silently become empty
+/// input, and NULs never rewrite into different valid input. The out buffer
+/// is always reclaimed (`take_string` is null-safe); only code 0 returns a
+/// string. Java-observable behavior matches the previous inline code (null
+/// on every failure path); this only removes the five-fold triplication
+/// and the silent coercions.
+unsafe fn call_c_abi(
+    env: JniEnv,
+    args: &[JString],
+    call: impl FnOnce(&[*const c_char]) -> (c_int, *mut c_char, *mut crate::QcoreError),
+) -> JString {
+    let mut owned = Vec::with_capacity(args.len());
+    for &arg in args {
+        let s = match j_to_rust(env, arg) {
+            Some(s) => s,
+            None => return std::ptr::null_mut(),
+        };
+        match CString::new(s) {
+            Ok(c) => owned.push(c),
+            Err(_) => return std::ptr::null_mut(),
+        }
+    }
+    let ptrs: Vec<*const c_char> = owned.iter().map(|c| c.as_ptr()).collect();
+    let (code, out, err) = call(&ptrs);
+    take_error(err);
+    let s = take_string(out);
+    if code == 0 {
+        rust_to_j(env, &s)
+    } else {
+        std::ptr::null_mut()
+    }
+}
+
 /// `Qcore.abiVersion()`.
 ///
 /// # Safety
@@ -172,22 +209,14 @@ pub unsafe extern "system" fn Java_com_qcore_Qcore_engineStart(
     chain: JString,
 ) -> JString {
     let result = std::panic::catch_unwind(|| unsafe {
-        let chain = j_to_rust(env, chain).unwrap_or_default();
-        let chain_c = CString::new(chain).unwrap_or_else(|_| CString::new("").unwrap());
-        let mut out: *mut c_char = std::ptr::null_mut();
-        let mut err: *mut crate::QcoreError = std::ptr::null_mut();
-        let code = with_engine(handle, |e| {
-            crate::qcore_engine_start(e, chain_c.as_ptr(), &mut out, &mut err)
-        });
-        take_error(err);
-        // Reclaim unconditionally (see scanJson): `take_string` is a no-op
-        // on null, so this is free insurance against payload-on-error paths.
-        let s = take_string(out);
-        if code == 0 {
-            rust_to_j(env, &s)
-        } else {
-            std::ptr::null_mut()
-        }
+        call_c_abi(env, &[chain], |args| {
+            let mut out: *mut c_char = std::ptr::null_mut();
+            let mut err: *mut crate::QcoreError = std::ptr::null_mut();
+            let code = with_engine(handle, |e| {
+                crate::qcore_engine_start(e, args[0], &mut out, &mut err)
+            });
+            (code, out, err)
+        })
     });
     result.unwrap_or(std::ptr::null_mut())
 }
@@ -204,22 +233,14 @@ pub unsafe extern "system" fn Java_com_qcore_Qcore_engineStatusJson(
     session_id: JString,
 ) -> JString {
     let result = std::panic::catch_unwind(|| unsafe {
-        let id = j_to_rust(env, session_id).unwrap_or_default();
-        let id_c = CString::new(id).unwrap_or_else(|_| CString::new("").unwrap());
-        let mut out: *mut c_char = std::ptr::null_mut();
-        let mut err: *mut crate::QcoreError = std::ptr::null_mut();
-        let code = with_engine(handle, |e| {
-            crate::qcore_engine_status_json(e, id_c.as_ptr(), &mut out, &mut err)
-        });
-        take_error(err);
-        // Reclaim unconditionally (see scanJson): `take_string` is a no-op
-        // on null, so this is free insurance against payload-on-error paths.
-        let s = take_string(out);
-        if code == 0 {
-            rust_to_j(env, &s)
-        } else {
-            std::ptr::null_mut()
-        }
+        call_c_abi(env, &[session_id], |args| {
+            let mut out: *mut c_char = std::ptr::null_mut();
+            let mut err: *mut crate::QcoreError = std::ptr::null_mut();
+            let code = with_engine(handle, |e| {
+                crate::qcore_engine_status_json(e, args[0], &mut out, &mut err)
+            });
+            (code, out, err)
+        })
     });
     result.unwrap_or(std::ptr::null_mut())
 }
@@ -281,34 +302,14 @@ pub unsafe extern "system" fn Java_com_qcore_Qcore_scanJson(
     family: JString,
 ) -> JString {
     let result = std::panic::catch_unwind(|| unsafe {
-        let transport = j_to_rust(env, transport).unwrap_or_default();
-        let profile = j_to_rust(env, profile).unwrap_or_default();
-        let family = j_to_rust(env, family).unwrap_or_default();
-        let transport_c = CString::new(transport).unwrap_or_else(|_| CString::new("").unwrap());
-        let profile_c = CString::new(profile).unwrap_or_else(|_| CString::new("").unwrap());
-        let family_c = CString::new(family).unwrap_or_else(|_| CString::new("").unwrap());
-        let mut out: *mut c_char = std::ptr::null_mut();
-        let mut err: *mut crate::QcoreError = std::ptr::null_mut();
-        let code = with_engine(handle, |e| {
-            crate::qcore_scan(
-                e,
-                transport_c.as_ptr(),
-                profile_c.as_ptr(),
-                family_c.as_ptr(),
-                &mut out,
-                &mut err,
-            )
-        });
-        take_error(err);
-        // Always reclaim `out`: qcore_scan allocates it even on its
-        // payload-on-error path (empty discovery, code 4), so freeing only
-        // on success leaks one JSON string per empty scan from Java.
-        let s = take_string(out);
-        if code == 0 {
-            rust_to_j(env, &s)
-        } else {
-            std::ptr::null_mut()
-        }
+        call_c_abi(env, &[transport, profile, family], |args| {
+            let mut out: *mut c_char = std::ptr::null_mut();
+            let mut err: *mut crate::QcoreError = std::ptr::null_mut();
+            let code = with_engine(handle, |e| {
+                crate::qcore_scan(e, args[0], args[1], args[2], &mut out, &mut err)
+            });
+            (code, out, err)
+        })
     });
     result.unwrap_or(std::ptr::null_mut())
 }
@@ -325,22 +326,14 @@ pub unsafe extern "system" fn Java_com_qcore_Qcore_importConfig(
     path: JString,
 ) -> JString {
     let result = std::panic::catch_unwind(|| unsafe {
-        let path = j_to_rust(env, path).unwrap_or_default();
-        let path_c = CString::new(path).unwrap_or_else(|_| CString::new("").unwrap());
-        let mut out: *mut c_char = std::ptr::null_mut();
-        let mut err: *mut crate::QcoreError = std::ptr::null_mut();
-        let code = with_engine(handle, |e| {
-            crate::qcore_import_config(e, path_c.as_ptr(), &mut out, &mut err)
-        });
-        take_error(err);
-        // Reclaim unconditionally (see scanJson): `take_string` is a no-op
-        // on null, so this is free insurance against payload-on-error paths.
-        let s = take_string(out);
-        if code == 0 {
-            rust_to_j(env, &s)
-        } else {
-            std::ptr::null_mut()
-        }
+        call_c_abi(env, &[path], |args| {
+            let mut out: *mut c_char = std::ptr::null_mut();
+            let mut err: *mut crate::QcoreError = std::ptr::null_mut();
+            let code = with_engine(handle, |e| {
+                crate::qcore_import_config(e, args[0], &mut out, &mut err)
+            });
+            (code, out, err)
+        })
     });
     result.unwrap_or(std::ptr::null_mut())
 }
@@ -357,22 +350,14 @@ pub unsafe extern "system" fn Java_com_qcore_Qcore_exportConfig(
     import_ref: JString,
 ) -> JString {
     let result = std::panic::catch_unwind(|| unsafe {
-        let import_ref = j_to_rust(env, import_ref).unwrap_or_default();
-        let ref_c = CString::new(import_ref).unwrap_or_else(|_| CString::new("").unwrap());
-        let mut out: *mut c_char = std::ptr::null_mut();
-        let mut err: *mut crate::QcoreError = std::ptr::null_mut();
-        let code = with_engine(handle, |e| {
-            crate::qcore_export_config(e, ref_c.as_ptr(), &mut out, &mut err)
-        });
-        take_error(err);
-        // Reclaim unconditionally (see scanJson): `take_string` is a no-op
-        // on null, so this is free insurance against payload-on-error paths.
-        let s = take_string(out);
-        if code == 0 {
-            rust_to_j(env, &s)
-        } else {
-            std::ptr::null_mut()
-        }
+        call_c_abi(env, &[import_ref], |args| {
+            let mut out: *mut c_char = std::ptr::null_mut();
+            let mut err: *mut crate::QcoreError = std::ptr::null_mut();
+            let code = with_engine(handle, |e| {
+                crate::qcore_export_config(e, args[0], &mut out, &mut err)
+            });
+            (code, out, err)
+        })
     });
     result.unwrap_or(std::ptr::null_mut())
 }

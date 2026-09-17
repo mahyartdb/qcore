@@ -71,6 +71,25 @@ const ALLOWED_FIELDS: &[(&str, &[&str])] = &[
     ("mock", &["family"]),
 ];
 
+/// Resolve the `import`/`import_ref` alias pair shared by the three
+/// wireguard gates (grammar, chain file, preset). Either spelling alone
+/// resolves; both with the same value agree; both with different values
+/// fail closed naming both keys. (Previously each gate silently preferred
+/// one spelling — and different gates preferred different ones.)
+pub fn resolve_import_ref(
+    import_: Option<String>,
+    import_ref: Option<String>,
+    context: &str,
+) -> Result<Option<String>, String> {
+    match (import_, import_ref) {
+        (Some(a), Some(b)) if a != b => Err(format!(
+            "{context}: `import` and `import_ref` conflict (`{a}` vs `{b}`); keep one"
+        )),
+        (Some(a), _) => Ok(Some(a)),
+        (None, b) => Ok(b),
+    }
+}
+
 /// Strict TOML parse: unknown fields are deserialization errors naming the
 /// field (Principle IV). The explicit key check below is the enforcement
 /// point for builtin kinds. A *registered* non-builtin kind parses opaquely
@@ -285,6 +304,14 @@ impl<'de> Deserialize<'de> for HopConfig {
         // `id` rides alongside under `HopSpec`'s flatten; builtin structs
         // ignore it exactly as before (they declare no deny list).
         let value = serde_json::Value::Object(map.clone().into_iter().collect());
+        // Field list per builtin kind. The arms below match on static
+        // literals, so a miss here means the table drifted from the arms:
+        // fail closed, never panic on stored input (the table-coverage
+        // test pins the table in CI).
+        let fields = |kind: &'static str| {
+            allowed_fields(kind)
+                .ok_or_else(|| D::Error::custom(format!("transport `{kind}` has no field list")))
+        };
         let builtin = |t: serde_json::Value,
                        allow: &'static [&'static str]|
          -> Result<serde_json::Value, D::Error> {
@@ -297,46 +324,28 @@ impl<'de> Deserialize<'de> for HopConfig {
         };
         Ok(match kind.as_str() {
             "wireguard" => HopConfig::Wireguard(
-                serde_json::from_value(builtin(
-                    value,
-                    allowed_fields("wireguard").expect("builtin kinds have field lists"),
-                )?)
-                .map_err(D::Error::custom)?,
+                serde_json::from_value(builtin(value, fields("wireguard")?)?)
+                    .map_err(D::Error::custom)?,
             ),
             "masque" => HopConfig::Masque(
-                serde_json::from_value(builtin(
-                    value,
-                    allowed_fields("masque").expect("builtin kinds have field lists"),
-                )?)
-                .map_err(D::Error::custom)?,
+                serde_json::from_value(builtin(value, fields("masque")?)?)
+                    .map_err(D::Error::custom)?,
             ),
             "tor" => HopConfig::Tor(
-                serde_json::from_value(builtin(
-                    value,
-                    allowed_fields("tor").expect("builtin kinds have field lists"),
-                )?)
-                .map_err(D::Error::custom)?,
+                serde_json::from_value(builtin(value, fields("tor")?)?)
+                    .map_err(D::Error::custom)?,
             ),
             "psiphon" => HopConfig::Psiphon(
-                serde_json::from_value(builtin(
-                    value,
-                    allowed_fields("psiphon").expect("builtin kinds have field lists"),
-                )?)
-                .map_err(D::Error::custom)?,
+                serde_json::from_value(builtin(value, fields("psiphon")?)?)
+                    .map_err(D::Error::custom)?,
             ),
             "relay" => HopConfig::Relay(
-                serde_json::from_value(builtin(
-                    value,
-                    allowed_fields("relay").expect("builtin kinds have field lists"),
-                )?)
-                .map_err(D::Error::custom)?,
+                serde_json::from_value(builtin(value, fields("relay")?)?)
+                    .map_err(D::Error::custom)?,
             ),
             "mock" => HopConfig::Mock(
-                serde_json::from_value(builtin(
-                    value,
-                    allowed_fields("mock").expect("builtin kinds have field lists"),
-                )?)
-                .map_err(D::Error::custom)?,
+                serde_json::from_value(builtin(value, fields("mock")?)?)
+                    .map_err(D::Error::custom)?,
             ),
             other => {
                 map.remove("id");
@@ -432,5 +441,45 @@ bogus_key = "nope"
         let back: HopSpec = serde_json::from_str(&json).unwrap();
         assert_eq!(spec, back);
         assert_eq!(back.config.kind(), "tor");
+    }
+
+    #[test]
+    fn field_table_covers_all_builtin_kinds() {
+        // Guards the table every parse gate shares: deleting a row must
+        // break CI here, not panic in production on user input (the gates
+        // fail closed on a miss). This is a guard test by construction —
+        // the backstops it protects are unreachable while the table holds.
+        for kind in ["wireguard", "masque", "tor", "psiphon", "relay", "mock"] {
+            assert!(
+                allowed_fields(kind).is_some(),
+                "missing field list for `{kind}`"
+            );
+        }
+        assert!(allowed_fields("nope").is_none());
+    }
+
+    #[test]
+    fn import_ref_alias_resolves_without_silent_winners() {
+        // Either spelling alone resolves.
+        assert_eq!(
+            resolve_import_ref(Some("a".into()), None, "ctx").unwrap(),
+            Some("a".to_string())
+        );
+        assert_eq!(
+            resolve_import_ref(None, Some("b".into()), "ctx").unwrap(),
+            Some("b".to_string())
+        );
+        assert_eq!(resolve_import_ref(None, None, "ctx").unwrap(), None);
+        // Both spellings with the same value agree.
+        assert_eq!(
+            resolve_import_ref(Some("a".into()), Some("a".into()), "ctx").unwrap(),
+            Some("a".to_string())
+        );
+        // Both spellings with different values fail closed naming both keys.
+        let err = resolve_import_ref(Some("a".into()), Some("b".into()), "ctx").unwrap_err();
+        assert!(
+            err.contains("`import`") && err.contains("`import_ref`"),
+            "got: {err}"
+        );
     }
 }

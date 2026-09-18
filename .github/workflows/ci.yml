@@ -45,9 +45,10 @@ jobs:
           BASE="${{ github.event.pull_request.base.sha }}"
           [ -z "$BASE" ] && BASE="$(git merge-base HEAD HEAD~1 2>/dev/null || echo HEAD~1)"
           cargo semver-checks --baseline-rev "$BASE" --exclude tests-conformance --exclude tests-chains
-      # T087 static secret-scan gate: git-aware scan plus a filesystem scan
-      # over the working tree (build artifacts, reports, state files, crash
-      # output). Either scanner failing blocks the gate (SC-006).
+      # T087 static secret-scan gate: two git-history scans (gitleaks rule
+      # match incl. fixtures via .gitleaksignore, trufflehog verified-only)
+      # plus the secret_hygiene conformance suite (emitted artifacts). Any
+      # of them failing blocks the gate (SC-006).
       # Pinned gitleaks CLI instead of gitleaks-action: the action wraps the
       # scan in octokit calls (PR commit listing, review comments, summary,
       # artifact upload) whose failures surface as a bare step failure with
@@ -64,14 +65,20 @@ jobs:
           else
             gitleaks detect --source . -v --exit-code=2
           fi
-      - name: secret scan (trufflehog filesystem)
-        uses: trufflesecurity/trufflehog@v3.88.4
-        with:
-          path: ./
-          # target/ excluded: regenerable compiler output (multi-GB .o/rustdoc
-          # trees, incl. semver scratch copies) crashes the scanner with no
-          # finding attached. Sources, configs, state files, and .git history
-          # stay scanned; emitted-artifact secrecy is asserted by the
-          # secret_hygiene conformance suite.
-          extra_args: --only-verified --fail -x target/
+      # Pinned trufflehog CLI over the PR's git history (same content the
+      # docker action scanned: `git --since-commit BASE --branch HEAD`).
+      # The action wrapper fails opaquely (exit 1, no finding, no artifact)
+      # while every direct repro is clean, so run the scan transparently in
+      # the gate log. Verified-only: fakes can never trip it.
+      - name: secret scan (trufflehog git history)
+        run: |
+          curl -sSL -o /tmp/trufflehog.tar.gz https://github.com/trufflesecurity/trufflehog/releases/download/v3.88.4/trufflehog_3.88.4_linux_amd64.tar.gz
+          tar xzf /tmp/trufflehog.tar.gz -C /tmp && sudo install -m755 /tmp/trufflehog /usr/local/bin/
+          BASE="${{ github.event.pull_request.base.sha }}"
+          HEAD="${{ github.event.pull_request.head.sha }}"
+          if [ -n "$BASE" ] && [ -n "$HEAD" ]; then
+            trufflehog git "file://$(pwd)" --since-commit "$BASE" --branch "$HEAD" --fail --no-update --only-verified
+          else
+            trufflehog git "file://$(pwd)" --fail --no-update --only-verified
+          fi
       - run: cargo xtask smoke --target native

@@ -56,6 +56,11 @@ jobs:
           BASE="${{ github.event.pull_request.base.sha }}"
           [ -z "$BASE" ] && BASE="$(git merge-base HEAD HEAD~1 2>/dev/null || echo HEAD~1)"
           cargo semver-checks --baseline-rev "$BASE" --exclude tests-conformance --exclude tests-chains
+      # Semver scratch trees are single-use multi-GB baseline copies. Prune
+      # now that their only consumer ran: leaving them trips the post-run
+      # cache save with ENOENT annotations and wastes cache quota.
+      - name: prune semver scratch trees
+        run: rm -rf target/semver-checks
       # T087 secret-scan gate: gitleaks (rule match + .gitleaksignore
       # fingerprints) and trufflehog --only-verified over git history, plus
       # the secret_hygiene conformance suite. Any of them failing blocks the

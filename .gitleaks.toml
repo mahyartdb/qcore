@@ -1,0 +1,7 @@
+# Gitleaks false-positive allowlist (SC-006 secret-scan gate).
+# Exact-literal regexes only: known-fake fixtures, no path/commit blankets.
+[allowlist]
+description = "Fake secret-like literals used by the redaction/secret-hygiene tests; no real credentials."
+regexes = [
+    '''cB6V3Xk8pR2mN5qW7zT9yU1iO4pA6sD8fG0hJ2kL4==''',
+]

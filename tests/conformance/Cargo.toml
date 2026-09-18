@@ -5,18 +5,18 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-qcore-core = { path = "../../crates/qcore-core" }
-qcore-transport-api = { path = "../../crates/qcore-transport-api" }
-qcore-transports = { path = "../../crates/qcore-transports" }
+qcore-core = { version = "0.1.0", path = "../../crates/qcore-core" }
+qcore-transport-api = { version = "0.1.0", path = "../../crates/qcore-transport-api" }
+qcore-transports = { version = "0.1.0", path = "../../crates/qcore-transports" }
 serde_json = { workspace = true }
-transport-mock = { package = "qcore-transport-mock", path = "../../crates/qcore-transports/transport-mock" }
-transport-masque = { package = "qcore-transport-masque", path = "../../crates/qcore-transports/transport-masque" }
-transport-wireguard = { package = "qcore-transport-wireguard", path = "../../crates/qcore-transports/transport-wireguard" }
-transport-tor = { package = "qcore-transport-tor", path = "../../crates/qcore-transports/transport-tor" }
-transport-psiphon = { package = "qcore-transport-psiphon", path = "../../crates/qcore-transports/transport-psiphon" }
+transport-mock = { version = "0.1.0", package = "qcore-transport-mock", path = "../../crates/qcore-transports/transport-mock" }
+transport-masque = { version = "0.1.0", package = "qcore-transport-masque", path = "../../crates/qcore-transports/transport-masque" }
+transport-wireguard = { version = "0.1.0", package = "qcore-transport-wireguard", path = "../../crates/qcore-transports/transport-wireguard" }
+transport-tor = { version = "0.1.0", package = "qcore-transport-tor", path = "../../crates/qcore-transports/transport-tor" }
+transport-psiphon = { version = "0.1.0", package = "qcore-transport-psiphon", path = "../../crates/qcore-transports/transport-psiphon" }
 tokio = { workspace = true }
 async-trait = { workspace = true }
-qcore-ffi = { path = "../../crates/qcore-ffi" }
+qcore-ffi = { version = "0.1.0", path = "../../crates/qcore-ffi" }
 base64 = { workspace = true }
 
 [dev-dependencies]

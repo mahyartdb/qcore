@@ -19,7 +19,7 @@ jobs:
       - run: cargo nextest run --all-features
       - run: cargo nextest run -p tests-conformance
       - run: cargo xtask abi-diff
-      - run: cargo deny check
+      - run: cargo deny --config denylist.toml check
       - run: cargo semver-checks
       # T087 static secret-scan gate: git-aware scan plus a filesystem scan
       # over the working tree (build artifacts, reports, state files, crash

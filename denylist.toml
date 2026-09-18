@@ -13,13 +13,70 @@ targets = [
 ]
 
 [licenses]
-allow = ["MIT", "Apache-2.0", "ISC", "BSD-2-Clause", "BSD-3-Clause", "Unicode-DFS-2016", "CC0-1.0"]
+allow = ["MIT", "Apache-2.0", "ISC", "BSD-2-Clause", "BSD-3-Clause", "Unicode-DFS-2016", "Unicode-3.0", "CC0-1.0", "Unlicense", "Zlib", "MPL-2.0"]
 confidence-threshold = 0.8
+
+[advisories]
+ignore = [
+    { id = "RUSTSEC-2023-0071", reason = "Marvin timing sidechannel in rsa 0.9.10 via ssh-key-fork-arti/tor-key-forge (arti-client 0.46 subtree); no compatible patched release, unfixable without upstream arti upgrade; reassess on upgrade" },
+    { id = "RUSTSEC-2024-0436", reason = "paste 1.0.15 unmaintained proc-macro via slotmap-careful/tor-async-utils (arti-client 0.46 subtree); macro-only, no runtime/network surface; reassess on upstream upgrade" },
+]
 
 [bans]
 multiple-versions = "deny"
 wildcards = "deny"
 highlight = "all"
+# Duplicate majors required by disjoint transitive subtrees (primarily
+# arti-client 0.46); cannot unify in this tree. Each skip pins the older
+# line(s) so any NEW duplicate still fails the gate. Reassess on subtree upgrades.
+skip = [
+    { crate = "atomic@0.5.3", reason = "older line pinned by transitive subtree; newest 0.6.1 stays enforced" },
+    { crate = "block-buffer@0.10.4", reason = "older line pinned by transitive subtree; newest 0.12.1 stays enforced" },
+    { crate = "chacha20@0.9.1", reason = "older line pinned by transitive subtree; newest 0.10.2 stays enforced" },
+    { crate = "cipher@0.4.4", reason = "older line pinned by transitive subtree; newest 0.5.2 stays enforced" },
+    { crate = "const-oid@0.9.6", reason = "older line pinned by transitive subtree; newest 0.10.2 stays enforced" },
+    { crate = "cpufeatures@0.2.17", reason = "older line pinned by transitive subtree; newest 0.3.1 stays enforced" },
+    { crate = "crypto-common@0.1.7", reason = "older line pinned by transitive subtree; newest 0.2.2 stays enforced" },
+    { crate = "darling@0.14.4", reason = "older line pinned by transitive subtree; newest 0.24.1 stays enforced" },
+    { crate = "darling@0.21.3", reason = "older line pinned by transitive subtree; newest 0.24.1 stays enforced" },
+    { crate = "darling_core@0.14.4", reason = "older line pinned by transitive subtree; newest 0.24.1 stays enforced" },
+    { crate = "darling_core@0.21.3", reason = "older line pinned by transitive subtree; newest 0.24.1 stays enforced" },
+    { crate = "darling_macro@0.14.4", reason = "older line pinned by transitive subtree; newest 0.24.1 stays enforced" },
+    { crate = "darling_macro@0.21.3", reason = "older line pinned by transitive subtree; newest 0.24.1 stays enforced" },
+    { crate = "digest@0.10.7", reason = "older line pinned by transitive subtree; newest 0.11.3 stays enforced" },
+    { crate = "foldhash@0.1.5", reason = "older line pinned by transitive subtree; newest 0.2.0 stays enforced" },
+    { crate = "getrandom@0.2.17", reason = "older line pinned by transitive subtree; newest 0.4.3 stays enforced" },
+    { crate = "getrandom@0.3.4", reason = "older line pinned by transitive subtree; newest 0.4.3 stays enforced" },
+    { crate = "hashbrown@0.12.3", reason = "older line pinned by transitive subtree; newest 0.17.1 stays enforced" },
+    { crate = "hashbrown@0.15.5", reason = "older line pinned by transitive subtree; newest 0.17.1 stays enforced" },
+    { crate = "hashbrown@0.16.1", reason = "older line pinned by transitive subtree; newest 0.17.1 stays enforced" },
+    { crate = "inout@0.1.4", reason = "older line pinned by transitive subtree; newest 0.2.2 stays enforced" },
+    { crate = "keccak@0.1.6", reason = "older line pinned by transitive subtree; newest 0.2.2 stays enforced" },
+    { crate = "rand@0.8.8", reason = "older line pinned by transitive subtree; newest 0.10.2 stays enforced" },
+    { crate = "rand_chacha@0.3.1", reason = "older line pinned by transitive subtree; newest 0.10.0 stays enforced" },
+    { crate = "rand_core@0.6.4", reason = "older line pinned by transitive subtree; newest 0.10.1 stays enforced" },
+    { crate = "serde_spanned@0.6.9", reason = "toml 0.8 line (workspace) vs 1.x line (arti subtree); newest stays enforced" },
+    { crate = "sha3@0.10.9", reason = "older line pinned by transitive subtree; newest 0.12.0 stays enforced" },
+    { crate = "strsim@0.10.0", reason = "older line pinned by transitive subtree; newest 0.11.1 stays enforced" },
+    { crate = "syn@1.0.109", reason = "older line pinned by transitive subtree; newest 3.0.5 stays enforced" },
+    { crate = "syn@2.0.119", reason = "older line pinned by transitive subtree; newest 3.0.5 stays enforced" },
+    { crate = "thiserror@1.0.69", reason = "older line pinned by transitive subtree; newest 2.0.20 stays enforced" },
+    { crate = "thiserror-impl@1.0.69", reason = "older line pinned by transitive subtree; newest 2.0.20 stays enforced" },
+    { crate = "toml@0.8.23", reason = "toml 0.8 line (workspace) vs 1.x line (arti subtree); newest stays enforced" },
+    { crate = "toml_datetime@0.6.11", reason = "toml 0.8 line (workspace) vs 1.x line (arti subtree); newest stays enforced" },
+    { crate = "toml_edit@0.22.27", reason = "toml 0.8 line (workspace) vs 1.x line (arti subtree); newest stays enforced" },
+    { crate = "universal-hash@0.5.1", reason = "older line pinned by transitive subtree; newest 0.6.1 stays enforced" },
+    { crate = "windows_aarch64_msvc@0.52.6", reason = "older windows-targets line pinned by transitive subtree; newest 0.53.1 stays enforced" },
+    { crate = "windows_i686_gnu@0.52.6", reason = "older windows-targets line pinned by transitive subtree; newest 0.53.1 stays enforced" },
+    { crate = "windows_i686_msvc@0.52.6", reason = "older windows-targets line pinned by transitive subtree; newest 0.53.1 stays enforced" },
+    { crate = "windows_x86_64_gnu@0.52.6", reason = "older windows-targets line pinned by transitive subtree; newest 0.53.1 stays enforced" },
+    { crate = "windows_x86_64_msvc@0.52.6", reason = "older windows-targets line pinned by transitive subtree; newest 0.53.1 stays enforced" },
+    { crate = "windows-sys@0.52.0", reason = "older line pinned by transitive subtree; newest 0.61.2 stays enforced" },
+    { crate = "windows-sys@0.59.0", reason = "older line pinned by transitive subtree; newest 0.61.2 stays enforced" },
+    { crate = "windows-sys@0.60.2", reason = "older line pinned by transitive subtree; newest 0.61.2 stays enforced" },
+    { crate = "windows-targets@0.52.6", reason = "older line pinned by transitive subtree; newest 0.53.5 stays enforced" },
+    { crate = "winnow@0.7.15", reason = "toml 0.8 line (workspace) vs 1.x line (arti subtree); newest 1.0.4 stays enforced" },
+]
 
 [sources]
 unknown-registry = "deny"

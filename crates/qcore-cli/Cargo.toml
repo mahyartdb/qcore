@@ -9,11 +9,11 @@ name = "qcore"
 path = "src/main.rs"
 
 [dependencies]
-qcore-core = { path = "../qcore-core" }
-qcore-transport-api = { path = "../qcore-transport-api" }
+qcore-core = { version = "0.1.0", path = "../qcore-core" }
+qcore-transport-api = { version = "0.1.0", path = "../qcore-transport-api" }
 # The CLI links every builtin transport so validation, `ls` and smoke see the
 # full registry (FR-006). Heavy transports stay feature-gated (FR-003g).
-qcore-transports = { path = "../qcore-transports", features = ["tor"] }
+qcore-transports = { version = "0.1.0", path = "../qcore-transports", features = ["tor"] }
 clap = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

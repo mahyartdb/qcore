@@ -8,7 +8,7 @@
 
 use crate::config::profile_dir::ProfileDirs;
 use crate::config::{HopConfig, HopSpec};
-use crate::identity::store::{load, IdentityRole};
+use crate::identity::store::{load, role_name, IdentityRole};
 use crate::scan::cache::read_winners;
 use std::collections::HashMap;
 
@@ -118,31 +118,18 @@ fn winner_endpoint(dirs: &ProfileDirs, keys: &[&str], family: &str) -> Option<St
 }
 
 /// Base64 key material → lowercase hex. Corrupt material fails toward
-/// re-registration, never toward a half-built tunnel.
+/// re-registration, never toward a half-built tunnel. Shares the 32-byte
+/// validation with the import gate (`b64_decode_32`) instead of re-owning it.
 fn b64_to_hex(b64: &[u8], hop_id: &str, role: &str) -> Result<String, (String, String)> {
-    use base64::Engine as _;
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(b64)
-        .map_err(|_| {
-            (
-                hop_id.to_string(),
-                format!("stored {role} identity is corrupt — run `qcore register` to replace it"),
-            )
-        })?;
-    if bytes.len() != 32 {
-        return Err((
+    let corrupt = || {
+        (
             hop_id.to_string(),
             format!("stored {role} identity is corrupt — run `qcore register` to replace it"),
-        ));
-    }
-    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
-}
-
-fn role_name(role: IdentityRole) -> &'static str {
-    match role {
-        IdentityRole::Outer => "warp",
-        IdentityRole::Inner => "warp-inner",
-    }
+        )
+    };
+    let s = std::str::from_utf8(b64).map_err(|_| corrupt())?;
+    let raw = crate::config::import::b64_decode_32(s).map_err(|_| corrupt())?;
+    Ok(crate::config::import::hex_encode(&raw))
 }
 
 #[cfg(test)]

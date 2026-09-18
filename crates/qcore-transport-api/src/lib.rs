@@ -1,7 +1,7 @@
 //! Public transport plugin boundary (plan: The Transport Interface).
 //!
 //! A transport is a plugin behind three traits plus static descriptor data.
-//! The engine reads descriptors from the [`registry`](crate::registry) and never
+//! The engine reads descriptors from its transport registry and never
 //! matches on a transport kind. Depends on tokio + async-trait only, so
 //! transport crates never pull in the engine.
 
@@ -54,6 +54,19 @@ pub trait UdpFlow: Send + Sync {
     async fn send_to(&self, buf: &[u8], dst: SocketAddr) -> Result<(), HopError>;
     async fn recv_from(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr), HopError>;
     fn local_addr(&self) -> Result<SocketAddr, HopError>;
+}
+
+/// Unspecified bind address matching `dst`'s family (port 0): the
+/// infallible spelling of `"0.0.0.0:0"` / `"[::]:0"`. Never parse constant
+/// socket literals — a typo would panic a dial path, while these
+/// constructors have no failure mode at all.
+pub fn unspecified_bind(dst: &SocketAddr) -> SocketAddr {
+    let ip = if dst.is_ipv4() {
+        std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+    } else {
+        std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
+    };
+    SocketAddr::new(ip, 0)
 }
 
 /// The egress handed to the next hop.

@@ -34,6 +34,13 @@ pub struct StartedHop {
     /// Active obfuscation profile name, if any (US5 T073 reporting).
     pub obfuscation: Option<String>,
     pub hop: Arc<dyn RunningHop>,
+    /// Keepalive watcher abort handle (`None` when keepalive is disabled).
+    /// `AbortHandle` (not `JoinHandle`) so `StartedHop` stays `Clone`.
+    /// Teardown (`unwind`, `SessionHandle::stop_all`) aborts before stopping
+    /// the hop: dropping the handle would detach the task and leak it.
+    /// Crate-internal (`pub(crate)`): teardown bookkeeping, not embedder
+    /// API — future internal handles stay minor for the same reason.
+    pub(crate) keepalive: Option<tokio::task::AbortHandle>,
 }
 
 /// Per-hop material merged into factory configs at bring-up (in memory
@@ -147,14 +154,19 @@ pub async fn bring_up(
                 }
             }
         });
-        if keepalive.enabled {
-            spawn_keepalive(
-                spec.id.clone(),
-                hop.clone(),
-                keepalive.clone(),
-                events.clone(),
-            );
-        }
+        let keepalive_abort = if keepalive.enabled {
+            Some(
+                spawn_keepalive(
+                    spec.id.clone(),
+                    hop.clone(),
+                    keepalive.clone(),
+                    events.clone(),
+                )
+                .abort_handle(),
+            )
+        } else {
+            None
+        };
         let _ = events.send(HopEvent::EndpointSelected {
             hop_id: spec.id.clone(),
             endpoint: effective_endpoint(spec),
@@ -170,14 +182,21 @@ pub async fn bring_up(
             inner_mtu: prober.current_mtu(),
             obfuscation: active_obfuscation,
             hop,
+            keepalive: keepalive_abort,
         });
     }
     Ok(started)
 }
 
-/// Stop started hops reverse-order, best effort (unwind path).
+/// Stop started hops reverse-order, best effort (unwind path). Each hop's
+/// keepalive watcher is aborted before its hop stops: aborting is the only
+/// stop signal (a missing bus receiver must NOT kill the watcher —
+/// receivers attach transiently), and dropping the handle would detach.
 async fn unwind(started: &[StartedHop]) {
     for s in started.iter().rev() {
+        if let Some(keepalive) = &s.keepalive {
+            keepalive.abort();
+        }
         let _ = s.hop.stop().await;
     }
 }
@@ -238,4 +257,114 @@ fn endpoint_of(spec: &crate::config::HopSpec) -> Option<String> {
 
 fn effective_endpoint(spec: &crate::config::HopSpec) -> String {
     endpoint_of(spec).unwrap_or_else(|| spec.config.family().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use qcore_transport_api::{
+        ByteStream, Capabilities, HopError, HopHealth, TransportDescriptor, UdpFlow,
+    };
+
+    struct StubDialer;
+
+    #[async_trait::async_trait]
+    impl Dialer for StubDialer {
+        async fn dial_tcp(&self, _dst: SocketAddr) -> Result<Box<dyn ByteStream>, HopError> {
+            Err(HopError::validation("unused in keepalive test"))
+        }
+        async fn dial_udp(&self, _dst: SocketAddr) -> Result<Box<dyn UdpFlow>, HopError> {
+            Err(HopError::validation("unused in keepalive test"))
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                accepts_tcp_carrier: false,
+                accepts_udp_carrier: false,
+                dials_tcp: false,
+                dials_udp: false,
+            }
+        }
+    }
+
+    static STUB_DESCRIPTOR: TransportDescriptor = TransportDescriptor {
+        kind: "stub",
+        capabilities: Capabilities {
+            accepts_tcp_carrier: false,
+            accepts_udp_carrier: false,
+            dials_tcp: false,
+            dials_udp: false,
+        },
+        obfuscation_families: &[],
+        config_schema: "stub/v1",
+        needs_sidecar: false,
+    };
+
+    /// Always-healthy hop: the keepalive watcher never exits on its own, so
+    /// a finished watcher proves the owner aborted it (dropping the
+    /// JoinHandle would detach and the task would linger).
+    struct StubHop {
+        events: tokio::sync::broadcast::Sender<HopEvent>,
+    }
+
+    #[async_trait::async_trait]
+    impl RunningHop for StubHop {
+        fn descriptor(&self) -> &'static TransportDescriptor {
+            &STUB_DESCRIPTOR
+        }
+        fn dialer(&self) -> Arc<dyn Dialer> {
+            Arc::new(StubDialer)
+        }
+        fn health(&self) -> HopHealth {
+            HopHealth::Healthy
+        }
+        fn events(&self) -> tokio::sync::broadcast::Receiver<HopEvent> {
+            self.events.subscribe()
+        }
+        async fn stop(&self) -> Result<(), HopError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn unwind_aborts_keepalive_watchers() {
+        let hop: Arc<dyn RunningHop> = Arc::new(StubHop {
+            events: tokio::sync::broadcast::channel(16).0,
+        });
+        let (tx, _rx) = tokio::sync::broadcast::channel(16);
+        let handle = spawn_keepalive(
+            "h0".into(),
+            hop.clone(),
+            KeepalivePolicy {
+                enabled: true,
+                interval_secs: 3600,
+            },
+            tx,
+        );
+        let abort = handle.abort_handle();
+        let started = vec![StartedHop {
+            hop_id: "h0".into(),
+            kind: "stub".into(),
+            family: "ipv4".into(),
+            endpoint: None,
+            via: "root".into(),
+            nested: false,
+            inner_mtu: 1500,
+            obfuscation: None,
+            hop,
+            keepalive: Some(handle.abort_handle()),
+        }];
+        assert!(!abort.is_finished());
+        unwind(&started).await;
+        // Abort delivery needs a scheduler pass; bound the wait instead of
+        // sleeping (no wall-clock dependence).
+        let mut finished = false;
+        for _ in 0..100 {
+            if abort.is_finished() {
+                finished = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(finished, "keepalive watcher survived unwind");
+    }
 }

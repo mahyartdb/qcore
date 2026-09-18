@@ -40,8 +40,8 @@ struct Cli {
     #[arg(long = "max-depth", global = true)]
     max_depth: Option<u32>,
 
-    /// Connection timeout seconds (CONNECTION_TIMEOUT_SECONDS, default 30).
-    #[arg(long, global = true)]
+    /// Connection timeout seconds (default 30).
+    #[arg(long, global = true, env = "CONNECTION_TIMEOUT_SECONDS")]
     timeout: Option<u64>,
 
     /// Disable color (output is never colorized; also honors NO_COLOR).
@@ -84,7 +84,7 @@ fn check_globals(cli: &Cli) -> Result<GlobalOpts, i32> {
     }
     let timeout_secs = cli.timeout.unwrap_or(30);
     if timeout_secs < 1 {
-        eprintln!("qcore: --timeout must be at least 1 second");
+        eprintln!("qcore: --timeout must be at least 1 second (exit 6)");
         return Err(exit::USAGE);
     }
     Ok(GlobalOpts {

@@ -5,11 +5,11 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-qcore-core = { path = "../../crates/qcore-core" }
-qcore-transport-api = { path = "../../crates/qcore-transport-api" }
-qcore-transports = { path = "../../crates/qcore-transports", features = ["tor", "wireguard", "mock"] }
-transport-mock = { package = "qcore-transport-mock", path = "../../crates/qcore-transports/transport-mock" }
-transport-wireguard = { package = "qcore-transport-wireguard", path = "../../crates/qcore-transports/transport-wireguard" }
+qcore-core = { version = "0.2.0", path = "../../crates/qcore-core" }
+qcore-transport-api = { version = "0.1.0", path = "../../crates/qcore-transport-api" }
+qcore-transports = { version = "0.1.0", path = "../../crates/qcore-transports", features = ["tor", "wireguard", "mock"] }
+transport-mock = { version = "0.1.0", package = "qcore-transport-mock", path = "../../crates/qcore-transports/transport-mock" }
+transport-wireguard = { version = "0.1.0", package = "qcore-transport-wireguard", path = "../../crates/qcore-transports/transport-wireguard" }
 tokio = { workspace = true }
 
 [[test]]

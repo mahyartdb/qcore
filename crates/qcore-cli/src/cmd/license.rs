@@ -57,3 +57,42 @@ pub fn resolve(
     }
     Ok(None)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flag_and_file_conflict_is_usage_error() {
+        let r = resolve(
+            Some("k"),
+            Some(&std::env::temp_dir().join("qcore-test-license.toml")),
+            false,
+        );
+        assert_eq!(r.unwrap_err(), crate::exit::USAGE);
+    }
+
+    #[test]
+    fn missing_file_is_usage_error() {
+        let r = resolve(
+            None,
+            Some(&std::env::temp_dir().join("qcore-test-missing-license")),
+            true,
+        );
+        assert_eq!(r.unwrap_err(), crate::exit::USAGE);
+    }
+
+    #[test]
+    fn empty_file_is_usage_error() {
+        let path = std::env::temp_dir().join(format!("qcore-license-empty-{}", std::process::id()));
+        std::fs::write(&path, "  \n").unwrap();
+        let r = resolve(None, Some(&path), true);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(r.unwrap_err(), crate::exit::USAGE);
+    }
+
+    #[test]
+    fn non_interactive_without_input_resolves_none() {
+        assert!(matches!(resolve(None, None, true), Ok(None)));
+    }
+}

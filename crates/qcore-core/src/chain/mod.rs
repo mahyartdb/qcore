@@ -151,17 +151,17 @@ pub fn parse_single_hop(kind: &str, opts: &str) -> Result<HopSpec, ChainError> {
         });
     }
     // Unknown keys fail closed, naming the field (typed per transport).
-    let known: &[&str] = match crate::config::allowed_fields(kind) {
-        Some(fields) => fields,
-        None => {
-            return Err(ChainError::new(
-                None,
-                None,
-                format!("unknown transport `{kind}`"),
-                Some("run `qcore ls` for registered transports".to_string()),
-            ))
-        }
-    };
+    // Plugin kinds returned above. A miss here means the field table
+    // drifted from the builtin arms below: fail closed, never panic on
+    // user input (the table-coverage test pins the table in CI).
+    let known: &[&str] = crate::config::allowed_fields(kind).ok_or_else(|| {
+        ChainError::new(
+            None,
+            None,
+            format!("transport `{kind}` has no field list"),
+            None,
+        )
+    })?;
     for k in pairs.keys() {
         if !known.contains(&k.as_str()) {
             return Err(ChainError::new(
@@ -176,10 +176,12 @@ pub fn parse_single_hop(kind: &str, opts: &str) -> Result<HopSpec, ChainError> {
     let config = match kind {
         "wireguard" => HopConfig::Wireguard(WireguardConfig {
             peer: get("peer", "warp"),
-            import_ref: pairs
-                .get("import")
-                .or_else(|| pairs.get("import_ref"))
-                .cloned(),
+            import_ref: resolve_import_ref(
+                pairs.get("import").cloned(),
+                pairs.get("import_ref").cloned(),
+                &format!("chain: transport `{kind}`"),
+            )
+            .map_err(|e| ChainError::new(None, None, e, None))?,
             obfuscation: pairs.get("obfuscation").cloned(),
             family,
             endpoint: pairs.get("endpoint").cloned(),
@@ -197,7 +199,16 @@ pub fn parse_single_hop(kind: &str, opts: &str) -> Result<HopSpec, ChainError> {
         }),
         "relay" => HopConfig::Relay(RelayConfig { family }),
         "mock" => HopConfig::Mock(MockConfig { family }),
-        _ => unreachable!(),
+        // Table hit without an arm is programmer drift, not user input:
+        // fail closed like the gate above, never panic.
+        _ => {
+            return Err(ChainError::new(
+                None,
+                None,
+                format!("transport `{kind}` has no hop builder"),
+                None,
+            ))
+        }
     };
     Ok(HopSpec {
         id: format!("{kind}-0"),

@@ -64,11 +64,13 @@ impl ParamVal {
         }
     }
 
-    /// Deterministic scalar: ints/bools/strings as-is, ranges at midpoint.
+    /// Deterministic scalar: ints/bools/strings as-is, ranges at midpoint
+    /// (`midpoint` cannot overflow, unlike `(lo + hi) / 2` on extremes —
+    /// profile files are untrusted input).
     pub fn scalar(&self) -> String {
         match self {
             ParamVal::Int(i) => i.to_string(),
-            ParamVal::Range(lo, hi) => ((lo + hi) / 2).to_string(),
+            ParamVal::Range(lo, hi) => lo.midpoint(*hi).to_string(),
             ParamVal::Bool(b) => b.to_string(),
             ParamVal::Str(s) => s.clone(),
         }
@@ -232,17 +234,19 @@ pub fn resolve_for_chain(
             .ok_or_else(|| err(format!("unknown obfuscation profile `{name}`")))?;
         let (kind, peer, alpn) = hop_mode(hop);
         // Family must be in the transport descriptor (source of truth).
+        // Matched on variants, not Debug strings: `ObfFamily` and the
+        // transport API's `ObfuscationFamily` are parallel types, and string
+        // comparison would silently pass a renamed variant.
         let descriptor_ok = registry
             .factory(&kind)
             .map(|f| {
-                let want = match profile.family {
-                    ObfFamily::Noize => "noize",
-                    ObfFamily::Awg => "awg",
-                };
-                f.descriptor()
-                    .obfuscation_families
-                    .iter()
-                    .any(|fam| format!("{fam:?}").to_lowercase() == want)
+                f.descriptor().obfuscation_families.iter().any(|fam| {
+                    use qcore_transport_api::ObfuscationFamily as F;
+                    matches!(
+                        (fam, profile.family),
+                        (F::Noize, ObfFamily::Noize) | (F::Awg, ObfFamily::Awg)
+                    )
+                })
             })
             .unwrap_or(false);
         if !descriptor_ok {
@@ -301,7 +305,7 @@ fn profile_fields(profile: &ObfuscationProfile) -> Vec<(String, String)> {
             }
             ParamVal::Range(lo, hi) => {
                 // Other ranges (s1..s4): deterministic midpoint scalar.
-                fields.push((format!("{prefix}{k}"), ((lo + hi) / 2).to_string()));
+                fields.push((format!("{prefix}{k}"), lo.midpoint(*hi).to_string()));
             }
             _ => fields.push((format!("{prefix}{k}"), v.scalar())),
         }
@@ -326,5 +330,14 @@ mod tests {
             assert!(profiles.contains_key(name), "ships {name}");
         }
         assert_eq!(profiles["awg-balanced"].params["jc"].scalar(), "6");
+    }
+
+    #[test]
+    fn extreme_range_midpoint_cannot_overflow() {
+        // (lo + hi) / 2 would overflow here; midpoint is exact.
+        let r = ParamVal::Range(i64::MAX - 1, i64::MAX);
+        let expected = (((i64::MAX - 1) as i128 + i64::MAX as i128) / 2).to_string();
+        assert_eq!(r.scalar(), expected);
+        assert_eq!(ParamVal::Range(4, 9).scalar(), "6");
     }
 }

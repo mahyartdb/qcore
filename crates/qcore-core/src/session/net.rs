@@ -5,7 +5,7 @@
 //! IPv4 (configurable to IPv6). `AllowedIPs` honored exactly (no silent family
 //! expansion). DNS routed through the tunnel or refuse to start (FR-013c).
 
-use qcore_transport_api::{ByteStream, Capabilities, Dialer, HopError, UdpFlow};
+use qcore_transport_api::{unspecified_bind, ByteStream, Capabilities, Dialer, HopError, UdpFlow};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -237,11 +237,8 @@ impl Dialer for RootDialer {
     }
 
     async fn dial_udp(&self, dst: SocketAddr) -> Result<Box<dyn UdpFlow>, HopError> {
-        let bind: SocketAddr = if dst.is_ipv4() {
-            "0.0.0.0:0".parse().unwrap()
-        } else {
-            "[::]:0".parse().unwrap()
-        };
+        // Infallible unspecified bind (never parse constant socket literals).
+        let bind: SocketAddr = unspecified_bind(&dst);
         let socket = tokio::net::UdpSocket::bind(bind)
             .await
             .map_err(HopError::from)?;
@@ -316,8 +313,13 @@ impl Default for KeepalivePolicy {
     }
 }
 
-/// Spawn the keepalive watcher for one hop. Dropping/aborting the returned
-/// handle stops the ticks; session teardown aborts all watchers.
+/// Spawn the keepalive watcher for one hop. Only aborting the returned
+/// handle stops the ticks — dropping a `JoinHandle` detaches (the task keeps
+/// running). The owner stores `handle.abort_handle()` in `StartedHop` and
+/// aborts on teardown (`unwind`, `SessionHandle::stop_all`); the linger is
+/// then bounded by abort delivery, not by the next tick. A missing bus
+/// receiver deliberately does NOT stop the watcher: receivers attach
+/// transiently, so explicit abort is the only stop signal.
 pub fn spawn_keepalive(
     hop_id: String,
     hop: std::sync::Arc<dyn qcore_transport_api::RunningHop>,

@@ -2,6 +2,10 @@
 //!
 //! Typed-field-first: secret fields are always redacted by key.
 //! Entropy-and-denylist scanning second, for free-form values.
+//! Scope: the entropy scan detects random-looking blobs (16+ chars), whole
+//! or embedded as whitespace-delimited tokens. Short or human-readable
+//! credentials under innocuous keys are NOT detected — those must use a
+//! typed secret key or a denylist entry.
 //! Fail-closed: a value that cannot be classified safe and cannot be proven
 //! secret is NOT emitted — the whole record is dropped and a placeholder with
 //! metadata only is written.
@@ -43,7 +47,7 @@ const DENYLIST: &[&str] = &[
 /// Redaction verdict for one value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Redaction {
-    /// Safe to emit (possibly masked length-preserving... no: emitted as-is).
+    /// Safe to emit as-is.
     Keep(String),
     /// Proven secret: replaced, never emitted.
     Redacted,
@@ -57,9 +61,40 @@ pub struct DroppedRecord {
     pub reason: &'static str,
 }
 
+impl std::fmt::Display for DroppedRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Field names are not secrets: operators triaging a dropped record
+        // need to know which keys were present.
+        write!(
+            f,
+            "record dropped fail-closed ({} fields: {}): {}",
+            self.field_count,
+            self.keys.join(", "),
+            self.reason
+        )
+    }
+}
+
+/// Minimum byte length for a free-form value to count as secret-like.
+const MIN_RANDOM_LEN: usize = 16;
+/// Minimum Shannon entropy (bits/char) for a value to count as secret-like.
+const ENTROPY_BITS_PER_CHAR: f64 = 4.2;
+/// Minimum byte length for an unanchored secret-like value to drop the
+/// whole record fail-closed (shorter values are redacted in place).
+const MIN_DROP_LEN: usize = 44;
+
 fn key_is_secret(key: &str) -> bool {
     let k = key.to_lowercase().replace(['-', '_', ' '], "");
     SECRET_KEYS.iter().any(|sk| k.contains(sk))
+}
+
+/// Typed-anchor check only (no entropy heuristic): true when the key is
+/// secret-named or the value matches the denylist. For validating
+/// operator-authored config, where the probabilistic entropy scan would
+/// false-positive on benign identifiers (and miss short secrets anyway —
+/// see `redact_value` scope). Heuristic hunting stays in diagnostic sinks.
+pub fn has_secret_anchor(key: &str, value: &str) -> bool {
+    key_is_secret(key) || value_matches_denylist(value)
 }
 
 fn value_matches_denylist(v: &str) -> bool {
@@ -87,7 +122,9 @@ fn entropy(s: &str) -> f64 {
 }
 
 fn looks_random(s: &str) -> bool {
-    s.len() >= 16 && entropy(s) > 4.2 && s.bytes().any(|b| b.is_ascii_alphanumeric())
+    s.len() >= MIN_RANDOM_LEN
+        && entropy(s) > ENTROPY_BITS_PER_CHAR
+        && s.bytes().any(|b| b.is_ascii_alphanumeric())
 }
 
 /// Record-drop predicate shared by [`redact_record`] and the NDJSON event
@@ -97,10 +134,53 @@ pub fn drops_record(key: &str, value: &str) -> bool {
     !key_is_secret(key)
         && !value_matches_denylist(value)
         && looks_random(value)
-        && value.len() >= 44
+        && value.len() >= MIN_DROP_LEN
 }
 
+/// Mask a free-text value when it is secret-like, else return it
+/// unchanged. Shared by diagnostic sinks that render raw fields (session
+/// text/stderr reports, FFI error messages), which — unlike the NDJSON
+/// stream — have no per-field redaction pass.
+pub fn masked_value(key: &str, value: &str) -> String {
+    match redact_value(key, value) {
+        Redaction::Keep(s) => s,
+        Redaction::Redacted => "<redacted>".to_string(),
+    }
+}
+
+/// One masked `layer=… hop=… kind=… cause=…` line shared by every sink that
+/// renders a failure report as text (session text/stderr reports, FFI error
+/// messages). The free-text cause is masked; the raw `Display` impl is never
+/// emitted to a sink. One format means a `FailureReport` shape change lands
+/// here, not in three hand-copied literals that silently diverge.
+pub fn masked_failure_line(f: &qcore_transport_api::FailureReport) -> String {
+    format!(
+        "layer={} hop={} kind={} cause={}",
+        f.layer,
+        f.hop_id,
+        f.kind,
+        masked_value("cause", &f.cause)
+    )
+}
+
+/// Keep an actionable `prefix` and mask a secret-like `detail` (fail
+/// closed). Shared by CLI-facing cause builders (registration reports).
+pub fn prefixed_cause(prefix: &str, detail: &str) -> String {
+    match redact_value("cause", detail) {
+        Redaction::Keep(masked) => format!("{prefix}{masked}"),
+        Redaction::Redacted => format!("{prefix}<redacted>"),
+    }
+}
 /// Classify one key/value pair.
+///
+/// Whole-value checks first (typed keys, denylist, whole-value entropy),
+/// then a token scan: a secret embedded in longer low-entropy prose dilutes
+/// whole-value entropy below threshold, so secret-like whitespace-delimited
+/// tokens are masked in place and the sentence is kept with context intact.
+/// Scope: only random-looking blobs of [`MIN_RANDOM_LEN`]+ chars are
+/// detected. Short or human-readable credentials under innocuous keys are
+/// NOT caught by this heuristic — those need a typed secret key or a
+/// denylist entry.
 pub fn redact_value(key: &str, value: &str) -> Redaction {
     if key_is_secret(key) || value_matches_denylist(value) {
         return Redaction::Redacted;
@@ -110,7 +190,30 @@ pub fn redact_value(key: &str, value: &str) -> Redaction {
     if looks_random(value) {
         return Redaction::Redacted;
     }
+    if value.split(char::is_whitespace).any(looks_random) {
+        return Redaction::Keep(mask_secret_tokens(value));
+    }
     Redaction::Keep(value.to_string())
+}
+
+/// Replace secret-like whitespace-delimited tokens with `<redacted>`,
+/// preserving every other byte (including separator runs) exactly, so a
+/// value with no secret-like token round-trips byte-identical.
+fn mask_secret_tokens(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for span in value.split_inclusive(char::is_whitespace) {
+        // trim_end_matches strips the trailing separator run; the remainder
+        // is one token. (Separator matching is the same char::is_whitespace
+        // predicate as the split, so word + sep == span.)
+        let (word, sep) = span.split_at(span.trim_end_matches(char::is_whitespace).len());
+        out.push_str(if looks_random(word) {
+            "<redacted>"
+        } else {
+            word
+        });
+        out.push_str(sep);
+    }
+    out
 }
 
 /// Redact a whole record. Returns the redacted map, or a [`DroppedRecord`]
@@ -195,5 +298,76 @@ mod tests {
         assert_eq!(out["kind"], "wireguard");
         assert_eq!(out["PrivateKey"], "<redacted>");
         assert!(!out["PrivateKey"].contains("cB6V"));
+    }
+
+    #[test]
+    fn sink_helpers_mask_only_secret_like_values() {
+        assert_eq!(
+            masked_value("cause", "connection refused"),
+            "connection refused"
+        );
+        assert_eq!(
+            masked_value(
+                "cause",
+                "boom xT4vN7qW2zR5uY8iO1pA3sD6fG9hJ0kL2mN4bV6cX8dE0gH2=="
+            ),
+            "<redacted>"
+        );
+        assert_eq!(
+            prefixed_cause("provider refused: ", "quota gone"),
+            "provider refused: quota gone"
+        );
+        assert_eq!(
+            prefixed_cause(
+                "provider refused: ",
+                "quota gone xT4vN7qW2zR5uY8iO1pA3sD6fG9hJ0kL2mN4bV6cX8dE0gH2=="
+            ),
+            "provider refused: <redacted>"
+        );
+    }
+
+    const ECHO_44: &str = "xT4vN7qW2zR5uY8iO1pA3sD6fG9hJ0kL2mN4bV6cX8dE0gH2==";
+
+    #[test]
+    fn masked_failure_line_masks_cause_keeps_shape() {
+        use qcore_transport_api::{FailureLayer, FailureReport};
+        let f = FailureReport::new(
+            FailureLayer::Transport,
+            "wg-0",
+            format!("boom {ECHO_44}"),
+            "transport",
+        );
+        let line = masked_failure_line(&f);
+        assert!(!line.contains(ECHO_44), "leaked: {line}");
+        assert_eq!(
+            line,
+            "layer=transport hop=wg-0 kind=transport cause=<redacted>"
+        );
+    }
+
+    #[test]
+    fn embedded_secret_in_prose_is_masked_in_place() {
+        // ~190 chars of low-entropy boilerplate around one 48-char secret:
+        // well within the 220-char provider-body budget, whole-value entropy
+        // dilutes below threshold -> pre-fix this leaks verbatim (Keep).
+        let detail = format!("ref {} {ECHO_44} end", "ok ".repeat(60));
+        let out = masked_value("cause", &detail);
+        assert!(!out.contains(ECHO_44), "embedded secret leaked: {out}");
+        assert!(out.contains("<redacted>"), "nothing masked: {out}");
+        assert!(out.contains("end"), "context lost: {out}");
+    }
+
+    #[test]
+    fn prefixed_cause_masks_embedded_secret_keeps_prefix() {
+        let detail = format!("{} {ECHO_44} done", "note ".repeat(40));
+        let out = prefixed_cause("provider refused: ", &detail);
+        assert!(out.starts_with("provider refused: "), "prefix lost: {out}");
+        assert!(!out.contains(ECHO_44), "embedded secret leaked: {out}");
+    }
+
+    #[test]
+    fn benign_prose_passes_through_byte_identical() {
+        let msg = "connection reset by peer after idle timeout exceeded";
+        assert_eq!(masked_value("cause", msg), msg);
     }
 }

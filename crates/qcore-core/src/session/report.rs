@@ -5,6 +5,7 @@
 //! enforces it and there is no setter (FR-026). Active-profile fields are
 //! populated by T068 (scan) / T073 (obfuscation); until then they are `None`.
 
+use crate::diag::redact::{masked_failure_line, masked_value};
 use qcore_transport_api::{FailureLayer, FailureReport, HopHealth};
 
 /// Exit codes, single source (contracts/cli.md). The CLI re-exports these.
@@ -83,9 +84,38 @@ impl ConnectionReport {
     }
 }
 
-/// Exactly one JSON document (stdout contract).
+/// Exactly one JSON document (stdout contract). The failure cause is
+/// redacted like in [`to_text`]: `--json` stdout and FFI status buffers are
+/// sinks too (FR-026). Serialization of this shape is infallible in
+/// practice; the fallback keeps the no-panic convention (and the
+/// one-document contract) on the impossible path.
 pub fn to_json(r: &ConnectionReport) -> String {
-    serde_json::to_string(r).expect("report serializes")
+    let mut redacted = r.clone();
+    if let Some(f) = redacted.failure.as_mut() {
+        f.cause = masked_value("cause", &f.cause);
+    }
+    serde_json::to_string(&redacted).unwrap_or_else(|_| encode_fallback())
+}
+
+/// Impossible-path fallback: an explicit failure marker, never a
+/// success-shaped document — `failure: null` would present a serialization
+/// bug as success to downstream parsers. Built with `json!` (not a literal)
+/// so the shape cannot rot when fields are added.
+fn encode_fallback() -> String {
+    serde_json::json!({
+        "ordered_chain": [],
+        "exit_hop_id": "<encode-error>",
+        "secret_redaction": true,
+        "active_scan_profile": null,
+        "active_obfuscation": null,
+        "failure": {
+            "layer": "Config",
+            "hop_id": "",
+            "cause": "report serialization failed",
+            "kind": "encode",
+        }
+    })
+    .to_string()
 }
 
 /// Human form (stdout; diagnostics stay on stderr).
@@ -106,7 +136,10 @@ pub fn to_text(r: &ConnectionReport) -> String {
         ));
     }
     if let Some(f) = &r.failure {
-        out.push_str(&format!("failure: {f}\n"));
+        // Shared masked rendering (see `masked_failure_line`): unlike the
+        // NDJSON stream (which redacts), this text path renders raw fields,
+        // so a secret-like cause is masked here (fail closed, FR-026).
+        out.push_str(&format!("failure: {}\n", masked_failure_line(f)));
     }
     out
 }
@@ -120,9 +153,10 @@ pub fn emit_report(r: &ConnectionReport, json: bool) {
     }
 }
 
-/// Emit a failure to stderr; returns the mapped exit code.
+/// Emit a failure to stderr; returns the mapped exit code. The cause is
+/// redacted via the shared helper: stderr is an unredacted sink.
 pub fn emit_failure(r: &FailureReport) -> i32 {
-    eprintln!("qcore: {r}");
+    eprintln!("qcore: {}", masked_failure_line(r));
     exit_code_for_failure(r)
 }
 
@@ -168,5 +202,80 @@ mod tests {
         let doc = to_json(&r);
         assert_eq!(doc.lines().count(), 1);
         assert!(doc.contains("secret_redaction"));
+    }
+
+    #[test]
+    fn text_failure_line_masks_secret_like_cause() {
+        let failure = FailureReport::new(
+            FailureLayer::Transport,
+            "wg-0",
+            "boom xT4vN7qW2zR5uY8iO1pA3sD6fG9hJ0kL2mN4bV6cX8dE0gH2==",
+            "transport",
+        );
+        let r = ConnectionReport {
+            failure: Some(failure),
+            ..ConnectionReport::new(vec![], "wg-0")
+        };
+        let text = to_text(&r);
+        assert!(
+            text.contains("failure: layer=transport hop=wg-0"),
+            "got: {text}"
+        );
+        assert!(
+            !text.contains("xT4vN7qW"),
+            "secret-like cause leaked: {text}"
+        );
+        assert!(text.contains("cause=<redacted>"), "got: {text}");
+        // Ordinary causes render through the shared masked helper — pinned
+        // here, not against Display (Display renders the raw cause and must
+        // never reach a sink).
+        let plain = FailureReport::new(
+            FailureLayer::Transport,
+            "wg-0",
+            "connection refused",
+            "transport",
+        );
+        assert_eq!(
+            masked_failure_line(&plain),
+            "layer=transport hop=wg-0 kind=transport cause=connection refused"
+        );
+        let r2 = ConnectionReport {
+            failure: Some(plain),
+            ..ConnectionReport::new(vec![], "wg-0")
+        };
+        assert!(to_text(&r2).contains("failure: layer=transport hop=wg-0 kind=transport"));
+    }
+
+    #[test]
+    fn json_failure_masks_secret_like_cause() {
+        const SECRET: &str = "xT4vN7qW2zR5uY8iO1pA3sD6fG9hJ0kL2mN4bV6cX8dE0gH2==";
+        // Diluted exactly like a provider echo: whole-value entropy is below
+        // threshold, so only token-level masking can catch this.
+        let cause = format!("ref {} {SECRET} end", "ok ".repeat(60));
+        let r = ConnectionReport {
+            failure: Some(FailureReport::new(
+                FailureLayer::Transport,
+                "wg-0",
+                cause,
+                "transport",
+            )),
+            ..ConnectionReport::new(vec![], "wg-0")
+        };
+        let doc = to_json(&r);
+        assert!(!doc.contains(SECRET), "secret-like cause leaked: {doc}");
+        let back: ConnectionReport = serde_json::from_str(&doc).unwrap();
+        let back_cause = back.failure.expect("failure round-trips").cause;
+        assert!(!back_cause.contains(SECRET), "leaked after round-trip");
+        assert!(back_cause.contains("<redacted>"), "got: {back_cause}");
+    }
+
+    #[test]
+    fn json_encode_fallback_is_failure_shaped() {
+        let back: ConnectionReport = serde_json::from_str(&encode_fallback()).unwrap();
+        assert!(
+            back.failure.is_some(),
+            "fallback must not look like success"
+        );
+        assert!(!back.exit_hop_id.is_empty());
     }
 }

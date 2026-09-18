@@ -42,8 +42,10 @@ fn redact_json(key: &str, value: &mut serde_json::Value) -> bool {
             if drops_record(key, s) {
                 return true;
             }
-            if let Redaction::Redacted = redact_value(key, s) {
-                *s = "<redacted>".to_string();
+            match redact_value(key, s) {
+                Redaction::Redacted => *s = "<redacted>".to_string(),
+                // Keep payload may carry in-place token masking.
+                Redaction::Keep(masked) => *s = masked,
             }
             false
         }
@@ -154,7 +156,7 @@ mod tests {
     }
 
     #[test]
-    fn typed_secret_key_is_masked_not_dropped() {
+    fn low_entropy_value_under_innocuous_key_is_kept() {
         let r = FailureReport::new(FailureLayer::Config, "wg-0", "bad token abc", "invalid");
         let line = to_ndjson(DiagEvent::Failure(&r));
         assert!(!line.contains("\"dropped\""), "got: {line}");

@@ -5,6 +5,7 @@
 //! Private keys, access tokens, and license values have no field to live
 //! in and MUST never be interpolated into `cause`.
 
+use crate::diag::redact::prefixed_cause;
 use crate::session::report::{EXIT_INVALID, EXIT_SUCCESS};
 use serde::{Deserialize, Serialize};
 
@@ -57,16 +58,27 @@ impl RegistrationReport {
 /// registration, renewal, and the connect-time hook.
 pub fn report_for_error(e: super::register::RegisterError) -> RegistrationReport {
     use super::register::RegisterError;
+    // Enforce the module's no-credentials-in-cause rule at the boundary:
+    // provider bodies (220-char `detail`) flow into `e`, and a misbehaving
+    // provider could echo secrets. The actionable prefix is always kept;
+    // only a secret-like detail is replaced (fail closed) via the shared
+    // [`crate::diag::redact::prefixed_cause`] helper.
     let (action, cause) = match e {
-        RegisterError::Blocked(e) => (ReportAction::Blocked, format!("provider unreachable: {e}")),
-        RegisterError::Refused(e) => (ReportAction::Refused, format!("provider refused: {e}")),
+        RegisterError::Blocked(e) => (
+            ReportAction::Blocked,
+            prefixed_cause("provider unreachable: ", &e),
+        ),
+        RegisterError::Refused(e) => (
+            ReportAction::Refused,
+            prefixed_cause("provider refused: ", &e),
+        ),
         RegisterError::Rejected(e) => (
             ReportAction::Refused,
-            format!("provider refused registration: {e}"),
+            prefixed_cause("provider refused registration: ", &e),
         ),
         RegisterError::Protocol(e) => (
             ReportAction::Blocked,
-            format!("provider answer unusable (client too old?): {e}"),
+            prefixed_cause("provider answer unusable (client too old?): ", &e),
         ),
     };
     RegistrationReport {
@@ -103,5 +115,28 @@ mod tests {
             license_applied: false,
         };
         assert_eq!(b.exit_code(), 2);
+    }
+
+    #[test]
+    fn secret_like_provider_detail_is_masked_prefix_kept() {
+        let r = report_for_error(super::super::register::RegisterError::Refused(
+            "quota gone xT4vN7qW2zR5uY8iO1pA3sD6fG9hJ0kL2mN4bV6cX8dE0gH2==".into(),
+        ));
+        assert!(
+            r.cause.starts_with("provider refused: "),
+            "got: {}",
+            r.cause
+        );
+        assert!(
+            !r.cause.contains("xT4vN7qW"),
+            "secret-like detail leaked: {}",
+            r.cause
+        );
+        assert!(r.cause.contains("<redacted>"), "got: {}", r.cause);
+        // Ordinary low-entropy causes pass through untouched.
+        let r2 = report_for_error(super::super::register::RegisterError::Blocked(
+            "connection refused".into(),
+        ));
+        assert_eq!(r2.cause, "provider unreachable: connection refused");
     }
 }

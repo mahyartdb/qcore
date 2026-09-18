@@ -1,11 +1,13 @@
 [package]
 name = "qcore-core"
-version.workspace = true
+# Independent versioning (constitution): 0.2.0 for the StartedHop shape
+# change (crate-internal keepalive handle). Pre-publish 0.x: minor carries it.
+version = "0.2.0"
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-qcore-transport-api = { path = "../qcore-transport-api" }
+qcore-transport-api = { version = "0.1.0", path = "../qcore-transport-api" }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }

@@ -9,12 +9,12 @@ name = "fake-sidecar"
 path = "src/bin/fake_sidecar.rs"
 
 [dependencies]
-qcore-transport-api = { path = "../../qcore-transport-api" }
+qcore-transport-api = { version = "0.1.0", path = "../../qcore-transport-api" }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
-qcore-core = { path = "../../qcore-core" }
-qcore-transports = { path = ".." }
-transport-mock = { package = "qcore-transport-mock", path = "../transport-mock" }
+qcore-core = { version = "0.2.0", path = "../../qcore-core" }
+qcore-transports = { version = "0.1.0", path = ".." }
+transport-mock = { version = "0.1.0", package = "qcore-transport-mock", path = "../transport-mock" }
 tokio = { workspace = true }

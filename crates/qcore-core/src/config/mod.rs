@@ -12,6 +12,6 @@ pub mod profile_dir;
 pub mod secret;
 
 pub use hop::{
-    allowed_fields, HopConfig, HopSpec, MasqueConfig, MockConfig, PsiphonConfig, RelayConfig,
-    TorConfig, WireguardConfig,
+    allowed_fields, resolve_import_ref, HopConfig, HopSpec, MasqueConfig, MockConfig,
+    PsiphonConfig, RelayConfig, TorConfig, WireguardConfig,
 };

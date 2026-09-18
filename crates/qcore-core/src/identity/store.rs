@@ -13,11 +13,9 @@
 //! wins; the loser fails closed.
 
 use crate::config::profile_dir::ProfileDirs;
-use crate::config::secret::SecretStore;
+use crate::config::secret::{SecretStore, SecretString};
 use crate::identity::model::{MasqueCredential, ProviderIdentity};
 use serde::{Deserialize, Serialize};
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 
 /// Which identity slot: outer (default WARP) or inner (GOOL second hop).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,15 +46,87 @@ pub fn identity_file(dirs: &ProfileDirs, role: IdentityRole) -> std::path::PathB
     dirs.config_dir.join(role.file_name())
 }
 
+/// Display name for a role in user-facing messages ("warp"/"warp-inner").
+/// Distinct from [`IdentityRole::account_prefix`] (secret-store namespace).
+pub(crate) fn role_name(role: IdentityRole) -> &'static str {
+    match role {
+        IdentityRole::Outer => "warp",
+        IdentityRole::Inner => "warp-inner",
+    }
+}
 fn secret_store(dirs: &ProfileDirs) -> SecretStore {
     // Per-dir service namespace: temp test dirs, parallel profiles, and the
-    // real profile never collide in a shared OS keyring.
+    // real profile never collide in a shared OS keyring. Stable FNV-1a —
+    // NOT DefaultHasher, whose output is explicitly unstable across
+    // releases and would silently orphan the namespace (forced
+    // re-registration) on toolchain upgrades. FNV-1a is only an opaque
+    // bucket label (the keyring ACLs are the security boundary), so a
+    // non-cryptographic hash is sufficient; determinism is the requirement.
+    let h = namespace_hash(&namespace_input(dirs));
+    SecretStore::new(format!("qcore-identity-{h:016x}"), dirs.config_dir.clone())
+}
+
+/// Canonical bytes hashed for the keyring service namespace: separators
+/// normalized to `/`, trailing separators trimmed (drive roots kept), and —
+/// on Windows only — ASCII-lowercased, because the filesystem is
+/// case-insensitive there and `Profile` vs `PROFILE` are one directory.
+/// Byte-level over the raw OS encoding, never `to_string_lossy`: distinct
+/// paths must never collapse onto one namespace via U+FFFD substitution.
+fn namespace_input(dirs: &ProfileDirs) -> Vec<u8> {
+    let raw = dirs.config_dir.as_os_str().as_encoded_bytes();
+    let mut out = Vec::with_capacity(raw.len());
+    for &b in raw {
+        out.push(if b == b'\\' { b'/' } else { b });
+    }
+    while out.len() > 1 && out.ends_with(b"/") && !out.ends_with(b":/") {
+        out.pop();
+    }
+    #[cfg(windows)]
+    out.make_ascii_lowercase();
+    out
+}
+
+/// Stable 64-bit FNV-1a (see [`secret_store`]).
+fn namespace_hash(s: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in s {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// Pre-FNV service namespace (master): `DefaultHasher` over the lossy path.
+/// Migration-only — never use for new namespaces. Reproduces entries
+/// written by binaries whose toolchain shares the current SipHash-1-3 (all
+/// toolchains since 1.13 in practice). On a miss the read contract still
+/// holds (missing → re-register), so an unrecoverable legacy name degrades
+/// to today's behavior, never to an error.
+fn legacy_service_name(dirs: &ProfileDirs) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
     let mut h = DefaultHasher::new();
     dirs.config_dir.to_string_lossy().hash(&mut h);
-    SecretStore::new(
-        format!("qcore-identity-{:016x}", h.finish()),
-        dirs.config_dir.clone(),
-    )
+    format!("qcore-identity-{:016x}", h.finish())
+}
+
+fn legacy_secret_store(dirs: &ProfileDirs) -> SecretStore {
+    SecretStore::new(legacy_service_name(dirs), dirs.config_dir.clone())
+}
+
+/// Resolve one secret account: current namespace first, legacy namespace on
+/// miss only — never on empty. An empty current-namespace value is
+/// corruption, which the read contract maps to missing, not to a stale
+/// rescue. New saves always go to the current namespace.
+fn get_account(
+    new: &SecretStore,
+    legacy: &SecretStore,
+    account: &str,
+) -> Result<SecretString, String> {
+    match new.get(account) {
+        Err(_) => legacy.get(account),
+        ok => ok,
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -91,15 +161,16 @@ pub fn load(dirs: &ProfileDirs, role: IdentityRole) -> Option<ProviderIdentity> 
         return None;
     }
     let store = secret_store(dirs);
+    let legacy = legacy_secret_store(dirs);
     let pfx = role.account_prefix();
-    let access_token = store.get(&format!("{pfx}/access_token")).ok()?;
-    let private_key_b64 = store.get(&format!("{pfx}/private_key")).ok()?;
+    let access_token = get_account(&store, &legacy, &format!("{pfx}/access_token")).ok()?;
+    let private_key_b64 = get_account(&store, &legacy, &format!("{pfx}/private_key")).ok()?;
     if access_token.is_empty() || private_key_b64.is_empty() {
         return None;
     }
     let masque = match rec.masque {
         Some(m) => {
-            let key_pem = store.get(&format!("{pfx}/masque_key")).ok()?;
+            let key_pem = get_account(&store, &legacy, &format!("{pfx}/masque_key")).ok()?;
             if key_pem.is_empty() || m.cert_pem.is_empty() {
                 return None;
             }
@@ -165,7 +236,17 @@ pub fn save(dirs: &ProfileDirs, role: IdentityRole, id: &ProviderIdentity) -> Re
         masque,
     };
     let text = toml::to_string(&rec).map_err(|e| format!("identity encode failed: {e}"))?;
-    atomic_write_0600(&identity_file(dirs, role), text.as_bytes())
+    atomic_write_0600(&identity_file(dirs, role), text.as_bytes())?;
+    // Migration hygiene: the identity now lives under the current namespace.
+    // Drop any legacy-namespace keyring copies while the registration lock
+    // is still held (no concurrent load can observe a half-migrated state).
+    // Keyring only — the file fallback is shared, not a copy. Failures are
+    // ignored: leftovers are inert, loads prefer the current namespace.
+    let legacy = legacy_secret_store(dirs);
+    legacy.delete_keyring(&format!("{pfx}/access_token"));
+    legacy.delete_keyring(&format!("{pfx}/private_key"));
+    legacy.delete_keyring(&format!("{pfx}/masque_key"));
+    Ok(())
 }
 
 /// Best-effort removal of a role's record (used only to discard a replaced
@@ -303,5 +384,82 @@ mod tests {
             "no half-written store"
         );
         let _ = std::fs::remove_dir_all(&d.config_dir);
+    }
+
+    #[test]
+    fn namespace_hash_is_stable_known_answer() {
+        // Guards the keyring namespace against hasher swaps: DefaultHasher
+        // is release-unstable and would silently orphan stored identities.
+        assert_eq!(namespace_hash(b""), 0xcbf29ce484222325);
+        let a = namespace_hash(b"/tmp/qcore-test-profile");
+        assert_eq!(a, namespace_hash(b"/tmp/qcore-test-profile"));
+        assert_ne!(a, namespace_hash(b"/tmp/qcore-test-profile-2"));
+    }
+
+    #[test]
+    fn namespace_input_is_canonical() {
+        let base =
+            std::env::temp_dir().join(format!("qcore-idns-{}-{}", std::process::id(), now_ms()));
+        let hashed = |d: &ProfileDirs| namespace_hash(&namespace_input(d));
+        let plain = ProfileDirs::resolve(Some(base.clone()), None);
+        // Trailing separator: same directory, must share one namespace.
+        let slashed = ProfileDirs::resolve(
+            Some(std::path::PathBuf::from(format!("{}\\", base.display()))),
+            None,
+        );
+        assert_eq!(hashed(&plain), hashed(&slashed));
+        // Separator style: same directory, one namespace.
+        let fwd = ProfileDirs::resolve(
+            Some(std::path::PathBuf::from(
+                base.to_string_lossy().replace('\\', "/"),
+            )),
+            None,
+        );
+        assert_eq!(hashed(&plain), hashed(&fwd));
+        #[cfg(windows)]
+        {
+            // Windows filesystems are case-insensitive: `Profile` and
+            // `PROFILE` are one directory, not two namespaces.
+            let upper = ProfileDirs::resolve(
+                Some(std::path::PathBuf::from(
+                    base.to_string_lossy().to_ascii_uppercase(),
+                )),
+                None,
+            );
+            assert_eq!(hashed(&plain), hashed(&upper));
+        }
+        // Distinct directories still namespace apart.
+        let other = ProfileDirs::resolve(Some(base.join("other")), None);
+        assert_ne!(hashed(&plain), hashed(&other));
+    }
+
+    #[test]
+    fn legacy_service_name_is_deterministic() {
+        let d = dirs("legacy-det");
+        assert_eq!(legacy_service_name(&d), legacy_service_name(&d));
+    }
+
+    #[test]
+    fn account_falls_back_to_legacy_namespace() {
+        let tag = format!("fb-{}-{}", std::process::id(), now_ms());
+        let new_dir = std::env::temp_dir().join(format!("qcore-idfb-new-{tag}"));
+        let legacy_dir = std::env::temp_dir().join(format!("qcore-idfb-leg-{tag}"));
+        let _ = std::fs::remove_dir_all(&new_dir);
+        let _ = std::fs::remove_dir_all(&legacy_dir);
+        let new = SecretStore::new(format!("qcore-test-new-{tag}"), new_dir.clone());
+        let legacy = SecretStore::new(format!("qcore-test-legacy-{tag}"), legacy_dir.clone());
+        legacy
+            .put("warp-outer/access_token", &SecretString::new("legacy-tok"))
+            .expect("legacy put");
+        // Current namespace misses; the legacy namespace answers.
+        let v = get_account(&new, &legacy, "warp-outer/access_token").expect("resolves");
+        assert_eq!(v.expose(), b"legacy-tok");
+        // Current-namespace hit wins over legacy.
+        new.put("warp-outer/access_token", &SecretString::new("new-tok"))
+            .expect("new put");
+        let v2 = get_account(&new, &legacy, "warp-outer/access_token").expect("resolves");
+        assert_eq!(v2.expose(), b"new-tok");
+        let _ = std::fs::remove_dir_all(&new_dir);
+        let _ = std::fs::remove_dir_all(&legacy_dir);
     }
 }

@@ -81,17 +81,24 @@ pub fn run(engine: &Engine, dirs: &qcore_core::config::profile_dir::ProfileDirs)
         Err(e) => println!("  (unavailable: {e})"),
     }
     println!("presets:");
-    match qcore_core::chain::preset::resolve_presets(dirs) {
+    // Single resolution shared with shortcuts below: resolving twice would
+    // read the file twice and handle override errors inconsistently.
+    let presets = match qcore_core::chain::preset::resolve_presets(dirs) {
         Ok(presets) => {
             for p in &presets {
                 println!("  {}", p.name);
             }
+            presets
         }
-        Err(e) => println!("  (unavailable: {e})"),
-    }
+        Err(e) => {
+            // Name the fallback explicitly: the names below are builtins,
+            // not the effective configuration (every consumer of
+            // resolve_presets fails closed on this error).
+            println!("  (unavailable: {e}; showing builtin fallback)");
+            qcore_core::chain::preset::builtin_presets()
+        }
+    };
     println!("shortcuts:");
-    let presets = qcore_core::chain::preset::resolve_presets(dirs)
-        .unwrap_or_else(|_| qcore_core::chain::preset::builtin_presets());
     crate::cmd::shortcuts::print_shortcuts(engine, &presets);
     exit::SUCCESS
 }

@@ -35,7 +35,7 @@ pub fn validate(
 
     // Depth = hops after preset expansion.
     if hops.len() as u32 > max_depth {
-        let last = hops.last().unwrap();
+        let last = hops.last().expect("nonempty checked above");
         return Err(ChainError::new(
             Some(hops.len() - 1),
             Some(last.id.clone()),
@@ -75,13 +75,21 @@ pub fn validate(
     // UDP-over-TCP framing upward, so it never triggers this rule.
     for pair in hops.windows(2) {
         let (carrier, next) = (&pair[0], &pair[1]);
-        let carrier_desc = registry.get(carrier.config.kind()).unwrap();
-        let next_desc = registry.get(next.config.kind()).unwrap();
+        // Safe: the unknown-kind loop above rejected unregistered kinds.
+        let carrier_desc = registry
+            .get(carrier.config.kind())
+            .expect("kind checked above");
+        let next_desc = registry
+            .get(next.config.kind())
+            .expect("kind checked above");
         let carrier_provides_udp =
             carrier_desc.capabilities.dials_udp || carrier.config.kind() == "relay";
         let next_needs_udp = next_desc.capabilities.dials_udp && next.config.kind() != "relay";
         if next_needs_udp && !carrier_provides_udp {
-            let idx = hops.iter().position(|h| h.id == next.id).unwrap();
+            let idx = hops
+                .iter()
+                .position(|h| h.id == next.id)
+                .expect("`next` comes from `hops`");
             return Err(ChainError::new(
                 Some(idx),
                 Some(next.id.clone()),

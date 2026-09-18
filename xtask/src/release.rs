@@ -161,8 +161,12 @@ pub fn package(args: Vec<String>) -> super::anyhow::Result<()> {
     ] {
         let src = Path::new(f);
         if src.exists() {
-            std::fs::copy(src, stage.join(src.file_name().unwrap()))
-                .map_err(|e| fail(format!("stage {f}: {e}")))?;
+            // Static literal paths below always have a file name.
+            std::fs::copy(
+                src,
+                stage.join(src.file_name().expect("staged path has a file name")),
+            )
+            .map_err(|e| fail(format!("stage {f}: {e}")))?;
         }
     }
     println!("package: staged {name} (+ qcore.h, abi-version.txt)");

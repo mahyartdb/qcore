@@ -20,22 +20,16 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 pub const READY_PREFIX: &str = "QCORE_SIDECAR_READY socks5=";
 
 /// How a secret reaches the sidecar. Stdin is implemented (write-once at
-/// spawn, handle kept open); never argv (FR-001b). Debug never leaks bytes.
+/// spawn, handle kept open); never argv (FR-001b). Debug never leaks bytes
+/// (not even the length: secret length is a side channel).
+#[derive(Clone)]
 pub struct SidecarSecret {
     pub payload: Vec<u8>,
 }
 
 impl std::fmt::Debug for SidecarSecret {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "<redacted {} bytes>", self.payload.len())
-    }
-}
-
-impl Clone for SidecarSecret {
-    fn clone(&self) -> Self {
-        SidecarSecret {
-            payload: self.payload.clone(),
-        }
+        write!(f, "<redacted>")
     }
 }
 
@@ -71,6 +65,10 @@ pub struct RunningSidecar {
     restarts_used: u32,
     max_restarts: u32,
     exe_label: String,
+    /// Owned stdin handle: keeps the pipe open (some clients block on EOF)
+    /// and closes it on teardown. Never forgotten (a forgotten handle would
+    /// leak the fd and break the EOF-on-teardown contract).
+    _stdin: Option<tokio::process::ChildStdin>,
 }
 
 /// Bounded supervisor.
@@ -114,9 +112,10 @@ impl SidecarSupervisor {
             .spawn()
             .map_err(|e| format!("sidecar `{label}`: spawn: {e}"))?;
 
-        // Deliver the secret on stdin first (write-once; handle kept by child
-        // table until drop).
-        if let Some(secret) = &self.config.secret {
+        // Deliver the secret on stdin first (write-once). The handle is
+        // kept in `RunningSidecar`: stdin stays open (some clients block on
+        // EOF) and closes on teardown.
+        let kept_stdin = if let Some(secret) = &self.config.secret {
             if let Some(mut stdin) = child.stdin.take() {
                 if let Err(e) = stdin.write_all(&secret.payload).await {
                     let _ = child.kill().await;
@@ -126,14 +125,16 @@ impl SidecarSupervisor {
                     let _ = child.kill().await;
                     return Err(format!("sidecar `{label}`: stdin secret delivery: {e}"));
                 }
-                // Keep stdin open (some clients block on EOF); drop closes it.
-                std::mem::forget(stdin);
+                Some(stdin)
+            } else {
+                None
             }
         } else {
             // No secret: close stdin so sidecars waiting on a secret line see
             // EOF instead of blocking serve forever.
             drop(child.stdin.take());
-        }
+            None
+        };
 
         let stdout = child
             .stdout
@@ -174,6 +175,7 @@ impl SidecarSupervisor {
                                             restarts_used,
                                             max_restarts: self.config.max_restarts,
                                             exe_label: label,
+                                            _stdin: kept_stdin,
                                         });
                                     }
                                     Err(_) => continue, // ignore non-conforming lines
@@ -206,6 +208,9 @@ impl SidecarSupervisor {
         running.child = revived.child.take();
         running.socks_addr = revived.socks_addr;
         running.restarts_used = revived.restarts_used;
+        // Move the stdin handle too: dropping `revived` with it still inside
+        // would EOF the fresh sidecar's stdin immediately.
+        running._stdin = revived._stdin.take();
         Ok(())
     }
 }

@@ -17,8 +17,8 @@ pub mod test_support;
 
 use boringtun::noise::{Tunn, TunnResult};
 use qcore_transport_api::{
-    ByteStream, Capabilities, Dialer, HopConfig, HopError, HopErrorKind, HopEvent, HopHealth,
-    ObfuscationFamily, RunningHop, TransportDescriptor, UdpFlow,
+    unspecified_bind, ByteStream, Capabilities, Dialer, HopConfig, HopError, HopErrorKind,
+    HopEvent, HopHealth, ObfuscationFamily, RunningHop, TransportDescriptor, UdpFlow,
 };
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -204,11 +204,7 @@ impl WireguardHop {
             })?;
             Arc::new(FlowSock { flow })
         } else {
-            let bind: SocketAddr = if params.peer_endpoint.is_ipv4() {
-                "0.0.0.0:0".parse().unwrap()
-            } else {
-                "[::]:0".parse().unwrap()
-            };
+            let bind: SocketAddr = unspecified_bind(&params.peer_endpoint);
             Arc::new(OsSock {
                 socket: Arc::new(
                     tokio::net::UdpSocket::bind(bind)

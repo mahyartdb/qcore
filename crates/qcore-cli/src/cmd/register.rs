@@ -40,10 +40,15 @@ fn resolve_license(args: &RegisterArgs) -> Result<Option<SecretString>, i32> {
 pub fn provider_opts(provider: Option<&str>) -> ProviderOptions {
     ProviderOptions {
         provider_base: provider.unwrap_or(DEFAULT_PROVIDER_BASE).to_string(),
-        timeout_secs: 20,
+        timeout_secs: REGISTER_TIMEOUT_SECS,
         family: "dual".to_string(),
     }
 }
+
+/// Registration exchange timeout. `family` stays the contractual
+/// `ipv4`|`ipv6`|`dual` string (https.rs): promoting it to an enum would
+/// cross the engine boundary and break the Rust API (follow-up class T007c).
+const REGISTER_TIMEOUT_SECS: u64 = 20;
 
 pub fn emit(report: &RegistrationReport, json: bool) -> i32 {
     let code = report.exit_code();

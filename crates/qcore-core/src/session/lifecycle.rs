@@ -38,7 +38,9 @@ pub struct StartedHop {
     /// `AbortHandle` (not `JoinHandle`) so `StartedHop` stays `Clone`.
     /// Teardown (`unwind`, `SessionHandle::stop_all`) aborts before stopping
     /// the hop: dropping the handle would detach the task and leak it.
-    pub keepalive: Option<tokio::task::AbortHandle>,
+    /// Crate-internal (`pub(crate)`): teardown bookkeeping, not embedder
+    /// API — future internal handles stay minor for the same reason.
+    pub(crate) keepalive: Option<tokio::task::AbortHandle>,
 }
 
 /// Per-hop material merged into factory configs at bring-up (in memory

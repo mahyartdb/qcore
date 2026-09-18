@@ -10,6 +10,8 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@v2
         with:
@@ -20,7 +22,13 @@ jobs:
       - run: cargo nextest run -p tests-conformance
       - run: cargo xtask abi-diff
       - run: cargo deny --config denylist.toml check
-      - run: cargo semver-checks
+      # Unpublished crate: no crates.io baseline exists, so compare the PR
+      # delta against its base instead (merge-base semantics for push events).
+      - name: semver-checks (git baseline)
+        run: |
+          BASE="${{ github.event.pull_request.base.sha }}"
+          [ -z "$BASE" ] && BASE="$(git merge-base HEAD HEAD~1 2>/dev/null || echo HEAD~1)"
+          cargo semver-checks --baseline-rev "$BASE"
       # T087 static secret-scan gate: git-aware scan plus a filesystem scan
       # over the working tree (build artifacts, reports, state files, crash
       # output). Either scanner failing blocks the gate (SC-006).

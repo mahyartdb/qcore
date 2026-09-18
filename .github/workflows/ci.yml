@@ -24,6 +24,12 @@ jobs:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Prefix orphans the pre-prune cache, whose restores crashed the
+          # conformance link with ld SIGBUS (corrupt member in the restored
+          # set). A red run never re-saves, so a poisoned entry sticks until
+          # the prefix is bumped — bump again if a restore ever poisons a run.
+          key: v2-pruned
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest@0.9.145,cargo-deny@0.20.2,cargo-semver-checks@0.50.0

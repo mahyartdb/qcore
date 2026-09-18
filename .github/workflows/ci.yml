@@ -22,13 +22,23 @@ jobs:
       - run: cargo nextest run -p tests-conformance
       - run: cargo xtask abi-diff
       - run: cargo deny --config denylist.toml check
+      # Runner disk is ~14GB: clippy+nextest+conformance target/ plus the
+      # dual baseline/current rustdoc builds below exceed it (ENOSPC kill).
+      # Everything before this point is done; wipe build artifacts and the
+      # registry cache so semver (then smoke) rebuild only what they need.
+      - name: free disk before semver baseline builds
+        run: |
+          cargo clean
+          rm -rf ~/.cargo/registry/cache
       # Unpublished crate: no crates.io baseline exists, so compare the PR
       # delta against its base instead (merge-base semantics for push events).
+      # Test suites are not versioned API surfaces (FR-003f), so they are
+      # excluded from the check.
       - name: semver-checks (git baseline)
         run: |
           BASE="${{ github.event.pull_request.base.sha }}"
           [ -z "$BASE" ] && BASE="$(git merge-base HEAD HEAD~1 2>/dev/null || echo HEAD~1)"
-          cargo semver-checks --baseline-rev "$BASE"
+          cargo semver-checks --baseline-rev "$BASE" --exclude tests-conformance --exclude tests-chains
       # T087 static secret-scan gate: git-aware scan plus a filesystem scan
       # over the working tree (build artifacts, reports, state files, crash
       # output). Either scanner failing blocks the gate (SC-006).

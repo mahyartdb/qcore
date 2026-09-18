@@ -68,5 +68,10 @@ jobs:
         uses: trufflesecurity/trufflehog@v3.88.4
         with:
           path: ./
-          extra_args: --only-verified --fail
+          # target/ excluded: regenerable compiler output (multi-GB .o/rustdoc
+          # trees, incl. semver scratch copies) crashes the scanner with no
+          # finding attached. Sources, configs, state files, and .git history
+          # stay scanned; emitted-artifact secrecy is asserted by the
+          # secret_hygiene conformance suite.
+          extra_args: --only-verified --fail -x target/
       - run: cargo xtask smoke --target native

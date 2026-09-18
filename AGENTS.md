@@ -14,13 +14,17 @@ Spec tasks T001-T094 (001) and T001-T037 (002) are all complete; this file route
 | Task | Command |
 |---|---|
 | Build | `cargo xtask build --release` |
-| Full local gate (what CI runs) | `cargo xtask ci` |
+| Local core gate (fmt, clippy, nextest, conformance, abi-diff) | `cargo xtask ci` |
+| Supply chain | `cargo deny --config denylist.toml check` (policy lives in `denylist.toml`, not the deny default) |
+| API semver | `cargo semver-checks --baseline-rev <base-sha>` (git baseline; crate unpublished, test suites excluded) |
+| Secret scans | gitleaks CLI v8.30.1, trufflehog `--only-verified` (false positives: `.gitleaksignore` fingerprints) |
+| Full CI gate | `.github/workflows/ci.yml` = core gate + supply chain + semver + scans + native smoke |
 | Unit + contract tests | `cargo nextest run --all-features` |
 | Conformance matrix | `cargo nextest run -p tests-conformance` |
 | Lint | `cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings` |
 | C ABI diff | `cargo xtask abi-diff` |
 | Per-target smoke | `cargo xtask smoke --target <triple>` |
-| Release | `cargo xtask release` (tag-driven) |
+| Release | `cargo xtask release` (tag-driven; KNOWN GAPS, not yet proven end-to-end: release matrix builds 3/9 `targets.toml` entries, publish job has no checkout/toolchain) |
 
 `cargo xtask` resolves via the `[alias]` in `.cargo/config.toml`.
 

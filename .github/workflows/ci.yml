@@ -2,15 +2,13 @@ name: ci
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [master]
 
 jobs:
   # Tier A (every PR): native host unit/contract, lint, secret scan, native stub-peer smoke.
   gate:
     runs-on: ubuntu-22.04
-    # Least privilege; pull-requests:read lets gitleaks-action list PR
-    # commits for its range scan (a missing scope fails the step with no
-    # finding attached).
+    # Least privilege for the gate job's token.
     permissions:
       contents: read
       pull-requests: read

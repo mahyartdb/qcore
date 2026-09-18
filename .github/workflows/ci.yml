@@ -4,28 +4,41 @@ on:
   push:
     branches: [master]
 
+# Cancel superseded runs on re-push; only the latest commit per ref matters.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   # Tier A (every PR): native host unit/contract, lint, secret scan, native stub-peer smoke.
   gate:
     runs-on: ubuntu-22.04
+    timeout-minutes: 90
     # Least privilege for the gate job's token.
     permissions:
       contents: read
       pull-requests: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest@0.9.145,cargo-deny@0.20.2,cargo-semver-checks@0.50.0
-      - run: cargo fmt --check
-      - run: cargo clippy --all-targets --all-features -- -D warnings
-      - run: cargo nextest run --all-features
-      - run: cargo nextest run -p tests-conformance
-      - run: cargo xtask abi-diff
-      - run: cargo deny --config denylist.toml check
+      - name: fmt
+        run: cargo fmt --check
+      - name: clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: unit + contract tests
+        run: cargo nextest run --all-features
+      - name: conformance matrix
+        run: cargo nextest run -p tests-conformance
+      - name: C ABI diff
+        run: cargo xtask abi-diff
+      - name: supply chain (cargo-deny)
+        run: cargo deny --config denylist.toml check
       # Runner disk is ~14GB: clippy+nextest+conformance target/ plus the
       # dual baseline/current rustdoc builds below exceed it (ENOSPC kill).
       # Everything before this point is done; wipe build artifacts and the
@@ -43,15 +56,12 @@ jobs:
           BASE="${{ github.event.pull_request.base.sha }}"
           [ -z "$BASE" ] && BASE="$(git merge-base HEAD HEAD~1 2>/dev/null || echo HEAD~1)"
           cargo semver-checks --baseline-rev "$BASE" --exclude tests-conformance --exclude tests-chains
-      # T087 static secret-scan gate: two git-history scans (gitleaks rule
-      # match incl. fixtures via .gitleaksignore, trufflehog verified-only)
-      # plus the secret_hygiene conformance suite (emitted artifacts). Any
-      # of them failing blocks the gate (SC-006).
-      # Pinned gitleaks CLI instead of gitleaks-action: the action wraps the
-      # scan in octokit calls (PR commit listing, review comments, summary,
-      # artifact upload) whose failures surface as a bare step failure with
-      # no finding attached. The CLI step keeps full output in the gate log
-      # and honors .gitleaksignore for the known-fake test fixtures.
+      # T087 secret-scan gate: gitleaks (rule match + .gitleaksignore
+      # fingerprints) and trufflehog --only-verified over git history, plus
+      # the secret_hygiene conformance suite. Any of them failing blocks the
+      # gate (SC-006). Both scanners run as pinned CLIs, not wrapper actions:
+      # the actions fail opaquely (exit 1, no finding attached) while direct
+      # repros are clean, so the scan stays transparent in the gate log.
       - name: gitleaks (pinned CLI)
         run: |
           curl -sSL -o /tmp/gitleaks.tar.gz https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
@@ -63,11 +73,6 @@ jobs:
           else
             gitleaks detect --source . -v --exit-code=2
           fi
-      # Pinned trufflehog CLI over the PR's git history (same content the
-      # docker action scanned: `git --since-commit BASE --branch HEAD`).
-      # The action wrapper fails opaquely (exit 1, no finding, no artifact)
-      # while every direct repro is clean, so run the scan transparently in
-      # the gate log. Verified-only: fakes can never trip it.
       - name: secret scan (trufflehog git history)
         run: |
           curl -sSL -o /tmp/trufflehog.tar.gz https://github.com/trufflesecurity/trufflehog/releases/download/v3.88.4/trufflehog_3.88.4_linux_amd64.tar.gz
@@ -79,4 +84,5 @@ jobs:
           else
             trufflehog git "file://$(pwd)" --fail --no-update --only-verified
           fi
-      - run: cargo xtask smoke --target native
+      - name: native smoke
+        run: cargo xtask smoke --target native

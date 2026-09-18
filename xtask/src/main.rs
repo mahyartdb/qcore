@@ -20,7 +20,8 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-/// The full local gate: what CI runs (AGENTS.md).
+/// Local core gate: the fast subset of the CI gate (full gate lives in
+/// `.github/workflows/ci.yml`; see AGENTS.md).
 fn ci() -> anyhow::Result<()> {
     // Implemented as shell delegation so CI and local runs share one definition.
     shell("cargo fmt --check")?;

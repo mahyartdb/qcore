@@ -42,7 +42,7 @@ Spec tasks T001-T094 (001) and T001-T037 (002) are all complete; this file route
 | `specs/001-multi-protocol-vpn/checklists/` | Reviewer-owned quality gates — `requirements.md` passed; the rest are not work markers |
 | `specs/001-multi-protocol-vpn/quickstart.md` | Scenarios 1–8 |
 | `specs/002-warp-registration-scan/` | WARP/GOOL/MASQUE registration + renewal + seeded scan (spec, plan, tasks T001–T037) |
-| `BASE.md` | Aether fork record |
+| `docs/BASE.md` | Aether fork record |
 | `xtask/src/targets.toml` | The 9-target release contract (amendment to change) |
 
 ## Code map
@@ -81,6 +81,5 @@ xtask/src/                             build, smoke, package, release, abi_diff
 
 ## Skills
 
-use related rust skills when writing or editing rust code.
-Per-area rule-to-check mapping (which skills govern each area + fastest
-verification command): `docs/rust-practices.md`.
+Rust: before editing Rust, load your area's row in `docs/rust-practices.md`
+(governing skills + fastest verification command).

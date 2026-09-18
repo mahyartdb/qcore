@@ -3,19 +3,24 @@ on:
   schedule: [{ cron: "0 3 * * *" }]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   # Tier B (nightly + main): broad cross-build matrix + stub-peer smoke.
   # Real-network egress (WARP/MASQUE/Tor/Psiphon) is supplementary, non-blocking.
   broad:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
       - run: cargo xtask build --target x86_64-unknown-linux-gnu
       - run: cargo xtask smoke --target x86_64-unknown-linux-gnu
   live-egress:
     runs-on: ubuntu-22.04
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
       - run: echo "live-network egress checks (non-blocking)"
       - run: cargo test -p tests-conformance -- --ignored

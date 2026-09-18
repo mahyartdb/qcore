@@ -1,7 +1,7 @@
 # Gitleaks false-positive fingerprints (SC-006 secret-scan gate).
 # Each entry is a known-fake secret-like literal used by the
 # redaction/secret-hygiene unit tests (WireGuard-style fixture key);
-# no real credentials. gitleaks-action documents this file (not config
+# no real credentials. gitleaks documents this file (not config
 # allowlists) as its false-positive mechanism, and it applies to both
 # CI scans and local `gitleaks detect` runs.
 # Format: {commit}:{path}:{rule}:{line} (see `gitleaks detect` report).

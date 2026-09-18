@@ -1,0 +1,15 @@
+# Weekly maintenance PRs (capped). cargo bumps must keep
+# `cargo deny --config denylist.toml check` green: deny pins exact
+# duplicate-version lines, so each bump PR re-adjudicates or drops skips.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5

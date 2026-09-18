@@ -3,9 +3,14 @@ on:
   push:
     tags: ["v*"]
 
+permissions:
+  contents: read
+
 jobs:
-  # Tier C (tag): every listed target built and smoked; publish blocked unless green.
-  # Conventional commits -> release-plz / git-cliff changelog.
+  # Tier C (tag): every contracted target built and smoked; publish blocked
+  # unless green. KNOWN GAP, not yet proven end-to-end: the matrix covers 3/9
+  # xtask/src/targets.toml entries (Windows only). Do not tag `v*` until the
+  # matrix is complete and a dry-run passes (AGENTS.md Release row).
   matrix:
     strategy:
       matrix:
@@ -15,13 +20,21 @@ jobs:
           - aarch64-pc-windows-msvc
     runs-on: ${{ contains(matrix.target, 'aarch64') && 'windows-11-arm' || 'windows-2022' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
       - run: cargo xtask build --target ${{ matrix.target }}
       - run: cargo xtask smoke --target ${{ matrix.target }}
   publish:
     needs: [matrix]
     runs-on: ubuntu-22.04
+    permissions:
+      contents: write # GitHub release artifacts
+      id-token: write # cosign keyless signing
     steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
       - run: cargo xtask package
       - uses: sigstore/cosign-installer@v3
       - run: cargo xtask release

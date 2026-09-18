@@ -48,9 +48,22 @@ jobs:
       # T087 static secret-scan gate: git-aware scan plus a filesystem scan
       # over the working tree (build artifacts, reports, state files, crash
       # output). Either scanner failing blocks the gate (SC-006).
-      - uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Pinned gitleaks CLI instead of gitleaks-action: the action wraps the
+      # scan in octokit calls (PR commit listing, review comments, summary,
+      # artifact upload) whose failures surface as a bare step failure with
+      # no finding attached. The CLI step keeps full output in the gate log
+      # and honors .gitleaksignore for the known-fake test fixtures.
+      - name: gitleaks (pinned CLI)
+        run: |
+          curl -sSL -o /tmp/gitleaks.tar.gz https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
+          tar xzf /tmp/gitleaks.tar.gz -C /tmp && sudo install -m755 /tmp/gitleaks /usr/local/bin/
+          BASE="${{ github.event.pull_request.base.sha }}"
+          HEAD="${{ github.event.pull_request.head.sha }}"
+          if [ -n "$BASE" ] && [ -n "$HEAD" ]; then
+            gitleaks detect --source . -v --exit-code=2 --log-opts="--no-merges --first-parent $BASE..$HEAD"
+          else
+            gitleaks detect --source . -v --exit-code=2
+          fi
       - name: secret scan (trufflehog filesystem)
         uses: trufflesecurity/trufflehog@v3.88.4
         with:

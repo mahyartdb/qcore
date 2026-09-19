@@ -51,7 +51,11 @@ impl PmtuProber {
                 sizes.push(next);
             }
         }
-        if *sizes.last().unwrap() != MIN_MTU {
+        if *sizes
+            .last()
+            .expect("sizes starts with one entry and only grows")
+            != MIN_MTU
+        {
             sizes.push(MIN_MTU);
         }
         PmtuProber {

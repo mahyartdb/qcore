@@ -45,9 +45,10 @@ pub fn validate(
     }
 
     // Duplicate ids (HopSpec id is "unique in chain; used in reports/errors").
+    // Borrowed set: no per-hop clone on the happy path (errors clone once).
     let mut ids = HashSet::new();
     for (i, hop) in hops.iter().enumerate() {
-        if !ids.insert(hop.id.clone()) {
+        if !ids.insert(hop.id.as_str()) {
             return Err(ChainError::new(
                 Some(i),
                 Some(hop.id.clone()),
@@ -73,7 +74,7 @@ pub fn validate(
     // carrier providing UDP egress (descriptor dials_udp, or the relay
     // adapter between). The relay itself accepts a TCP carrier and provides
     // UDP-over-TCP framing upward, so it never triggers this rule.
-    for pair in hops.windows(2) {
+    for (idx, pair) in hops.windows(2).enumerate() {
         let (carrier, next) = (&pair[0], &pair[1]);
         // Safe: the unknown-kind loop above rejected unregistered kinds.
         let carrier_desc = registry
@@ -86,10 +87,9 @@ pub fn validate(
             carrier_desc.capabilities.dials_udp || carrier.config.kind() == "relay";
         let next_needs_udp = next_desc.capabilities.dials_udp && next.config.kind() != "relay";
         if next_needs_udp && !carrier_provides_udp {
-            let idx = hops
-                .iter()
-                .position(|h| h.id == next.id)
-                .expect("`next` comes from `hops`");
+            // `next` is `pair[1]` of window `idx`, so its hop index is
+            // `idx + 1` by construction — no `position` rescan, no expect.
+            let idx = idx + 1;
             return Err(ChainError::new(
                 Some(idx),
                 Some(next.id.clone()),

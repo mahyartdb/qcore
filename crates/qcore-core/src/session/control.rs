@@ -37,7 +37,10 @@ pub fn control_file(dirs: &ProfileDirs) -> std::path::PathBuf {
 
 pub fn write_control_file(dirs: &ProfileDirs, info: &ControlInfo) -> std::io::Result<()> {
     dirs.ensure_dirs()?;
-    std::fs::write(control_file(dirs), serde_json::to_string(info).unwrap())
+    std::fs::write(
+        control_file(dirs),
+        serde_json::to_string(info).expect("ControlInfo is a plain serializable struct"),
+    )
 }
 
 pub fn read_control_file(dirs: &ProfileDirs) -> Option<ControlInfo> {

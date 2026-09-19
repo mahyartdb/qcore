@@ -24,6 +24,42 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::stream::FrameSender;
+
+/// Per-hop ordered egress cap (#12 queue decision: bounded-block with
+/// backpressure). The egress FIFO is replay-order-sensitive, so a full queue
+/// parks senders (async `send` awaits space; `poll_write` parks its waker)
+/// instead of dropping. 1024 packets ≈ 1.4 MB at full MTU — bounded memory
+/// per hop, deep enough to absorb pump scheduling jitter. #10 measured the
+/// status quo this replaces: 100k × 1400 B queued with zero backpressure
+/// (~140 MB growth).
+pub const EGRESS_QUEUE_CAP: usize = 1024;
+
+/// One queued uplink packet: destination + encrypted bytes.
+pub type EgressItem = (SocketAddr, Vec<u8>);
+
+thread_local! {
+    /// Reused 64K boringtun scratch (#15 perf batch). `vec![0u8; 65535]`
+    /// zeroing measured ~1.5 µs/alloc here (11.6 µs in #10) — the dominant
+    /// per-packet cost next to ~100–300 ns framing. One buffer per worker
+    /// thread; `seal` copies the packet out before returning, so reuse is
+    /// race-free. Grows once, never shrinks.
+    static SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Run `f` against the thread-local 64K scratch (boringtun writes its output
+/// into the buffer; the returned packet slice is copied out by the caller
+/// before the next use).
+fn with_scratch<R>(f: impl FnOnce(&mut Vec<u8>) -> R) -> R {
+    SCRATCH.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        if buf.len() < 65535 {
+            buf.resize(65535, 0);
+        }
+        f(&mut buf)
+    })
+}
+
 static DESCRIPTOR: TransportDescriptor = TransportDescriptor {
     kind: "wireguard",
     capabilities: Capabilities {
@@ -95,8 +131,9 @@ struct HopInner {
     streams: Arc<stream::StreamTable>,
     /// Ordered egress queue: FIFO send order is load-bearing — concurrent
     /// `send_to` spawns let keepalives overtake DATA and trip the peer's
-    /// replay protection. Only the pump task transmits.
-    tx: tokio::sync::mpsc::UnboundedSender<(SocketAddr, Vec<u8>)>,
+    /// replay protection. Only the pump task transmits. Bounded
+    /// ([`EGRESS_QUEUE_CAP`]): full means backpressure, never growth.
+    tx: tokio::sync::mpsc::Sender<EgressItem>,
 }
 
 /// Packet uplink for the boringtun pump (US3 T058 nesting): an OS UDP socket
@@ -235,23 +272,25 @@ impl WireguardHop {
             }
         }
         let (events, _) = tokio::sync::broadcast::channel(16);
-        let (tx, tx_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, tx_rx) = tokio::sync::mpsc::channel(EGRESS_QUEUE_CAP);
+        let streams = Arc::new(stream::StreamTable::new());
+        streams.observe(hop_id.clone(), events.clone());
         let inner = Arc::new(HopInner {
             tunnel: Mutex::new(tunnel),
             udp,
             peer: std::sync::RwLock::new(params.peer_endpoint),
-            streams: Arc::new(stream::StreamTable::new()),
+            streams,
             tx,
         });
 
         // Initiate the handshake immediately (lock released before await).
+        // Scratch is thread-local-reused, not allocated per call (#15).
         let init: Option<Vec<u8>> = {
             let mut tunnel = inner.tunnel.lock().unwrap();
-            let mut dst = vec![0u8; 65535];
-            match tunnel.encapsulate(&[], &mut dst) {
+            with_scratch(|dst| match tunnel.encapsulate(&[], dst) {
                 TunnResult::WriteToNetwork(packet) => Some(packet.to_vec()),
                 _ => None,
-            }
+            })
         };
         if let Some(packet) = init {
             inner.udp.send_to(&packet, params.peer_endpoint).await.ok();
@@ -265,6 +304,9 @@ impl WireguardHop {
         });
 
         // Wait for handshake completion (engine wraps with its own timeout).
+        // One reused scratch buffer for the retry loop, not one 64K alloc
+        // per 200 ms tick (#15).
+        let mut retry_dst = vec![0u8; 65535];
         let ok = tokio::time::timeout(Duration::from_secs(15), async {
             loop {
                 {
@@ -277,8 +319,7 @@ impl WireguardHop {
                 // before await so the pump can make progress).
                 let retry: Option<Vec<u8>> = {
                     let mut tunnel = inner.tunnel.lock().unwrap();
-                    let mut dst = vec![0u8; 65535];
-                    match tunnel.encapsulate(&[], &mut dst) {
+                    match tunnel.encapsulate(&[], &mut retry_dst) {
                         TunnResult::WriteToNetwork(packet) => Some(packet.to_vec()),
                         _ => None,
                     }
@@ -315,40 +356,93 @@ impl WireguardHop {
     }
 }
 
-/// Encrypt-and-queue helper shared by flows and streams. Queued (not
-/// spawned) so the pump transmits FIFO — see `HopInner::tx`.
-fn wg_send(inner: &HopInner, plaintext: &[u8]) -> Result<(), HopError> {
+/// Encrypt one channel frame into a queued uplink packet (sync half of the
+/// egress path: IP-wrap + boringtun encapsulate under the tunnel lock, which
+/// is released before any queue await). The 64K boringtun scratch is
+/// thread-local-reused; only the sized packet copy allocates (#15).
+fn seal(inner: &HopInner, frame: Vec<u8>) -> Result<EgressItem, HopError> {
     // Frames ride the tunnel as IPv4/253 payloads (see stream::wrap_ip).
-    let packet = stream::wrap_ip(plaintext);
-    let mut tunnel = inner.tunnel.lock().unwrap();
-    let mut dst = vec![0u8; 65535];
-    match tunnel.encapsulate(&packet, &mut dst) {
-        TunnResult::WriteToNetwork(packet) => {
-            let peer = *inner.peer.read().unwrap();
-            inner
-                .tx
-                .send((peer, packet.to_vec()))
-                .map_err(|_| HopError::transport("wireguard", "egress queue closed"))?;
-            Ok(())
+    let packet = stream::wrap_ip(&frame);
+    with_scratch(|dst| {
+        let mut tunnel = inner.tunnel.lock().unwrap();
+        match tunnel.encapsulate(&packet, dst) {
+            TunnResult::WriteToNetwork(packet) => {
+                let peer = *inner.peer.read().unwrap();
+                Ok((peer, packet.to_vec()))
+            }
+            TunnResult::Done => Err(HopError::transport(
+                "wireguard",
+                "encapsulate produced nothing to send",
+            )),
+            TunnResult::Err(e) => Err(HopError::transport(
+                "wireguard",
+                format!("encapsulate: {e:?}"),
+            )),
+            TunnResult::WriteToTunnelV4(..) | TunnResult::WriteToTunnelV6(..) => Err(
+                HopError::transport("wireguard", "encapsulate returned tunnel data"),
+            ),
         }
-        TunnResult::Done => Ok(()),
-        TunnResult::Err(e) => Err(HopError::transport(
-            "wireguard",
-            format!("encapsulate: {e:?}"),
-        )),
-        TunnResult::WriteToTunnelV4(..) | TunnResult::WriteToTunnelV6(..) => Err(
-            HopError::transport("wireguard", "encapsulate returned tunnel data"),
-        ),
+    })
+}
+
+/// Bounded-egress frame sender shared by flows and streams. Queued (not
+/// spawned) so the pump transmits FIFO — see `HopInner::tx`.
+struct EgressTx {
+    hop_id: String,
+    inner: Arc<HopInner>,
+}
+
+#[async_trait::async_trait]
+impl FrameSender for EgressTx {
+    /// Encrypt then await queue space (backpressure, never growth).
+    async fn send_frame(&self, frame: Vec<u8>) -> Result<(), HopError> {
+        let item = seal(&self.inner, frame)?;
+        self.inner
+            .tx
+            .send(item)
+            .await
+            .map_err(|_| HopError::transport(self.hop_id.clone(), "egress queue closed"))?;
+        Ok(())
+    }
+
+    /// Encrypt then queue without waiting: full maps to retryable
+    /// [`HopError::overloaded`], closed to a terminal transport error.
+    fn try_send_frame(&self, frame: Vec<u8>) -> Result<(), HopError> {
+        let item = seal(&self.inner, frame)?;
+        self.inner.tx.try_send(item).map_err(|e| match e {
+            tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                HopError::overloaded(self.hop_id.clone(), "egress queue full")
+            }
+            tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                HopError::transport(self.hop_id.clone(), "egress queue closed")
+            }
+        })?;
+        Ok(())
+    }
+
+    fn congestion_waiter(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>> {
+        let tx = self.inner.tx.clone();
+        Box::pin(async move {
+            let _ = tx.reserve().await;
+        })
     }
 }
 
 async fn pump_loop(
     inner: Arc<HopInner>,
-    mut tx_rx: tokio::sync::mpsc::UnboundedReceiver<(SocketAddr, Vec<u8>)>,
+    mut tx_rx: tokio::sync::mpsc::Receiver<EgressItem>,
     events: tokio::sync::broadcast::Sender<HopEvent>,
     hop_id: String,
 ) {
+    // Reused 64K buffers, allocated once per pump task — never per packet
+    // (#15 perf batch: per-packet 64K zeroing was the top hotspot in #10).
+    // `buf`/`plain`/`tick_dst` are each consumed synchronously before the
+    // next iteration, so reuse is race-free on this single task.
     let mut buf = vec![0u8; 65535];
+    let mut plain = vec![0u8; 65535];
+    let mut tick_dst = vec![0u8; 65535];
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -358,18 +452,20 @@ async fn pump_loop(
                 // sent directly) so ALL transmissions share one FIFO order —
                 // direct sends let keepalives overtake DATA and trip the
                 // peer's replay protection.
-                let queued: Option<(SocketAddr, Vec<u8>)> = {
+                let queued: Option<EgressItem> = {
                     let mut tunnel = inner.tunnel.lock().unwrap();
-                    let mut dst = vec![0u8; 65535];
-                    match tunnel.encapsulate(&[], &mut dst) {
+                    match tunnel.encapsulate(&[], &mut tick_dst) {
                         TunnResult::WriteToNetwork(packet) => {
                             Some((*inner.peer.read().unwrap(), packet.to_vec()))
                         }
                         _ => None,
                     }
                 };
-                if let Some((peer, bytes)) = queued {
-                    inner.tx.send((peer, bytes)).ok();
+                if let Some(item) = queued {
+                    // Best-effort: a full queue already holds 1024 newer
+                    // packets' worth of backpressure; the next 100 ms tick
+                    // retransmits. Never blocks the pump on its own queue.
+                    let _ = inner.tx.try_send(item);
                 }
             }
             queued = tx_rx.recv() => {
@@ -378,23 +474,22 @@ async fn pump_loop(
             }
             recvd = inner.udp.recv_from(&mut buf) => {
                 let Ok((n, src)) = recvd else { break };
-                let mut plain = vec![0u8; 65535];
                 let mut tunnel = inner.tunnel.lock().unwrap();
                 match tunnel.decapsulate(Some(src.ip()), &buf[..n], &mut plain) {
                     TunnResult::WriteToTunnelV4(data, _) | TunnResult::WriteToTunnelV6(data, _) => {
                         drop(tunnel);
                         // Roaming: a valid packet from a new source moves the peer.
                         *inner.peer.write().unwrap() = src;
-                        let frame = data.to_vec();
-                        // Strip the IPv4 envelope; non-channel IP packets
-                        // belong to a future TUN integration, not dispatch.
-                        let Some(inner_frame) = stream::unwrap_ip(&frame) else {
+                        // Single copy (#15): strip the envelope in place and
+                        // copy only the inner frame — the old code copied
+                        // `data` to `frame` first, then the inner frame again.
+                        let Some(inner_frame) = stream::unwrap_ip(data) else {
                             continue;
                         };
-                        let inner_frame = inner_frame.to_vec();
                         if std::env::var("QCORE_WG_TRACE").is_ok() {
-                            eprintln!("[wg-pump] tunnel-data {}B type={:02x}", frame.len(), frame.first().copied().unwrap_or(0));
+                            eprintln!("[wg-pump] tunnel-data {}B type={:02x}", data.len(), data.first().copied().unwrap_or(0));
                         }
+                        let inner_frame = inner_frame.to_vec();
                         if let Err(e) = stream::dispatch(&inner.streams, &inner_frame) {
                             let _ = events.send(HopEvent::Failed { hop_id: hop_id.clone(), cause: e });
                         }
@@ -403,8 +498,9 @@ async fn pump_loop(
                         let bytes = reply.to_vec();
                         drop(tunnel);
                         // Same FIFO queue: handshake replies stay ordered
-                        // relative to data (replay protection).
-                        inner.tx.send((src, bytes)).ok();
+                        // relative to data (replay protection). Best-effort
+                        // on a full queue — the peer retransmits.
+                        let _ = inner.tx.try_send((src, bytes));
                     }
                     TunnResult::Done => {}
                     TunnResult::Err(_) => {}
@@ -459,8 +555,10 @@ struct WgDialer {
 #[async_trait::async_trait]
 impl Dialer for WgDialer {
     async fn dial_tcp(&self, dst: SocketAddr) -> Result<Box<dyn ByteStream>, HopError> {
-        let inner = self.inner.clone();
-        let send: stream::SendFrame = Arc::new(move |frame: &[u8]| wg_send(&inner, frame));
+        let send: stream::SendFrame = Arc::new(EgressTx {
+            hop_id: self.hop_id.clone(),
+            inner: self.inner.clone(),
+        });
         let stream = stream::open_stream(&self.inner.streams, dst, send)
             .await
             .map_err(|e| HopError::transport(self.hop_id.clone(), e))?;
@@ -471,6 +569,10 @@ impl Dialer for WgDialer {
         Ok(Box::new(WgUdpFlow {
             hop_id: self.hop_id.clone(),
             inner: self.inner.clone(),
+            send: Arc::new(EgressTx {
+                hop_id: self.hop_id.clone(),
+                inner: self.inner.clone(),
+            }),
             dst,
             rx: tokio::sync::Mutex::new(self.inner.streams.subscribe_dgrams()),
         }))
@@ -489,6 +591,7 @@ impl Dialer for WgDialer {
 struct WgUdpFlow {
     hop_id: String,
     inner: Arc<HopInner>,
+    send: stream::SendFrame,
     dst: SocketAddr,
     rx: tokio::sync::Mutex<tokio::sync::broadcast::Receiver<(Vec<u8>, SocketAddr)>>,
 }
@@ -503,7 +606,9 @@ impl UdpFlow for WgUdpFlow {
             ));
         }
         let frame = stream::encode_dgram(&self.dst, buf);
-        wg_send(&self.inner, &frame)
+        // Async send awaits queue space: datagram senders get backpressure,
+        // never unbounded growth (#12).
+        self.send.send_frame(frame).await
     }
 
     async fn recv_from(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr), HopError> {
@@ -516,6 +621,13 @@ impl UdpFlow for WgUdpFlow {
                     return Ok((n, from));
                 }
                 Ok(_) => continue,
+                // Lagged is receiver-side loss on the bounded dgram fan-out,
+                // not a dead channel: count it (surfaced as `Congested`) and
+                // keep waiting. Only `Closed` ends the flow. (#12)
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    self.inner.streams.record_dgram_drops(n);
+                    continue;
+                }
                 Err(_) => {
                     return Err(HopError::transport(
                         self.hop_id.clone(),
@@ -571,6 +683,149 @@ mod tests {
             awg: None,
             noize: None,
         }
+    }
+
+    struct StubSock;
+
+    #[async_trait::async_trait]
+    impl PacketSock for StubSock {
+        async fn send_to(&self, _bytes: &[u8], _peer: SocketAddr) -> std::io::Result<()> {
+            Ok(())
+        }
+        async fn recv_from(&self, _buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+            std::future::pending().await
+        }
+        fn local_addr(&self) -> std::io::Result<SocketAddr> {
+            Ok("127.0.0.1:0".parse().unwrap())
+        }
+    }
+
+    /// Test-only hop interior: a real boringtun tunnel with a completed
+    /// offline handshake (so data encapsulation yields packets) over a stub
+    /// uplink. `cap` sizes the egress queue.
+    fn test_inner(cap: usize) -> (Arc<HopInner>, tokio::sync::mpsc::Receiver<EgressItem>) {
+        let sk_a = boringtun::x25519::StaticSecret::from([7u8; 32]);
+        let pk_a = boringtun::x25519::PublicKey::from(&sk_a);
+        let sk_b = boringtun::x25519::StaticSecret::from([9u8; 32]);
+        let pk_b = boringtun::x25519::PublicKey::from(&sk_b);
+        let mut a = Tunn::new(sk_a, pk_b, None, None, 0, None);
+        let mut b = Tunn::new(sk_b, pk_a, None, None, 0, None);
+        let mut buf = vec![0u8; 65535];
+        let init = match a.encapsulate(&[], &mut buf) {
+            TunnResult::WriteToNetwork(p) => p.to_vec(),
+            _ => panic!("handshake init"),
+        };
+        let resp = match b.decapsulate(None, &init, &mut buf) {
+            TunnResult::WriteToNetwork(p) => p.to_vec(),
+            _ => panic!("handshake response"),
+        };
+        if let TunnResult::Err(e) = a.decapsulate(None, &resp, &mut buf) {
+            panic!("initiator completes: {e:?}")
+        }
+        assert!(
+            a.time_since_last_handshake().is_some(),
+            "initiator established offline"
+        );
+        let (tx, rx) = tokio::sync::mpsc::channel(cap);
+        let inner = Arc::new(HopInner {
+            tunnel: Mutex::new(a),
+            udp: Arc::new(StubSock),
+            peer: std::sync::RwLock::new("127.0.0.1:1".parse().unwrap()),
+            streams: Arc::new(stream::StreamTable::new()),
+            tx,
+        });
+        (inner, rx)
+    }
+
+    fn egress_tx(inner: &Arc<HopInner>) -> EgressTx {
+        EgressTx {
+            hop_id: "wg-test-0".into(),
+            inner: inner.clone(),
+        }
+    }
+
+    /// Failing-first (#12 handoff): a full egress queue yields retryable
+    /// backpressure — never unbounded growth. Pre-fix this failed: the queue
+    /// was unbounded, so `try_send` never signaled full.
+    #[tokio::test]
+    async fn full_egress_yields_backpressure_not_growth() {
+        let (inner, rx) = test_inner(EGRESS_QUEUE_CAP);
+        let tx = egress_tx(&inner);
+        let _rx = rx; // held: nobody drains, so the queue must fill, not grow
+        let mut backpressure = 0u32;
+        for i in 0..(EGRESS_QUEUE_CAP + 50) {
+            let frame = vec![0x02, (i & 0xFF) as u8];
+            match tx.try_send_frame(frame) {
+                Ok(()) => {}
+                Err(e) if e.is_backpressure() => backpressure += 1,
+                Err(e) => panic!("terminal error, not backpressure: {e}"),
+            }
+        }
+        assert_eq!(backpressure, 50, "overflow parks, never grows");
+        assert_eq!(inner.tx.max_capacity(), EGRESS_QUEUE_CAP);
+        assert_eq!(inner.tx.capacity(), 0, "queue is at its bound");
+    }
+
+    /// The async half of backpressure: `send_frame` awaits space instead of
+    /// failing, and completes once the pump drains one packet.
+    #[tokio::test]
+    async fn async_send_awaits_space_then_completes() {
+        let (inner, mut rx) = test_inner(EGRESS_QUEUE_CAP);
+        let tx = egress_tx(&inner);
+        for i in 0..EGRESS_QUEUE_CAP {
+            tx.try_send_frame(vec![0x02, (i & 0xFF) as u8])
+                .expect("fills to the bound");
+        }
+        let waiter = tokio::spawn({
+            let tx = egress_tx(&inner);
+            async move { tx.send_frame(vec![0x02, 0xAA]).await }
+        });
+        // Still parked while full (past a scheduler pass, with no drain
+        // happening).
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiter.is_finished(), "send_frame parks on a full queue");
+        rx.recv().await.expect("pump drains one");
+        waiter
+            .await
+            .expect("waiter joins")
+            .expect("send_frame completes after drain");
+    }
+
+    /// Failing-first (#12): `Lagged` on the bounded dgram fan-out is counted
+    /// (surfaced as `Congested`) and skipped — the flow keeps working.
+    /// Pre-fix this failed: any lag returned "datagram channel closed".
+    #[tokio::test]
+    async fn dgram_lag_counts_congested_and_keeps_flow() {
+        let (inner, _rx) = test_inner(EGRESS_QUEUE_CAP);
+        let (events, _bus) = tokio::sync::broadcast::channel(4096);
+        inner.streams.observe("wg-test-0".to_string(), events);
+        let dst_b: SocketAddr = "127.0.0.1:2".parse().unwrap();
+        let dst_a: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let flow = WgUdpFlow {
+            hop_id: "wg-test-0".into(),
+            inner: inner.clone(),
+            send: Arc::new(egress_tx(&inner)),
+            dst: dst_b,
+            rx: tokio::sync::Mutex::new(inner.streams.subscribe_dgrams()),
+        };
+        // Overflow the 256-cap fan-out with non-matching datagrams, then
+        // deliver one matching datagram inside the surviving window.
+        for _ in 0..300 {
+            stream::dispatch(&inner.streams, &stream::encode_dgram(&dst_a, b"noise"))
+                .expect("dispatches");
+        }
+        stream::dispatch(&inner.streams, &stream::encode_dgram(&dst_b, b"hi")).expect("dispatches");
+        let mut buf = [0u8; 64];
+        let (n, from) = tokio::time::timeout(Duration::from_secs(2), flow.recv_from(&mut buf))
+            .await
+            .expect("recv arrives")
+            .expect("lag is skipped, not fatal");
+        assert_eq!(&buf[..n], b"hi");
+        assert_eq!(from, dst_b);
+        assert!(
+            inner.streams.dgram_drops() > 0,
+            "lag is counted into the congested total"
+        );
     }
 
     #[tokio::test]

@@ -11,7 +11,10 @@
 use std::path::PathBuf;
 
 fn main() {
-    let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    let manifest = PathBuf::from(
+        std::env::var("CARGO_MANIFEST_DIR")
+            .expect("cargo sets CARGO_MANIFEST_DIR for build scripts"),
+    );
     let version_rs = manifest.join("../qcore-core/src/api/version.rs");
     let text = std::fs::read_to_string(&version_rs).expect("read version.rs");
     let abi = text
@@ -24,7 +27,8 @@ fn main() {
         })
         .expect("ABI_VERSION const in version.rs");
     let stamp = abi.to_string();
-    let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let out_dir =
+        PathBuf::from(std::env::var("OUT_DIR").expect("cargo sets OUT_DIR for build scripts"));
     std::fs::write(out_dir.join("abi-version.txt"), &stamp).expect("write OUT_DIR stamp");
     // Checked-in mirror for diff visibility (best-effort: read-only checkouts).
     let _ = std::fs::write(manifest.join("abi-version.txt"), &stamp);

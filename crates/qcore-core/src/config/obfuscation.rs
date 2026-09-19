@@ -17,10 +17,56 @@ use std::collections::{BTreeMap, HashMap};
 pub const SHIPPED_OBFUSCATION_TOML: &str = include_str!("../../../../profiles/obfuscation.toml");
 
 /// Profile family: noize (wireguard + masque) or awg (`peer=awg` only).
+///
+/// Version window (map #7): this enum parallels the transport API's
+/// `ObfuscationFamily` (the compatibility source of truth) on purpose.
+/// Unifying the two types — or typing the stringly `family: String` fields
+/// on hop configs — is a breaking change and lands only in a major version
+/// window with migration notes. Until then: keep the variants in sync via
+/// the `From` impls below plus the parity test, and match on variants,
+/// never on `Debug`/display strings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObfFamily {
     Noize,
     Awg,
+}
+
+impl ObfFamily {
+    /// Canonical profile-file spelling (`family = "..."`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ObfFamily::Noize => "noize",
+            ObfFamily::Awg => "awg",
+        }
+    }
+
+    /// Parse a profile-file spelling; `None` means unknown (callers fail
+    /// closed naming the profile and the bad value).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "noize" => Some(ObfFamily::Noize),
+            "awg" => Some(ObfFamily::Awg),
+            _ => None,
+        }
+    }
+}
+
+impl From<ObfFamily> for qcore_transport_api::ObfuscationFamily {
+    fn from(f: ObfFamily) -> Self {
+        match f {
+            ObfFamily::Noize => qcore_transport_api::ObfuscationFamily::Noize,
+            ObfFamily::Awg => qcore_transport_api::ObfuscationFamily::Awg,
+        }
+    }
+}
+
+impl From<qcore_transport_api::ObfuscationFamily> for ObfFamily {
+    fn from(f: qcore_transport_api::ObfuscationFamily) -> Self {
+        match f {
+            qcore_transport_api::ObfuscationFamily::Noize => ObfFamily::Noize,
+            qcore_transport_api::ObfuscationFamily::Awg => ObfFamily::Awg,
+        }
+    }
 }
 
 /// One compatible mode entry: kind plus optional peer/alpn qualifier.
@@ -113,9 +159,8 @@ fn parse_profiles_toml(text: &str) -> Result<BTreeMap<String, ObfuscationProfile
             .as_table()
             .ok_or_else(|| format!("profile `{name}` must be a table"))?;
         let family = match pt.get("family").and_then(|x| x.as_str()) {
-            Some("noize") => ObfFamily::Noize,
-            Some("awg") => ObfFamily::Awg,
-            Some(other) => return Err(format!("profile `{name}` family `{other}` (noize|awg)")),
+            Some(s) => ObfFamily::parse(s)
+                .ok_or_else(|| format!("profile `{name}` family `{s}` (noize|awg)"))?,
             None => return Err(format!("profile `{name}` missing `family`")),
         };
         let modes = pt
@@ -234,28 +279,18 @@ pub fn resolve_for_chain(
             .ok_or_else(|| err(format!("unknown obfuscation profile `{name}`")))?;
         let (kind, peer, alpn) = hop_mode(hop);
         // Family must be in the transport descriptor (source of truth).
-        // Matched on variants, not Debug strings: `ObfFamily` and the
-        // transport API's `ObfuscationFamily` are parallel types, and string
-        // comparison would silently pass a renamed variant.
+        // Matched on variants via the `From` bridge, not Debug strings: a
+        // renamed variant fails to compile here instead of silently
+        // passing at runtime.
+        let want = qcore_transport_api::ObfuscationFamily::from(profile.family);
         let descriptor_ok = registry
             .factory(&kind)
-            .map(|f| {
-                f.descriptor().obfuscation_families.iter().any(|fam| {
-                    use qcore_transport_api::ObfuscationFamily as F;
-                    matches!(
-                        (fam, profile.family),
-                        (F::Noize, ObfFamily::Noize) | (F::Awg, ObfFamily::Awg)
-                    )
-                })
-            })
+            .map(|f| f.descriptor().obfuscation_families.contains(&want))
             .unwrap_or(false);
         if !descriptor_ok {
             return Err(err(format!(
                 "obfuscation profile `{name}` (family {}) incompatible with transport `{kind}`",
-                match profile.family {
-                    ObfFamily::Noize => "noize",
-                    ObfFamily::Awg => "awg",
-                }
+                profile.family.as_str()
             )));
         }
         if !profile
@@ -330,6 +365,31 @@ mod tests {
             assert!(profiles.contains_key(name), "ships {name}");
         }
         assert_eq!(profiles["awg-balanced"].params["jc"].scalar(), "6");
+    }
+
+    #[test]
+    fn obf_family_parity_with_transport_api() {
+        // Version-window guard (map #7): the parallel enums must spell and
+        // convert identically. Adding a variant to either side breaks this
+        // test until the `From` impls (and the window plan) are updated.
+        for (core, api) in [
+            (
+                ObfFamily::Noize,
+                qcore_transport_api::ObfuscationFamily::Noize,
+            ),
+            (ObfFamily::Awg, qcore_transport_api::ObfuscationFamily::Awg),
+        ] {
+            assert_eq!(core.as_str(), api.as_str());
+            assert_eq!(ObfFamily::parse(core.as_str()), Some(core));
+            assert_eq!(
+                qcore_transport_api::ObfuscationFamily::parse(api.as_str()),
+                Some(api)
+            );
+            assert_eq!(qcore_transport_api::ObfuscationFamily::from(core), api);
+            assert_eq!(ObfFamily::from(api), core);
+        }
+        assert_eq!(ObfFamily::parse("nope"), None);
+        assert_eq!(qcore_transport_api::ObfuscationFamily::parse("nope"), None);
     }
 
     #[test]

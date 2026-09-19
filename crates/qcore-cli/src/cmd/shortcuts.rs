@@ -109,7 +109,7 @@ fn segment<'a>(
                 presets
                     .iter()
                     .find(|p| p.name == seg)
-                    .unwrap()
+                    .expect("preset presence checked via `any` above")
                     .name
                     .as_str(),
             )),

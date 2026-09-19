@@ -1,13 +1,15 @@
 [package]
 name = "qcore-core"
 # Independent versioning (constitution): 0.2.0 for the StartedHop shape
-# change (crate-internal keepalive handle). Pre-publish 0.x: minor carries it.
-version = "0.2.0"
+# change (crate-internal keepalive handle); 0.3.0 for the HopReport.dropped
+# congestion-accounting field (#12 queue decision, #15 perf batch).
+# Pre-publish 0.x: minor carries it.
+version = "0.3.0"
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-qcore-transport-api = { version = "0.1.0", path = "../qcore-transport-api" }
+qcore-transport-api = { version = "0.2.0", path = "../qcore-transport-api" }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
@@ -19,6 +21,7 @@ boringtun = { workspace = true }
 getrandom = { workspace = true }
 rcgen = { workspace = true }
 base64 = { workspace = true }
+zeroize = { workspace = true }
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }
 rustls-native-certs = { workspace = true }

@@ -21,6 +21,7 @@ use crate::config::profile_dir::ProfileDirs;
 use crate::config::secret::{SecretStore, SecretString};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use zeroize::Zeroizing;
 
 /// Detected source format: any `J*`/`S*`/`H*`/`I*` key means AmneziaWG.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -749,13 +750,17 @@ pub fn materialize(
                 fields.push(("endpoint".into(), ep.clone()));
             }
         }
-        let priv_b64 = String::from_utf8_lossy(
-            secrets
-                .get("interface.private_key")
-                .map(|s| s.expose())
-                .unwrap_or_default(),
-        )
-        .into_owned();
+        // Transient base64 copy: wiped on drop (boundary decode only; the
+        // hex below and the stored secret are the survivors).
+        let priv_b64 = Zeroizing::new(
+            String::from_utf8_lossy(
+                secrets
+                    .get("interface.private_key")
+                    .map(|s| s.expose())
+                    .unwrap_or_default(),
+            )
+            .into_owned(),
+        );
         let priv_raw = b64_decode_32(priv_b64.trim()).map_err(|e| {
             ChainError::new(
                 None,
@@ -783,7 +788,7 @@ pub fn materialize(
         })?;
         fields.push(("peer_public_key".into(), hex_encode(&pub_raw)));
         if let Some(psk) = secrets.get("peer0.preshared_key") {
-            let psk_str = String::from_utf8_lossy(psk.expose()).into_owned();
+            let psk_str = Zeroizing::new(String::from_utf8_lossy(psk.expose()).into_owned());
             let psk_raw = b64_decode_32(psk_str.trim()).map_err(|e| {
                 ChainError::new(
                     None,

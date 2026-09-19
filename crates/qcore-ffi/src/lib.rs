@@ -53,7 +53,9 @@ fn ok_string(out: *mut *mut c_char, s: String) -> c_int {
 
 fn fail(err_out: *mut *mut QcoreError, code: c_int, message: String) -> c_int {
     if !err_out.is_null() {
-        let message = CString::new(message).unwrap_or_else(|_| CString::new("error").unwrap());
+        let message = CString::new(message).unwrap_or_else(|_| {
+            CString::new("error").expect("static fallback literal has no interior NUL")
+        });
         let err = Box::new(QcoreError {
             code,
             message: message.into_raw(),
@@ -81,6 +83,16 @@ fn unwind_guard<F: FnOnce() -> c_int + std::panic::UnwindSafe>(f: F) -> c_int {
     std::panic::catch_unwind(f).unwrap_or(-1)
 }
 
+/// FFI runtime sizing knob (#15): clamped, advisory, default 2.
+/// Non-integer/zero values fall back to the default (never an error).
+fn ffi_worker_threads(v: &serde_json::Value) -> usize {
+    v.get("worker_threads")
+        .and_then(|x| x.as_u64())
+        .filter(|t| *t >= 1)
+        .map(|t| t.clamp(1, 32) as usize)
+        .unwrap_or(2)
+}
+
 fn c_str(ptr: *const c_char) -> Result<String, String> {
     if ptr.is_null() {
         return Err("null string argument".to_string());
@@ -100,9 +112,16 @@ fn opt_c_str(ptr: *const c_char) -> Result<Option<String>, String> {
 }
 
 /// Optional JSON engine config:
-/// `{"config_dir","profile_dir","family","prefer","max_depth","timeout_secs"}`.
+/// `{"config_dir","profile_dir","family","prefer","max_depth","timeout_secs","worker_threads"}`.
 /// Null selects defaults. Transports linked are the FFI defaults (same set
 /// the CLI links minus tor; see `qcore-transports` features).
+///
+/// `worker_threads` sizes the private FFI runtime (#15 perf batch: the fixed
+/// `worker_threads(2)` ignored host width — embedders driving parallel scans
+/// or multi-hop pumps can raise it; single-session embedders can lower it to
+/// 1). Clamped to 1..=32, default 2 (unchanged behavior when absent).
+/// Non-integer/zero values fall back to the default (never an error: sizing
+/// is advisory, not validation).
 ///
 /// # Safety
 /// `config_json` must be null or point to valid NUL-terminated UTF-8;
@@ -143,6 +162,10 @@ pub unsafe extern "C" fn qcore_engine_new(
             .and_then(|x| x.as_u64())
             .filter(|t| *t >= 1)
             .unwrap_or(30);
+        // FFI runtime sizing knob (#15): clamped, advisory, default 2.
+        // #10 profiled `block_on` dispatch at ~67 ns/op — sizing is not the
+        // binding constraint, so this buys embedder control, not speed.
+        let worker_threads = ffi_worker_threads(&v);
         // Host links the transports it embeds (FR-003g scoping lives here).
         let _ = qcore_transports::linked_kinds();
         let engine = Engine::new(EngineConfig {
@@ -154,7 +177,7 @@ pub unsafe extern "C" fn qcore_engine_new(
             ..Default::default()
         });
         let rt = match tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
+            .worker_threads(worker_threads)
             .thread_name("qcore-ffi")
             .enable_all()
             .build()
@@ -492,5 +515,52 @@ mod tests {
             .to_string();
         assert!(msg2.contains("cause=bad option"), "got: {msg2}");
         assert_eq!(unsafe { qcore_error_free(err2) }, 0);
+    }
+
+    #[test]
+    fn worker_threads_knob_is_clamped_and_advisory() {
+        // #15: sizing is advisory — out-of-range/non-integer values fall back
+        // to the default instead of failing engine creation.
+        let v = |json: serde_json::Value| ffi_worker_threads(&json);
+        assert_eq!(v(serde_json::Value::Null), 2, "absent → default");
+        assert_eq!(v(serde_json::json!({"worker_threads": 4})), 4);
+        assert_eq!(v(serde_json::json!({"worker_threads": 1})), 1);
+        assert_eq!(
+            v(serde_json::json!({"worker_threads": 0})),
+            2,
+            "zero → default"
+        );
+        assert_eq!(
+            v(serde_json::json!({"worker_threads": 999})),
+            32,
+            "huge clamps to the ceiling"
+        );
+        assert_eq!(
+            v(serde_json::json!({"worker_threads": "many"})),
+            2,
+            "non-integer → default"
+        );
+    }
+
+    #[test]
+    fn engine_new_honors_worker_threads_end_to_end() {
+        // Creation succeeds with an explicit knob value (dirs pointed at temp
+        // so the test never touches the real profile).
+        let base = std::env::temp_dir().join(format!("qcore-ffi-knob-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let cfg = serde_json::json!({
+            "config_dir": base.join("config").to_str().unwrap(),
+            "profile_dir": base.join("profiles").to_str().unwrap(),
+            "worker_threads": 4,
+        })
+        .to_string();
+        let cfg = CString::new(cfg).unwrap();
+        let mut out: *mut QcoreEngine = std::ptr::null_mut();
+        let mut err: *mut QcoreError = std::ptr::null_mut();
+        let rc = unsafe { qcore_engine_new(cfg.as_ptr(), &mut out as *mut _, &mut err as *mut _) };
+        assert_eq!(rc, 0, "engine_new accepts the knob");
+        assert!(!out.is_null());
+        assert_eq!(unsafe { qcore_engine_free(out) }, 0);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

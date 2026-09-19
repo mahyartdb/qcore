@@ -370,4 +370,48 @@ mod tests {
         let msg = "connection reset by peer after idle timeout exceeded";
         assert_eq!(masked_value("cause", msg), msg);
     }
+
+    #[test]
+    fn denylist_covers_pem_headers() {
+        // Review pin (#13): every PEM private-key header the provider or a
+        // config could echo is caught even under an innocuous key.
+        for marker in [
+            "-----BEGIN PRIVATE KEY-----",
+            "-----BEGIN OPENSSH PRIVATE KEY-----",
+            "-----BEGIN EC PRIVATE KEY-----",
+            "payload PRIVATE KEY----- tail",
+        ] {
+            assert_eq!(
+                redact_value("blob", marker),
+                Redaction::Redacted,
+                "{marker}"
+            );
+        }
+    }
+
+    #[test]
+    fn drop_threshold_boundary_pins_44() {
+        // Review pin (#13): thresholds stay put — a 43-char random-looking
+        // value under an innocuous key redacts in place, while 44 chars
+        // (one WireGuard key) drops the whole record fail-closed. A
+        // threshold tweak must update this test deliberately.
+        let v44 = ECHO_44;
+        let v43 = &ECHO_44[..43];
+        assert!(drops_record("mystery", v44), "44 must drop");
+        assert!(!drops_record("mystery", v43), "43 must not drop");
+        assert_eq!(redact_value("mystery", v43), Redaction::Redacted);
+    }
+
+    #[test]
+    fn license_type_labels_are_not_typed_secrets() {
+        // Review verdict (#13): `license` stays OUT of SECRET_KEYS. License
+        // *keys* are high-entropy (caught by the entropy layer); license
+        // *labels* (`free`, `plus`) are actionable triage text and must not
+        // be masked. Typed-secret status would over-redact them.
+        assert_eq!(
+            redact_value("license", "plus"),
+            Redaction::Keep("plus".into())
+        );
+        assert_eq!(redact_value("license", ECHO_44), Redaction::Redacted);
+    }
 }

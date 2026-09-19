@@ -732,7 +732,10 @@ impl UdpFlow for H2Dgrams {
             {
                 let mut pending = self.pending.lock().await;
                 if pending.len() >= 4 {
-                    let len = u32::from_be_bytes(pending[..4].try_into().unwrap()) as usize;
+                    // Guarded by the length check above: exactly 4 bytes.
+                    let len =
+                        u32::from_be_bytes(pending[..4].try_into().expect("len prefix is 4 bytes"))
+                            as usize;
                     if pending.len() >= 4 + len {
                         let data: Vec<u8> = pending.drain(..4 + len).skip(4).collect();
                         let n = len.min(buf.len());

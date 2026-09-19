@@ -7,3 +7,6 @@
 # Format: {commit}:{path}:{rule}:{line} (see `gitleaks detect` report).
 3cfe2c6377779a52427339378945f6fb5212dcf2:crates/qcore-core/src/diag/redact.rs:generic-api-key:192
 f3f376f3c1d8abd467d08d2eee840da76b0fb821:.gitleaks.toml:generic-api-key:6
+# #13 denylist_covers_pem_headers test markers (known-fake PEM headers the
+# redaction denylist must catch); reported by CI gitleaks on a11fe1b.
+a11fe1b145241fd0bb3d85d35fbe8051676c3eec:crates/qcore-core/src/diag/redact.rs:private-key:379

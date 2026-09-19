@@ -1,6 +1,12 @@
 //! Shared license-key input (002 FR-010): flag (warns) > file > TTY
 //! prompt > none. Resolves to a [`SecretString`] before crossing into the
 //! engine; the key is never echoed, logged, reported, or persisted.
+//!
+//! TTY no-echo (#13: explicitly deferred, not silently dropped). The prompt
+//! below echoes input; scripts and the cautious must use `--license-file`.
+//! A no-echo prompt needs OS console APIs (Unix termios / Windows console
+//! mode) via a new dependency, which needs supply-chain review — deferred.
+//! This notice is the tracking record.
 
 use crate::exit;
 use qcore_core::config::secret::SecretString;
@@ -38,8 +44,9 @@ pub fn resolve(
         return Ok(Some(SecretString::new(key)));
     }
     if !non_interactive && std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-        // Note: line input echoes; scripts and the cautious should use
-        // --license-file.
+        // Echoing prompt (see module docs: no-echo deferred pending a
+        // vetted console-API dependency); scripts and the cautious should
+        // use --license-file.
         eprint!("provider license key (empty to skip): ");
         use std::io::Write;
         let _ = std::io::stderr().flush();
@@ -85,7 +92,7 @@ mod tests {
     #[test]
     fn empty_file_is_usage_error() {
         let path = std::env::temp_dir().join(format!("qcore-license-empty-{}", std::process::id()));
-        std::fs::write(&path, "  \n").unwrap();
+        std::fs::write(&path, "  \n").expect("temp license fixture is writable");
         let r = resolve(None, Some(&path), true);
         let _ = std::fs::remove_file(&path);
         assert_eq!(r.unwrap_err(), crate::exit::USAGE);

@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// Readiness announcement the sidecar MUST print on stdout:
 /// `QCORE_SIDECAR_READY socks5=127.0.0.1:PORT`
@@ -21,8 +22,9 @@ pub const READY_PREFIX: &str = "QCORE_SIDECAR_READY socks5=";
 
 /// How a secret reaches the sidecar. Stdin is implemented (write-once at
 /// spawn, handle kept open); never argv (FR-001b). Debug never leaks bytes
-/// (not even the length: secret length is a side channel).
-#[derive(Clone)]
+/// (not even the length: secret length is a side channel). The payload
+/// wipes via vetted `ZeroizeOnDrop` (#13: pre-v1 it was a plain `Vec<u8>`).
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct SidecarSecret {
     pub payload: Vec<u8>,
 }
@@ -247,5 +249,30 @@ impl Drop for RunningSidecar {
         if let Some(child) = self.child.as_mut() {
             let _ = child.start_kill();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zeroize::Zeroize;
+
+    #[test]
+    fn sidecar_secret_debug_never_leaks() {
+        let s = SidecarSecret {
+            payload: b"hunter2-secret".to_vec(),
+        };
+        assert_eq!(format!("{s:?}"), "<redacted>");
+    }
+
+    #[test]
+    fn sidecar_secret_zeroizes() {
+        // The stdin payload is key material in transit: the vetted
+        // `zeroize` impl must wipe it in place, not a hand-rolled loop.
+        let mut s = SidecarSecret {
+            payload: b"hunter2-secret".to_vec(),
+        };
+        s.zeroize();
+        assert!(s.payload.iter().all(|&b| b == 0));
     }
 }

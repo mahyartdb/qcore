@@ -172,7 +172,13 @@ pub unsafe extern "system" fn Java_com_qcore_Qcore_engineNew(
         let cfg = if config_json.is_null() {
             None
         } else {
-            j_to_rust(env, config_json)
+            // A non-null Java string that cannot be pinned or decoded is a
+            // JVM input problem: fail closed (0), never silently fall back
+            // to default config (same contract as `call_c_abi`).
+            match j_to_rust(env, config_json) {
+                Some(s) => Some(s),
+                None => return 0,
+            }
         };
         let cfg_ptr = cfg
             .as_ref()
@@ -360,4 +366,50 @@ pub unsafe extern "system" fn Java_com_qcore_Qcore_exportConfig(
         })
     });
     result.unwrap_or(std::ptr::null_mut())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Fake JVM table: pinning always fails (null chars), so `j_to_rust`
+    // returns `None` for any non-null Java string.
+    unsafe extern "system" fn failing_chars(
+        _env: JniEnv,
+        _s: JString,
+        _is_copy: *mut u8,
+    ) -> *const c_char {
+        std::ptr::null()
+    }
+
+    unsafe extern "system" fn noop_release(_env: JniEnv, _s: JString, _chars: *const c_char) {}
+
+    unsafe extern "system" fn null_new_string(_env: JniEnv, _bytes: *const c_char) -> JString {
+        std::ptr::null_mut()
+    }
+
+    fn failing_table() -> JniTable {
+        JniTable {
+            _reserved_and_unused: [std::ptr::null(); 167],
+            new_string_utf: null_new_string,
+            _get_string_utf_length: std::ptr::null(),
+            get_string_utf_chars: failing_chars,
+            release_string_utf_chars: noop_release,
+        }
+    }
+
+    #[test]
+    fn engine_new_with_undecodable_config_fails_closed() {
+        // A non-null Java string the JVM cannot pin/decode must yield
+        // handle 0 (failure), never a default-config engine.
+        let table = failing_table();
+        let mut slot: *const JniTable = &table;
+        let env: JniEnv = &mut slot as *mut *const JniTable;
+        let bogus: JString = std::ptr::dangling_mut::<c_void>();
+        let handle = unsafe { Java_com_qcore_Qcore_engineNew(env, std::ptr::null_mut(), bogus) };
+        assert_eq!(
+            handle, 0,
+            "undecodable config must fail closed, not default"
+        );
+    }
 }

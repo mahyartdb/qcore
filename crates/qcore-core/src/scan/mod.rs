@@ -280,7 +280,9 @@ impl Scanner {
         let kind = req.profile.probe_kind;
         let stealth_gap = req.profile.stealth;
         let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(limit));
-        let mut joins = Vec::new();
+        // Pre-sized (#15): one join per candidate, at most one pass each —
+        // no reason to grow these incrementally on large seeded scans.
+        let mut joins = Vec::with_capacity(cands.len());
         for addr in cands {
             if stealth_gap {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -295,7 +297,7 @@ impl Scanner {
                 probe(addr, kind, budget).await
             }));
         }
-        let mut passed = Vec::new();
+        let mut passed = Vec::with_capacity(joins.len());
         let mut failed = 0usize;
         for j in joins {
             match j.await {
@@ -418,11 +420,9 @@ pub fn persist_verified(
         return Ok(None);
     };
     dirs.ensure_dirs().map_err(|e| e.to_string())?;
-    std::fs::write(
-        dirs.endpoints_file(),
-        serde_json::json!({"last_known_good": top.address.to_string()}).to_string(),
-    )
-    .map_err(|e| e.to_string())?;
+    // Locked RMW in `cache` (preserves sibling transports' winners — the old
+    // whole-file rewrite wiped them on every scan).
+    cache::persist_last_known_good(dirs, top.address)?;
     Ok(Some(top.address))
 }
 

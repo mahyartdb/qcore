@@ -34,6 +34,12 @@ pub struct StartedHop {
     /// Active obfuscation profile name, if any (US5 T073 reporting).
     pub obfuscation: Option<String>,
     pub hop: Arc<dyn RunningHop>,
+    /// Cumulative bus-lag drops observed by this hop's session forwarder
+    /// (#12 observability hook): the per-hop event bus is bounded-drop, so a
+    /// slow session consumer loses events as `Lagged(n)`. The forwarder
+    /// counts them, re-emits the cumulative total as `HopEvent::Congested`,
+    /// and shares the counter here so `hop_reports` surfaces it.
+    pub congested_drops: Arc<std::sync::atomic::AtomicU64>,
     /// Keepalive watcher abort handle (`None` when keepalive is disabled).
     /// `AbortHandle` (not `JoinHandle`) so `StartedHop` stays `Clone`.
     /// Teardown (`unwind`, `SessionHandle::stop_all`) aborts before stopping
@@ -100,6 +106,16 @@ pub async fn bring_up(
             ));
         };
         let mut fcfg = spec.config.to_factory_config();
+        // Endpoint/family reporting reads this same snapshot: one
+        // `to_factory_config` build per hop instead of four (the helpers
+        // below each rebuilt it). Values are unchanged — the report
+        // reflects authored config, not merged material.
+        let endpoint = fcfg.get("endpoint").map(str::to_string);
+        let family = match endpoint.as_deref().map(|ep| ep.parse::<SocketAddr>()) {
+            Some(Ok(addr)) if addr.is_ipv4() => "ipv4".to_string(),
+            Some(Ok(_)) => "ipv6".to_string(),
+            _ => spec.config.family().to_string(),
+        };
         fcfg.fields.insert("hop_id".into(), spec.id.clone());
         // US2: explicit chain values win; import material fills the rest.
         if let Some(material) = materials.imports.get(&spec.id) {
@@ -144,16 +160,40 @@ pub async fn bring_up(
                 hop
             }
         };
-        // Fan hop events into the session bus (push, not poll).
+        // Fan hop events into the session bus (push, not poll). The per-hop
+        // bus is bounded-drop (#12): a slow session consumer loses bursts as
+        // `Lagged(n)`. Lag is counted per hop and re-emitted as `Congested`
+        // carrying the cumulative total, so loss is observable even when the
+        // session bus itself drops the re-emission. Only `Closed` ends the
+        // forwarder.
         let mut rx = hop.events();
         let tx = events.clone();
-        tokio::spawn(async move {
-            while let Ok(e) = rx.recv().await {
-                if tx.send(e).is_err() {
-                    break;
+        let forwarder_drops = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let forwarder_hop_id = spec.id.clone();
+        {
+            let forwarder_drops = forwarder_drops.clone();
+            tokio::spawn(async move {
+                loop {
+                    match rx.recv().await {
+                        Ok(e) => {
+                            if tx.send(e).is_err() {
+                                break;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            let total = forwarder_drops
+                                .fetch_add(n, std::sync::atomic::Ordering::Relaxed)
+                                + n;
+                            let _ = tx.send(HopEvent::Congested {
+                                hop_id: forwarder_hop_id.clone(),
+                                dropped: total,
+                            });
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
                 }
-            }
-        });
+            });
+        }
         let keepalive_abort = if keepalive.enabled {
             Some(
                 spawn_keepalive(
@@ -169,19 +209,20 @@ pub async fn bring_up(
         };
         let _ = events.send(HopEvent::EndpointSelected {
             hop_id: spec.id.clone(),
-            endpoint: effective_endpoint(spec),
+            endpoint: endpoint.clone().unwrap_or_else(|| family.clone()),
         });
         carrier = hop.dialer();
         started.push(StartedHop {
             hop_id: spec.id.clone(),
             kind: kind.to_string(),
-            family: effective_family(spec),
-            endpoint: endpoint_of(spec),
+            family,
+            endpoint,
             via,
             nested,
             inner_mtu: prober.current_mtu(),
             obfuscation: active_obfuscation,
             hop,
+            congested_drops: forwarder_drops,
             keepalive: keepalive_abort,
         });
     }
@@ -232,31 +273,6 @@ fn to_report(
         }
     }
     FailureReport::new(layer, hop_id, cause, kind)
-}
-
-/// Family in effect: endpoint-resolved when the hop has a fixed endpoint.
-fn effective_family(spec: &crate::config::HopSpec) -> String {
-    if let Some(ep) = endpoint_of(spec) {
-        if let Ok(addr) = ep.parse::<SocketAddr>() {
-            return if addr.is_ipv4() {
-                "ipv4".to_string()
-            } else {
-                "ipv6".to_string()
-            };
-        }
-    }
-    spec.config.family().to_string()
-}
-
-fn endpoint_of(spec: &crate::config::HopSpec) -> Option<String> {
-    spec.config
-        .to_factory_config()
-        .get("endpoint")
-        .map(str::to_string)
-}
-
-fn effective_endpoint(spec: &crate::config::HopSpec) -> String {
-    endpoint_of(spec).unwrap_or_else(|| spec.config.family().to_string())
 }
 
 #[cfg(test)]
@@ -351,6 +367,7 @@ mod tests {
             inner_mtu: 1500,
             obfuscation: None,
             hop,
+            congested_drops: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             keepalive: Some(handle.abort_handle()),
         }];
         assert!(!abort.is_finished());

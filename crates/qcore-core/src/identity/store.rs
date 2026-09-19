@@ -257,7 +257,9 @@ pub fn discard_record(dirs: &ProfileDirs, role: IdentityRole) {
 
 /// Write `bytes` to `path` atomically (temp file in the same dir + rename)
 /// with user-only permissions on unix (0o600). Windows has no mode bits;
-/// the config dir ACL is the boundary there.
+/// the config dir ACL is the boundary there (see `config::secret` module
+/// docs: per-user default dir; `--config` into shared locations is operator
+/// responsibility).
 fn atomic_write_0600(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);

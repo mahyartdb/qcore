@@ -906,7 +906,8 @@ fn spawn_detached(o: ConnectOpts) -> i32 {
     }
     cmd.stdin(std::process::Stdio::null())
         .stdout(log_file.try_clone().unwrap_or_else(|_| {
-            std::fs::File::create(std::env::temp_dir().join("qcore-null.log")).unwrap()
+            std::fs::File::create(std::env::temp_dir().join("qcore-null.log"))
+                .expect("temp-dir log fallback is writable when detaching")
         }))
         .stderr(log_file);
     #[cfg(windows)]

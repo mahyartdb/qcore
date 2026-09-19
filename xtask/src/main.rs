@@ -24,9 +24,13 @@ fn main() -> anyhow::Result<()> {
 /// `.github/workflows/ci.yml`; see AGENTS.md).
 fn ci() -> anyhow::Result<()> {
     // Implemented as shell delegation so CI and local runs share one definition.
+    // --workspace: default-members is only qcore/cli/ffi (11 tests); the
+    // unit/contract suites in qcore-core, transports, examples and xtask
+    // never ran in the gate (#17). Conformance stays a separate line (also
+    // excluded here to avoid running it twice); chains rides the workspace run.
     shell("cargo fmt --check")?;
-    shell("cargo clippy --all-targets --all-features -- -D warnings")?;
-    shell("cargo nextest run --all-features")?;
+    shell("cargo clippy --workspace --all-targets --all-features -- -D warnings")?;
+    shell("cargo nextest run --workspace --all-features --exclude tests-conformance")?;
     shell("cargo nextest run -p tests-conformance")?;
     shell("cargo run -q -p xtask -- abi-diff")?;
     Ok(())

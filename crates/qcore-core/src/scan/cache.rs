@@ -38,6 +38,19 @@ struct CacheFile {
     winners: BTreeMap<String, TransportWinner>,
 }
 
+/// Same-process RMW serializer (#15 perf batch: the cache is read-modify-
+/// write, so concurrent `record_winner` calls for different transports lost
+/// updates — last writer clobbered the first. Poisoning is recovered, never
+/// fatal: the cache is best-effort, and the atomic replace below means a
+/// recovered lock still never leaves a torn file). Cross-process races
+/// remain (no file locking — documented follow-up); the atomic replace at
+/// least guarantees readers never see torn JSON.
+static CACHE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lock_cache() -> std::sync::MutexGuard<'static, ()> {
+    CACHE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn read_file(dirs: &ProfileDirs) -> CacheFile {
     std::fs::read_to_string(dirs.endpoints_file())
         .ok()
@@ -47,11 +60,15 @@ fn read_file(dirs: &ProfileDirs) -> CacheFile {
 
 fn write_file(dirs: &ProfileDirs, file: &CacheFile) -> Result<(), String> {
     dirs.ensure_dirs().map_err(|e| e.to_string())?;
-    std::fs::write(
-        dirs.endpoints_file(),
-        serde_json::to_string(file).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())
+    let body = serde_json::to_string(file).map_err(|e| e.to_string())?;
+    // Atomic replace: temp + rename, so concurrent readers never observe a
+    // half-written file. Temp name carries the pid so concurrent processes
+    // never share it; a stale temp from a crashed writer is simply
+    // overwritten by the next write.
+    let path = dirs.endpoints_file();
+    let tmp = path.with_file_name(format!(".endpoints.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, body).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())
 }
 
 /// All cached winners (tolerant: missing/corrupt file → empty, never fatal).
@@ -61,14 +78,27 @@ pub fn read_winners(dirs: &ProfileDirs) -> BTreeMap<String, TransportWinner> {
 
 /// Record a transport's winner, preserving other transports. The legacy
 /// top-level `last_known_good` follows the newest winner for old readers.
+/// Serialized against concurrent same-process writers (see `CACHE_LOCK`).
 pub fn record_winner(
     dirs: &ProfileDirs,
     transport: &str,
     winner: TransportWinner,
 ) -> Result<(), String> {
+    let _guard = lock_cache();
     let mut file = read_file(dirs);
     file.last_known_good = Some(winner.address.clone());
     file.winners.insert(transport.to_string(), winner);
+    write_file(dirs, &file)
+}
+
+/// Set the legacy top-level `last_known_good` WITHOUT touching the winners
+/// map. `persist_verified` used to rewrite the whole file with only
+/// `last_known_good`, wiping every other transport's winner on each scan;
+/// this is the atomicity-preserving spelling. Serialized like `record_winner`.
+pub fn persist_last_known_good(dirs: &ProfileDirs, addr: SocketAddr) -> Result<(), String> {
+    let _guard = lock_cache();
+    let mut file = read_file(dirs);
+    file.last_known_good = Some(addr.to_string());
     write_file(dirs, &file)
 }
 
@@ -104,6 +134,7 @@ pub async fn verify_winner_first(
 }
 
 fn evict_winner(dirs: &ProfileDirs, transport: &str) {
+    let _guard = lock_cache();
     let mut file = read_file(dirs);
     if file.winners.remove(transport).is_some() {
         let _ = write_file(dirs, &file);
@@ -111,6 +142,7 @@ fn evict_winner(dirs: &ProfileDirs, transport: &str) {
 }
 
 fn touch_verified_at(dirs: &ProfileDirs, transport: &str) {
+    let _guard = lock_cache();
     let mut file = read_file(dirs);
     if let Some(w) = file.winners.get_mut(transport) {
         w.verified_at_ms = now_ms();
@@ -161,6 +193,61 @@ mod tests {
         let d = dirs("corrupt");
         std::fs::write(d.endpoints_file(), "{oops").unwrap();
         assert!(read_winners(&d).is_empty());
+        let _ = std::fs::remove_dir_all(&d.config_dir);
+    }
+
+    /// Failing-first (#15): concurrent same-process writers for different
+    /// transports must not lose updates. Pre-fix this failed: read-modify-
+    /// write without serialization meant the last writer clobbered the first
+    /// (lost winners). Rounds raise the race window; the lock makes every
+    /// round pass deterministically.
+    #[test]
+    fn concurrent_writers_keep_all_transports() {
+        let d = dirs("conc");
+        for _ in 0..10 {
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+            std::thread::scope(|s| {
+                for (i, t) in ["warp", "masque", "tor", "psiphon"].iter().enumerate() {
+                    let b = barrier.clone();
+                    let d = &d;
+                    s.spawn(move || {
+                        b.wait(); // release all writers at once
+                        record_winner(d, t, winner(&format!("127.0.0.1:{}", 2400 + i)))
+                            .expect("records under contention");
+                    });
+                }
+            });
+            let map = read_winners(&d);
+            assert_eq!(map.len(), 4, "no winner lost to a concurrent write");
+        }
+        let _ = std::fs::remove_dir_all(&d.config_dir);
+    }
+
+    /// `persist_last_known_good` sets the legacy LKG without wiping sibling
+    /// transports' winners (the old whole-file rewrite in `persist_verified`
+    /// destroyed them on every scan).
+    #[test]
+    fn persist_lkg_preserves_sibling_winners() {
+        let d = dirs("lkgkeep");
+        record_winner(&d, "warp", winner("127.0.0.1:2408")).unwrap();
+        record_winner(&d, "masque", winner("127.0.0.1:443")).unwrap();
+        persist_last_known_good(&d, "127.0.0.1:51820".parse().unwrap()).unwrap();
+        let map = read_winners(&d);
+        assert_eq!(map.len(), 2, "sibling winners survive LKG persist");
+        assert_eq!(map["warp"].address, "127.0.0.1:2408");
+        let raw = std::fs::read_to_string(d.endpoints_file()).unwrap();
+        assert!(raw.contains("127.0.0.1:51820"), "LKG updated: {raw}");
+        // No torn temp files left behind.
+        let parent = d.endpoints_file().parent().unwrap().to_path_buf();
+        assert!(
+            std::fs::read_dir(&parent).unwrap().all(|e| !e
+                .unwrap()
+                .file_name()
+                .to_str()
+                .unwrap_or("")
+                .ends_with(".tmp")),
+            "atomic replace cleans up its temp"
+        );
         let _ = std::fs::remove_dir_all(&d.config_dir);
     }
 }

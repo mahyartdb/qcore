@@ -34,6 +34,31 @@ pub enum SessionState {
     Stopped,
 }
 
+/// Typed illegal-transition error (issue #16: `Result<_, String>` → typed
+/// errors where the boundary demands it).
+///
+/// `Session::transition` keeps its `Result<(), String>` signature (no
+/// breaking change): it delegates to [`Session::transition_checked`] and
+/// renders the typed error. New callers that match on failure modes should
+/// use `transition_checked` directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransitionError {
+    pub from: SessionState,
+    pub to: SessionState,
+}
+
+impl std::fmt::Display for TransitionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "illegal session transition {:?} -> {:?}",
+            self.from, self.to
+        )
+    }
+}
+
+impl std::error::Error for TransitionError {}
+
 /// Durable session record (`session.json`). Never contains secrets: the chain
 /// carries only `import_ref`s, never keys.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,9 +100,17 @@ impl Session {
     }
 
     /// Enforce the state machine. Failing transitions are programming errors.
+    /// Kept for compatibility; delegates to [`Session::transition_checked`].
     pub fn transition(&mut self, to: SessionState) -> Result<(), String> {
+        self.transition_checked(to).map_err(|e| e.to_string())
+    }
+
+    /// Enforce the state machine, returning a typed [`TransitionError`].
+    /// Prefer this in new code that matches on failure modes.
+    pub fn transition_checked(&mut self, to: SessionState) -> Result<(), TransitionError> {
+        let from = self.state;
         let ok = matches!(
-            (self.state, to),
+            (from, to),
             (SessionState::Validating, SessionState::Starting)
                 | (SessionState::Validating, SessionState::Failed)
                 | (SessionState::Starting, SessionState::Up)
@@ -93,10 +126,7 @@ impl Session {
             self.state = to;
             Ok(())
         } else {
-            Err(format!(
-                "illegal session transition {:?} -> {to:?}",
-                self.state
-            ))
+            Err(TransitionError { from, to })
         }
     }
 
@@ -159,7 +189,7 @@ impl SessionHandle {
             .dialer()
     }
 
-    /// Per-hop family/endpoint/status/nesting/obfuscation in declared order.
+    /// Per-hop family/endpoint/status/nesting/obfuscation/drops in declared order.
     pub fn hop_reports(&self) -> Vec<HopReport> {
         self.started
             .iter()
@@ -173,6 +203,7 @@ impl SessionHandle {
                 nested: s.nested,
                 mtu: s.inner_mtu,
                 obfuscation: s.obfuscation.clone(),
+                dropped: s.congested_drops.load(std::sync::atomic::Ordering::Relaxed),
             })
             .collect()
     }
@@ -299,6 +330,27 @@ mod tests {
         assert_eq!(s.state, SessionState::Failed);
         assert!(s.transition(SessionState::Up).is_err());
         assert!(s.transition(SessionState::Stopped).is_err());
+    }
+
+    #[test]
+    fn typed_transition_names_both_states() {
+        let mut s = session();
+        let err = s
+            .transition_checked(SessionState::Up)
+            .expect_err("validating -> up is illegal");
+        assert_eq!(
+            err,
+            TransitionError {
+                from: SessionState::Validating,
+                to: SessionState::Up,
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            "illegal session transition Validating -> Up"
+        );
+        // Compat shim renders the same message.
+        assert_eq!(s.transition(SessionState::Up).unwrap_err(), err.to_string());
     }
 
     #[test]

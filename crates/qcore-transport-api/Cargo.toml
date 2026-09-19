@@ -1,6 +1,8 @@
 [package]
 name = "qcore-transport-api"
-version.workspace = true
+# Independent versioning (constitution): 0.2.0 for the HopEvent::Congested
+# variant (#12 queue decision, #15 perf batch). Pre-publish 0.x: minor carries it.
+version = "0.2.0"
 edition.workspace = true
 license.workspace = true
 

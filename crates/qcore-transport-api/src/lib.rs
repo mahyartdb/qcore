@@ -24,10 +24,38 @@ pub struct Capabilities {
 }
 
 /// Obfuscation family. Source of truth for profile compatibility (FR-021).
+///
+/// Version window (map #7): hardening this enum (`#[non_exhaustive]` or a
+/// new variant) is a breaking change and lands only in a major version
+/// window with migration notes. Until then, matching code matches on
+/// variants (never on `Debug` strings) and `qcore-core`'s parallel
+/// [`ObfFamily`](https://github.com/QMahyar/qcore/issues/7) stays in sync
+/// via `From` impls plus a parity test — see
+/// `qcore-core/src/config/obfuscation.rs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObfuscationFamily {
     Noize,
     Awg,
+}
+
+impl ObfuscationFamily {
+    /// Canonical profile-file spelling (`family = "..."`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ObfuscationFamily::Noize => "noize",
+            ObfuscationFamily::Awg => "awg",
+        }
+    }
+
+    /// Parse a profile-file spelling; `None` names nothing (callers fail
+    /// closed naming the profile and the bad value).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "noize" => Some(ObfuscationFamily::Noize),
+            "awg" => Some(ObfuscationFamily::Awg),
+            _ => None,
+        }
+    }
 }
 
 /// Static descriptor: registry key is a string, not an enum.

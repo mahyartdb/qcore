@@ -110,6 +110,7 @@ fn hop_id_of(e: &HopEvent) -> Option<&str> {
         | HopEvent::HealthChanged { hop_id, .. }
         | HopEvent::EndpointSelected { hop_id, .. }
         | HopEvent::Failed { hop_id, .. }
+        | HopEvent::Congested { hop_id, .. }
         | HopEvent::Stopped { hop_id } => Some(hop_id),
     }
 }
@@ -131,6 +132,23 @@ mod tests {
         assert_eq!(v["kind"], "hop");
         assert_eq!(v["hop_id"], "mock-0");
         assert!(v["ts_ms"].as_u64().is_some());
+    }
+
+    #[test]
+    fn congested_event_carries_numeric_dropped_and_hop_id() {
+        // Observability hook (#12): numeric-only payload is redaction-safe
+        // by construction and `hop_id_of` covers the new variant (the
+        // exhaustive match above forces coverage at compile time).
+        let e = HopEvent::Congested {
+            hop_id: "wg-0".into(),
+            dropped: 84,
+        };
+        let line = to_ndjson(DiagEvent::Hop(&e));
+        let v: serde_json::Value = serde_json::from_str(&line).expect("one JSON doc");
+        assert_eq!(v["hop_id"], "wg-0");
+        // HopEvent serializes externally-tagged: the variant name wraps fields.
+        assert_eq!(v["payload"]["Congested"]["dropped"], 84);
+        assert!(!line.contains("\"dropped\":true"), "got: {line}");
     }
 
     #[test]

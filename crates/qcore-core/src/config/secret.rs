@@ -2,20 +2,53 @@
 //!
 //! Secrets are parsed at the boundary, held in zeroizing wrappers, and stored
 //! via the OS keyring when available with a 0600 file fallback (Unix; on
-//! Windows the fallback file inherits the directory ACLs). They are never
-//! logged, persisted unencrypted elsewhere, or passed on process argv.
+//! Windows the fallback file inherits the directory ACLs — see below). They
+//! are never logged, persisted unencrypted elsewhere, or passed on process
+//! argv.
+//!
+//! Memory (#8: `zeroize`, earliest-`drop`): [`SecretString`] derives
+//! `Zeroize`/`ZeroizeOnDrop`, and every transient plaintext copy (the `put`
+//! value, the keyring `&str` bridge, request buffers in `identity::register`
+//! and `identity::masque`) rides `Zeroizing`, so the wipe is vetted rather
+//! than hand-rolled. Transients are dropped at earliest last-use by
+//! convention; no linear-type enforcement exists without newtype churn —
+//! rejected as over-engineering.
+//!
+//! `mlock`/`VirtualLock` (#8: rejected). The file fallback is plaintext-at-
+//! rest under 0600/inherited ACLs and the tokens are low-value ephemeral;
+//! locking pages would not raise that bar, needs privileges/limits, and adds
+//! per-platform edge cases. Swap exposure is accepted and documented here.
+//!
+//! Windows ACLs (#8: no new dependency). The bar is (1) the default config
+//! dir is per-user (`%USERPROFILE%\.qcore`, inheriting user-only profile
+//! ACLs), and (2) this documented boundary: `--config` pointing at a
+//! shared/world-readable location is operator responsibility — the fallback
+//! file inherits whatever ACLs that directory carries.
+//!
+//! Filename encoding v1 (#8): account names are escaped injectively (see
+//! [`encode_account`]) so distinct accounts never share one fallback file.
+//! Files written pre-v1 keep resolving through a dual read; writes always
+//! use v1. Legacy read support drops no earlier than qcore-core 0.4.0
+//! (constitution Independent Versioning: stored-format deprecation window).
 
 use std::fmt;
 
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
+
 /// Zeroizing secret string. Zeroes on drop; never `Display`s the value.
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct SecretString {
     inner: Vec<u8>,
 }
 
 impl SecretString {
     pub fn new(s: impl Into<String>) -> Self {
+        // The `String` bridge is wiped on scope exit: `into()` moves the
+        // caller's buffer here and `Zeroizing` zeroes it on drop, so only
+        // the `Vec<u8>` copy below survives.
+        let s = Zeroizing::new(s.into());
         SecretString {
-            inner: s.into().into_bytes(),
+            inner: s.as_bytes().to_vec(),
         }
     }
 
@@ -25,15 +58,6 @@ impl SecretString {
 
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
-    }
-}
-
-impl Drop for SecretString {
-    fn drop(&mut self) {
-        for b in self.inner.iter_mut() {
-            // Volatile so the wipe is never optimized away.
-            unsafe { std::ptr::write_volatile(b, 0) };
-        }
     }
 }
 
@@ -51,6 +75,31 @@ pub struct SecretStore {
     fallback_dir: std::path::PathBuf,
 }
 
+/// v1 account-filename encoding: injective escape so distinct accounts
+/// never share one fallback file. ASCII alphanumerics and `-` pass
+/// through; `_` → `__`, `/` → `_s`, `.` → `_d`; any other char escapes
+/// per UTF-8 byte as `_xHH` (lowercase hex). Names without `_`, `/`,
+/// `.`, or exotic chars (e.g. `wg-home`) encode exactly as the legacy
+/// sanitizer did, so those files need no migration.
+pub(crate) fn encode_account(account: &str) -> String {
+    let mut out = String::with_capacity(account.len());
+    for b in account.bytes() {
+        match b {
+            b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z' | b'-' => out.push(b as char),
+            b'_' => out.push_str("__"),
+            b'/' => out.push_str("_s"),
+            b'.' => out.push_str("_d"),
+            _ => {
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                out.push_str("_x");
+                out.push(HEX[(b >> 4) as usize] as char);
+                out.push(HEX[(b & 0x0f) as usize] as char);
+            }
+        }
+    }
+    out
+}
+
 impl SecretStore {
     pub fn new(service: impl Into<String>, fallback_dir: std::path::PathBuf) -> Self {
         SecretStore {
@@ -60,7 +109,10 @@ impl SecretStore {
     }
 
     pub fn put(&self, account: &str, secret: &SecretString) -> Result<(), String> {
-        let value = String::from_utf8_lossy(secret.expose()).into_owned();
+        // Transient plaintext copy (the keyring `&str` bridge): wiped on
+        // drop via `Zeroizing` (pre-v1 this was a plain `String` that was
+        // never wiped).
+        let value = Zeroizing::new(String::from_utf8_lossy(secret.expose()).into_owned());
         if Self::put_keyring(&self.service, account, &value) {
             return Ok(());
         }
@@ -110,6 +162,16 @@ impl SecretStore {
     }
 
     fn account_path(&self, account: &str) -> std::path::PathBuf {
+        self.fallback_dir
+            .join(format!("{}.secret", encode_account(account)))
+    }
+
+    /// Pre-v1 sanitizer (many-to-one: `/`, `.`, and every other unsafe char
+    /// onto `_`). Read-only: [`SecretStore::get_file`] consults it when the
+    /// v1 name misses, so fallback files written before v1 keep resolving.
+    /// Writes always use v1; legacy read support drops no earlier than
+    /// qcore-core 0.4.0 (see module docs).
+    fn legacy_account_path(&self, account: &str) -> std::path::PathBuf {
         let safe: String = account
             .chars()
             .map(|c| {
@@ -147,9 +209,21 @@ impl SecretStore {
     }
 
     fn get_file(&self, account: &str) -> Result<SecretString, String> {
-        std::fs::read_to_string(self.account_path(account))
-            .map(SecretString::new)
-            .map_err(|e| e.to_string())
+        // Dual read across the v1 encoding window: v1 name first, legacy
+        // name on miss only. A legacy hit is returned as-is (no
+        // read-path rewrite); the next `put` consolidates onto v1.
+        match std::fs::read_to_string(self.account_path(account)) {
+            Ok(text) => Ok(SecretString::new(text)),
+            Err(current_err) => {
+                let legacy = self.legacy_account_path(account);
+                if legacy != self.account_path(account) {
+                    if let Ok(text) = std::fs::read_to_string(&legacy) {
+                        return Ok(SecretString::new(text));
+                    }
+                }
+                Err(current_err.to_string())
+            }
+        }
     }
 }
 
@@ -216,5 +290,76 @@ mod tests {
         let entries: Vec<_> = std::fs::read_dir(&dir).expect("readdir").collect();
         assert_eq!(entries.len(), 1, "cleanup created residue: {entries:?}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn account_encoding_is_injective_over_real_accounts() {
+        // Pre-v1 the sanitizer mapped `/`, `.`, and every other unsafe char
+        // onto `_`, so distinct accounts shared one fallback file. v1 must
+        // keep every real-world account apart.
+        let accounts = [
+            "warp-outer/access_token",
+            "warp-outer_access_token",
+            "warp-outer.access_token",
+            "warp-outer__access_token",
+            "warp-inner/masque_key",
+            "import/wg-home/interface.private_key",
+            "import/wg-home/interface_private_key",
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for a in accounts {
+            assert!(seen.insert(encode_account(a)), "collision for {a}");
+        }
+        // Simple names are migration-free: v1 matches the legacy file.
+        assert_eq!(encode_account("wg-home"), "wg-home");
+    }
+
+    #[test]
+    fn file_fallback_reads_legacy_then_writes_v1() {
+        let dir = std::env::temp_dir().join(format!("qcore-secret-mig-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("setup");
+        let store = SecretStore::new("qcore-test", dir.clone());
+        // v1 and legacy names differ for this account (it carries `/`, `_`).
+        assert_ne!(
+            store.account_path("warp-outer/access_token"),
+            store.legacy_account_path("warp-outer/access_token"),
+            "test needs an account the encodings disagree on"
+        );
+        // A pre-v1 file at the legacy name still resolves (dual read).
+        std::fs::write(
+            store.legacy_account_path("warp-outer/access_token"),
+            "legacy-bytes",
+        )
+        .expect("seed");
+        let back = store
+            .get_file("warp-outer/access_token")
+            .expect("legacy resolves");
+        assert_eq!(back.expose(), b"legacy-bytes");
+        // Writes land on the v1 name only; the legacy file is untouched.
+        store
+            .put_file("warp-outer/access_token", "new-bytes")
+            .expect("put");
+        assert_eq!(
+            std::fs::read_to_string(store.account_path("warp-outer/access_token"))
+                .expect("v1 written"),
+            "new-bytes"
+        );
+        assert_eq!(
+            std::fs::read_to_string(store.legacy_account_path("warp-outer/access_token"))
+                .expect("legacy intact"),
+            "legacy-bytes"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn secret_string_wipes_through_zeroize() {
+        // The wipe is the vetted `zeroize` impl, not a hand-rolled loop:
+        // `Zeroize` zeroes the buffer in place.
+        let mut s = SecretString::new("wipe-me");
+        assert_eq!(s.expose(), b"wipe-me");
+        s.zeroize();
+        assert!(s.expose().iter().all(|&b| b == 0));
     }
 }

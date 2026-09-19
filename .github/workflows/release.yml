@@ -8,9 +8,14 @@ permissions:
 
 jobs:
   # Tier C (tag): every contracted target built and smoked; publish blocked
-  # unless green. KNOWN GAP, not yet proven end-to-end: the matrix covers 3/9
-  # xtask/src/targets.toml entries (Windows only). Do not tag `v*` until the
-  # matrix is complete and a dry-run passes (AGENTS.md Release row).
+  # unless green. KNOWN GAP, not yet proven end-to-end (issue #16 triage):
+  # the matrix covers 3/9 xtask/src/targets.toml entries (Windows only).
+  # Expanding to all 9 is DEFERRED: removing/demoting targets needs a
+  # constitution amendment, and the linux/android legs need runner capacity
+  # plus a tag dry-run. Do not tag `v*` until the matrix is complete and a
+  # dry-run passes (AGENTS.md Release row). The publish job below already
+  # has checkout + toolchain + cosign installer; its remaining gap is the
+  # same unproven end-to-end run, not missing steps.
   matrix:
     strategy:
       matrix:

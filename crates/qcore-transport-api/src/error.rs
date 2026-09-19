@@ -63,6 +63,31 @@ impl HopError {
         HopError::new(HopErrorKind::Transport, Some(hop_id.into()), message)
     }
 
+    /// Backpressure signal: the per-hop bounded egress queue is full. The
+    /// frame was NOT sent and NOT dropped — the caller must retry (async
+    /// senders `await` queue space; `poll_write` parks on a waker). Kind
+    /// stays `Transport` (never a new `HopErrorKind` variant) so downstream
+    /// exhaustive matches keep compiling: a dedicated kind needs a major
+    /// version window (map #7 enum windows). The message prefix is the
+    /// machine-readable marker; see [`HopError::is_backpressure`].
+    pub fn overloaded(hop_id: impl Into<String>, message: impl Into<String>) -> Self {
+        HopError::new(
+            HopErrorKind::Transport,
+            Some(hop_id.into()),
+            format!("egress congested (backpressure; retry): {}", message.into()),
+        )
+    }
+
+    /// True for [`HopError::overloaded`] backpressure (retry), false for all
+    /// other transport failures (fail). Callers must not string-match the
+    /// free-form suffix — only this prefix is contractual.
+    pub fn is_backpressure(&self) -> bool {
+        self.kind == HopErrorKind::Transport
+            && self
+                .message
+                .starts_with("egress congested (backpressure; retry)")
+    }
+
     pub fn validation(message: impl Into<String>) -> Self {
         HopError::new(HopErrorKind::Validation, None, message)
     }
@@ -98,11 +123,35 @@ pub enum HopHealth {
 /// Push-based hop events (engine subscribes; never polls).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum HopEvent {
-    Started { hop_id: String },
-    HealthChanged { hop_id: String, health: HopHealth },
-    EndpointSelected { hop_id: String, endpoint: String },
-    Failed { hop_id: String, cause: String },
-    Stopped { hop_id: String },
+    Started {
+        hop_id: String,
+    },
+    HealthChanged {
+        hop_id: String,
+        health: HopHealth,
+    },
+    EndpointSelected {
+        hop_id: String,
+        endpoint: String,
+    },
+    Failed {
+        hop_id: String,
+        cause: String,
+    },
+    Stopped {
+        hop_id: String,
+    },
+    /// Congestion accounting (#12 queue decision): `dropped` is the
+    /// hop-local cumulative count of frames/events discarded under
+    /// congestion (stream-queue overflow, datagram lag, forwarder lag).
+    /// Numeric-only payload by construction, so diag redaction passes it
+    /// through untouched. Monotonic per hop: a receiver that itself lagged
+    /// can still observe the total. New variant (map #7): downstream
+    /// exhaustive matches must add a wildcard arm.
+    Congested {
+        hop_id: String,
+        dropped: u64,
+    },
 }
 
 /// Machine-readable failure record: failing layer + cause (SC-007).
@@ -138,5 +187,26 @@ impl fmt::Display for FailureReport {
             "layer={} hop={} kind={} cause={}",
             self.layer, self.hop_id, self.kind, self.cause
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn overloaded_is_retryable_without_new_kind() {
+        // #12/#15: backpressure rides the existing `Transport` kind (a new
+        // `HopErrorKind` variant would break downstream exhaustive matches —
+        // version-window rule). The prefix is the contract.
+        let e = HopError::overloaded("wg-0", "egress queue full");
+        assert_eq!(e.kind, HopErrorKind::Transport);
+        assert!(e.is_backpressure());
+        assert!(e.message.contains("egress queue full"));
+        // Ordinary transport failures are NOT backpressure.
+        let closed = HopError::transport("wg-0", "egress queue closed");
+        assert!(!closed.is_backpressure());
+        let other = HopError::transport("wg-0", "encapsulate: NoiseProtocol");
+        assert!(!other.is_backpressure());
     }
 }

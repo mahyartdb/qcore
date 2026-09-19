@@ -47,6 +47,12 @@ pub struct HopReport {
     pub nested: bool,
     pub mtu: u16,
     pub obfuscation: Option<String>,
+    /// Cumulative congestion drops observed for this hop (session-bus lag
+    /// counted by the hop's forwarder; WG stream/dgram drops arrive as
+    /// `Congested` events on the bus). Zero when nothing was ever dropped.
+    /// Additive field (#15): readers must ignore unknown fields, never
+    /// reject.
+    pub dropped: u64,
 }
 
 pub fn health_status(h: HopHealth) -> String {
@@ -196,6 +202,7 @@ mod tests {
                 nested: false,
                 mtu: 1500,
                 obfuscation: None,
+                dropped: 0,
             }],
             "wg-0",
         );

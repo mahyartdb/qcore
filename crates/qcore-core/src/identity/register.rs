@@ -9,6 +9,7 @@ use crate::config::secret::SecretString;
 use crate::identity::https::{request, request_with_family, HttpError, HttpMethod};
 use crate::identity::model::ProviderIdentity;
 use std::time::Duration;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Default provider base (real API host). Tests point `provider_base` at a
 /// loopback fixture double instead (test-only override, never stable CLI).
@@ -141,8 +142,10 @@ pub async fn refresh_stored(
 ) -> Result<Refreshed, RegisterError> {
     let timeout = Duration::from_secs(opts.timeout_secs.max(1));
     let url = format!("{}/reg/{}", opts.provider_base, id.device_id);
-    let token = String::from_utf8_lossy(id.access_token.expose()).into_owned();
-    let auth = format!("Bearer {token}");
+    // Transient auth buffer: wiped on drop; lives across the await because
+    // the request borrows it (earliest-`drop` = right after, by convention).
+    let token = Zeroizing::new(String::from_utf8_lossy(id.access_token.expose()).into_owned());
+    let auth = Zeroizing::new(format!("Bearer {}", token.as_str()));
     let (resp, family) = request_with_family(
         HttpMethod::Get,
         &url,
@@ -152,6 +155,8 @@ pub async fn refresh_stored(
         &opts.family,
     )
     .await?;
+    drop(auth);
+    drop(token);
     let parsed = parse_registration(resp.body_str().map_err(RegisterError::Protocol)?)?;
     Ok(Refreshed {
         interface_v4: parsed.interface_v4.clone(),
@@ -183,10 +188,13 @@ pub(crate) async fn apply_license(
 ) -> LicenseUpgrade {
     let timeout = Duration::from_secs(opts.timeout_secs.max(1));
     let url = format!("{}/reg/{}/account", opts.provider_base, id.device_id);
-    let token = String::from_utf8_lossy(id.access_token.expose()).into_owned();
-    let auth = format!("Bearer {token}");
-    let key_text = String::from_utf8_lossy(key.expose()).into_owned();
-    let body = serde_json::json!({"license": key_text}).to_string();
+    // Transient buffers (token/auth/body): `Zeroizing` so the wipe is
+    // vetted; the key copy drops pre-await (the body carries what the
+    // provider needs), the rest drop right after last use.
+    let token = Zeroizing::new(String::from_utf8_lossy(id.access_token.expose()).into_owned());
+    let auth = Zeroizing::new(format!("Bearer {}", token.as_str()));
+    let key_text = Zeroizing::new(String::from_utf8_lossy(key.expose()).into_owned());
+    let body = Zeroizing::new(serde_json::json!({"license": key_text.as_str()}).to_string());
     // Drop the plaintext copies at the earliest point (transient buffers;
     // SecretString itself zeroizes on drop).
     drop(key_text);
@@ -198,6 +206,9 @@ pub(crate) async fn apply_license(
         timeout,
     )
     .await;
+    drop(body);
+    drop(auth);
+    drop(token);
     match result {
         Ok(_) => LicenseUpgrade {
             applied: true,
@@ -291,9 +302,8 @@ fn generate_device_key() -> Result<(SecretString, String), RegisterError> {
     let engine = base64::engine::general_purpose::STANDARD;
     let private_b64 = engine.encode(sk);
     let public_b64 = engine.encode(public.as_bytes());
-    for b in sk.iter_mut() {
-        *b = 0;
-    }
+    // Vetted wipe (pre-v1 a non-volatile byte loop the optimizer could kill).
+    sk.zeroize();
     drop(secret);
     // Empty public keys are never valid — a sanity trip-wire, not secrecy.
     if public_b64.is_empty() {

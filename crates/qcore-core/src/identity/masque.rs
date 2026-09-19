@@ -10,6 +10,7 @@ use crate::identity::https::{request_with_family, HttpMethod};
 use crate::identity::model::ProviderIdentity;
 use crate::identity::register::{ProviderOptions, RegisterError};
 use std::time::Duration;
+use zeroize::Zeroizing;
 
 /// Self-issued credential: (certificate PEM public, key PEM secret).
 pub fn generate_credential() -> Result<(String, SecretString), String> {
@@ -31,8 +32,10 @@ pub async fn enroll_credential(
 ) -> Result<String, RegisterError> {
     let timeout = Duration::from_secs(opts.timeout_secs.max(1));
     let url = format!("{}/reg/{}", opts.provider_base, identity.device_id);
-    let token = String::from_utf8_lossy(identity.access_token.expose()).into_owned();
-    let auth = format!("Bearer {token}");
+    // Transient auth buffer: wiped on drop; earliest-`drop` after the await.
+    let token =
+        Zeroizing::new(String::from_utf8_lossy(identity.access_token.expose()).into_owned());
+    let auth = Zeroizing::new(format!("Bearer {}", token.as_str()));
     let body = serde_json::json!({"cert": cert_pem, "key_type": "secp256r1"}).to_string();
     let (_resp, family) = request_with_family(
         HttpMethod::Patch,
@@ -43,6 +46,8 @@ pub async fn enroll_credential(
         &opts.family,
     )
     .await?;
+    drop(auth);
+    drop(token);
     Ok(family)
 }
 

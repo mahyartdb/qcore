@@ -3036,7 +3036,7 @@ dependencies = [
 
 [[package]]
 name = "qcore-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3053,6 +3053,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "toml 0.8.23",
+ "zeroize",
 ]
 
 [[package]]
@@ -3068,7 +3069,7 @@ dependencies = [
 
 [[package]]
 name = "qcore-transport-api"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "inventory",
@@ -3110,6 +3111,7 @@ dependencies = [
  "qcore-transport-mock",
  "qcore-transports",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]

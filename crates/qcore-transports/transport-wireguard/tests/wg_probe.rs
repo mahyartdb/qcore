@@ -135,16 +135,15 @@ async fn wg_loopback_throughput_and_handshake() {
     // Warmup ladder (burst sizes known to fit loopback socket buffers;
     // a full 64K unpaced burst stalls a stall-on-loss v1 path — by design,
     // not by defect — so the bulk measurement below paces one segment
-    // per turn instead).
-    let big = vec![0xA5u8; 8192];
-    let mut big_back = vec![0u8; 8192];
+    // per turn instead). Reuses the bulk buffers; every turn is
+    // content-checked, not just counted.
     for &size in &[8usize, 1024, 8192] {
-        stream.write_all(&big[..size]).await.unwrap();
+        stream.write_all(&chunk[..size]).await.unwrap();
         let mut got = 0;
         while got < size {
             let r = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
-                stream.read(&mut big_back[got..size]),
+                stream.read(&mut back[got..size]),
             )
             .await
             .expect("read timeout")
@@ -152,6 +151,11 @@ async fn wg_loopback_throughput_and_handshake() {
             assert!(r > 0, "eof at size {size}");
             got += r;
         }
+        assert_eq!(
+            &back[..size],
+            &chunk[..size],
+            "echo mismatch at size {size}"
+        );
         eprintln!("PROBE size {size} ok");
     }
     let t0 = Instant::now();
@@ -161,10 +165,17 @@ async fn wg_loopback_throughput_and_handshake() {
         stream.write_all(&chunk[..n]).await.unwrap();
         let mut got = 0;
         while got < n {
-            let r = stream.read(&mut back[got..n]).await.unwrap();
-            assert!(r > 0);
+            let r = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                stream.read(&mut back[got..n]),
+            )
+            .await
+            .expect("bulk read timeout")
+            .unwrap();
+            assert!(r > 0, "eof in bulk transfer");
             got += r;
         }
+        assert_eq!(&back[..n], &chunk[..n], "bulk echo mismatch");
         remaining -= n;
     }
     let dt = t0.elapsed();

@@ -411,7 +411,7 @@ pub fn encode_dgram_prefixed(prefix: &[u8], payload: &[u8]) -> Vec<u8> {
 
 /// Max bytes accepted per `poll_write` call (one DATA frame).
 /// Sized for throughput, not for path MTU — measured 146 MiB/s vs 49 MiB/s
-/// for 1400 B segments on loopback (8K turns, release). The tradeoff is
+/// for 1400 B segments (loopback, 8K turns, release, i5-12400). The tradeoff is
 /// explicit: an 8.2K outer datagram fragments on 1500-MTU paths (six
 /// fragments; one lost fragment kills the datagram on a path documented as
 /// stall-on-loss) and costs ~8 MB worst-case egress queue memory per hop at

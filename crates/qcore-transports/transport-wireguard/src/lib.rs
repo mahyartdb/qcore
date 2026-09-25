@@ -306,11 +306,17 @@ impl WireguardHop {
         // Wait for handshake completion (engine wraps with its own timeout).
         // One reused scratch buffer for the retry loop, not one 64K alloc
         // per tick. The loop polls every 20 ms but retransmits at most every
-        // 200 ms: the old code slept 200 ms per iteration, flooring
-        // loopback handshakes at ~200 ms (measured 208 ms); the retransmit
-        // cadence — the only network-visible behavior — is unchanged.
+        // RETRANSMIT_INTERVAL: the old code slept 200 ms per iteration,
+        // flooring loopback handshakes at ~200 ms (measured 208 ms,
+        // i5-12400 loopback, release); the retransmit cadence — the only
+        // network-visible behavior — is unchanged.
+        const RETRANSMIT_INTERVAL: Duration = Duration::from_millis(200);
         let mut retry_dst = vec![0u8; 65535];
-        let mut last_tx = std::time::Instant::now();
+        // Backdated so the first iteration retransmits immediately, exactly
+        // like the old loop (which sent before its first 200 ms sleep).
+        let mut last_tx = std::time::Instant::now()
+            .checked_sub(RETRANSMIT_INTERVAL)
+            .unwrap_or_else(std::time::Instant::now);
         let ok = tokio::time::timeout(Duration::from_secs(15), async {
             loop {
                 {
@@ -321,7 +327,7 @@ impl WireguardHop {
                 }
                 // Retransmit initiation while unestablished (lock released
                 // before await so the pump can make progress).
-                if last_tx.elapsed() >= Duration::from_millis(200) {
+                if last_tx.elapsed() >= RETRANSMIT_INTERVAL {
                     let retry: Option<Vec<u8>> = {
                         let mut tunnel = inner.tunnel.lock().unwrap();
                         match tunnel.encapsulate(&[], &mut retry_dst) {

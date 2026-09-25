@@ -305,8 +305,12 @@ impl WireguardHop {
 
         // Wait for handshake completion (engine wraps with its own timeout).
         // One reused scratch buffer for the retry loop, not one 64K alloc
-        // per 200 ms tick (#15).
+        // per tick. The loop polls every 20 ms but retransmits at most every
+        // 200 ms: the old code slept 200 ms per iteration, flooring
+        // loopback handshakes at ~200 ms (measured 208 ms); the retransmit
+        // cadence — the only network-visible behavior — is unchanged.
         let mut retry_dst = vec![0u8; 65535];
+        let mut last_tx = std::time::Instant::now();
         let ok = tokio::time::timeout(Duration::from_secs(15), async {
             loop {
                 {
@@ -317,18 +321,21 @@ impl WireguardHop {
                 }
                 // Retransmit initiation while unestablished (lock released
                 // before await so the pump can make progress).
-                let retry: Option<Vec<u8>> = {
-                    let mut tunnel = inner.tunnel.lock().unwrap();
-                    match tunnel.encapsulate(&[], &mut retry_dst) {
-                        TunnResult::WriteToNetwork(packet) => Some(packet.to_vec()),
-                        _ => None,
+                if last_tx.elapsed() >= Duration::from_millis(200) {
+                    let retry: Option<Vec<u8>> = {
+                        let mut tunnel = inner.tunnel.lock().unwrap();
+                        match tunnel.encapsulate(&[], &mut retry_dst) {
+                            TunnResult::WriteToNetwork(packet) => Some(packet.to_vec()),
+                            _ => None,
+                        }
+                    };
+                    if let Some(packet) = retry {
+                        let peer = *inner.peer.read().unwrap();
+                        inner.udp.send_to(&packet, peer).await.ok();
                     }
-                };
-                if let Some(packet) = retry {
-                    let peer = *inner.peer.read().unwrap();
-                    inner.udp.send_to(&packet, peer).await.ok();
+                    last_tx = std::time::Instant::now();
                 }
-                tokio::time::sleep(Duration::from_millis(200)).await;
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
         })
         .await
@@ -480,17 +487,20 @@ async fn pump_loop(
                         drop(tunnel);
                         // Roaming: a valid packet from a new source moves the peer.
                         *inner.peer.write().unwrap() = src;
-                        // Single copy (#15): strip the envelope in place and
-                        // copy only the inner frame — the old code copied
-                        // `data` to `frame` first, then the inner frame again.
+                        // Single copy on ingress: the frame is copied out of the
+                        // reused decrypt buffer once, then handed to dispatch
+                        // by value — `Bytes::from` reuses that allocation and
+                        // slices the header by refcount (was two copies).
+                        // Non-channel packets (a TUN integration would route
+                        // these) are skipped, never dispatched.
                         let Some(inner_frame) = stream::unwrap_ip(data) else {
                             continue;
                         };
+                        let inner_frame = inner_frame.to_vec();
                         if std::env::var("QCORE_WG_TRACE").is_ok() {
                             eprintln!("[wg-pump] tunnel-data {}B type={:02x}", data.len(), data.first().copied().unwrap_or(0));
                         }
-                        let inner_frame = inner_frame.to_vec();
-                        if let Err(e) = stream::dispatch(&inner.streams, &inner_frame) {
+                        if let Err(e) = stream::dispatch(&inner.streams, inner_frame) {
                             let _ = events.send(HopEvent::Failed { hop_id: hop_id.clone(), cause: e });
                         }
                     }
@@ -574,6 +584,7 @@ impl Dialer for WgDialer {
                 inner: self.inner.clone(),
             }),
             dst,
+            prefix: stream::dgram_prefix(&dst),
             rx: tokio::sync::Mutex::new(self.inner.streams.subscribe_dgrams()),
         }))
     }
@@ -593,6 +604,9 @@ struct WgUdpFlow {
     inner: Arc<HopInner>,
     send: stream::SendFrame,
     dst: SocketAddr,
+    /// Pre-encoded datagram header (flow is dst-bound; see
+    /// [`stream::dgram_prefix`]).
+    prefix: Vec<u8>,
     rx: tokio::sync::Mutex<tokio::sync::broadcast::Receiver<(Vec<u8>, SocketAddr)>>,
 }
 
@@ -605,7 +619,7 @@ impl UdpFlow for WgUdpFlow {
                 "wireguard flow is bound to its dial destination",
             ));
         }
-        let frame = stream::encode_dgram(&self.dst, buf);
+        let frame = stream::encode_dgram_prefixed(&self.prefix, buf);
         // Async send awaits queue space: datagram senders get backpressure,
         // never unbounded growth (#12).
         self.send.send_frame(frame).await
@@ -806,15 +820,16 @@ mod tests {
             inner: inner.clone(),
             send: Arc::new(egress_tx(&inner)),
             dst: dst_b,
+            prefix: stream::dgram_prefix(&dst_b),
             rx: tokio::sync::Mutex::new(inner.streams.subscribe_dgrams()),
         };
         // Overflow the 256-cap fan-out with non-matching datagrams, then
         // deliver one matching datagram inside the surviving window.
         for _ in 0..300 {
-            stream::dispatch(&inner.streams, &stream::encode_dgram(&dst_a, b"noise"))
+            stream::dispatch(&inner.streams, stream::encode_dgram(&dst_a, b"noise"))
                 .expect("dispatches");
         }
-        stream::dispatch(&inner.streams, &stream::encode_dgram(&dst_b, b"hi")).expect("dispatches");
+        stream::dispatch(&inner.streams, stream::encode_dgram(&dst_b, b"hi")).expect("dispatches");
         let mut buf = [0u8; 64];
         let (n, from) = tokio::time::timeout(Duration::from_secs(2), flow.recv_from(&mut buf))
             .await

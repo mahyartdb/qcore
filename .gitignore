@@ -27,3 +27,6 @@ identity-*.toml
 *.tmp
 .DS_Store
 Thumbs.db
+
+# Local agent tooling (per-user skills, commands, plugins — never commit)
+.opencode/

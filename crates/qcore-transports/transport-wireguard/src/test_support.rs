@@ -39,7 +39,12 @@ impl WgResponder {
             None,
         )));
         let task = tokio::spawn(async move {
+            // Reused buffers, allocated once per responder — never per
+            // packet (the old loop zeroed three 64K buffers per datagram,
+            // adding noise to loopback timing gates).
             let mut buf = vec![0u8; 65535];
+            let mut plain = vec![0u8; 65535];
+            let mut enc = vec![0u8; 65535];
             loop {
                 let Ok((n, src)) = udp.recv_from(&mut buf).await else {
                     break;
@@ -47,7 +52,6 @@ impl WgResponder {
                 if std::env::var("QCORE_WG_TRACE").is_ok() {
                     eprintln!("[wg-resp] recv {n}B head={:02x?}", &buf[..n.min(12)]);
                 }
-                let mut plain = vec![0u8; 65535];
                 let action = {
                     let mut tunnel = tunnel.lock().unwrap();
                     match tunnel.decapsulate(Some(src.ip()), &buf[..n], &mut plain) {
@@ -58,7 +62,6 @@ impl WgResponder {
                             }
                             let reply = echo_frame(data);
                             // Re-encrypt the echo through the same tunnel.
-                            let mut enc = vec![0u8; 65535];
                             match tunnel.encapsulate(&reply, &mut enc) {
                                 TunnResult::WriteToNetwork(packet) => Some(packet.to_vec()),
                                 _ => None,

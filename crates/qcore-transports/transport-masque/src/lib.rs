@@ -357,10 +357,18 @@ impl Dialer for H3Dialer {
     }
 
     async fn dial_udp(&self, dst: SocketAddr) -> Result<Box<dyn UdpFlow>, HopError> {
+        // The flow is bound to `dst` (send_to rejects anything else), so
+        // the length-prefixed destination header is encoded once here —
+        // not formatted per datagram on the hot path.
+        let dst_s = dst.to_string();
+        let mut prefix = Vec::with_capacity(1 + dst_s.len());
+        prefix.push(dst_s.len() as u8);
+        prefix.extend_from_slice(dst_s.as_bytes());
         Ok(Box::new(QuicDgrams {
             hop_id: self.hop_id.clone(),
             conn: self.conn.clone(),
             dst,
+            prefix,
             local: self.local,
         }))
     }
@@ -427,6 +435,8 @@ struct QuicDgrams {
     hop_id: String,
     conn: quinn::Connection,
     dst: SocketAddr,
+    /// Pre-encoded `[len u8][dst]` datagram header (flow is dst-bound).
+    prefix: Vec<u8>,
     local: SocketAddr,
 }
 
@@ -439,10 +449,8 @@ impl UdpFlow for QuicDgrams {
                 "masque datagram flow is bound to its dial destination",
             ));
         }
-        let dst_s = dst.to_string();
-        let mut frame = Vec::with_capacity(1 + dst_s.len() + buf.len());
-        frame.push(dst_s.len() as u8);
-        frame.extend_from_slice(dst_s.as_bytes());
+        let mut frame = Vec::with_capacity(self.prefix.len() + buf.len());
+        frame.extend_from_slice(&self.prefix);
         frame.extend_from_slice(buf);
         self.conn
             .send_datagram(Bytes::from(frame))

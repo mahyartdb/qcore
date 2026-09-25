@@ -1,19 +1,13 @@
 <!--
 Sync Impact Report
-- Version change: 1.0.0 -> 1.1.0
-- Modified principles:
-  - I. Protocol-Agnostic Transport Core (expanded: plugin OR managed sidecar)
-  - II. Dual-Stack Parity (scope aligned: harness requirement added; the
-        resolver/NAT-traversal parity claim replaced by socket setup, endpoint
-        resolution, routing/AllowedIPs, resolver transport, and MTU)
-  - V. Observable, Reproducible Behavior (scanning non-determinism made explicit)
+- Version change: 1.1.0 -> 1.2.0
+- Modified principles: none
 - Added sections/clauses:
-  - Development Workflow: Release Integrity, Independent Versioning,
-    Platform Parity & Target List, Consolidation Bias, Dual-Stack Harness,
-    Secret-Scan Scope
-  - Security: Sidecar Trust Boundary
+  - VII. Measured Performance (measurement-led optimization, regression-gate
+    discipline, release metric tracking)
 - Removed sections: none
-- Follow-up TODOs: none (RATIFICATION_DATE retained as 2026-09-14)
+- Follow-up TODOs: record first release-metric baselines (binary size, peak
+  session memory, clean build time) alongside this ratification
 - Direction honored: no license/legal-grant language was added.
 -->
 
@@ -91,6 +85,27 @@ state, emitted config), not internal wiring. The conformance suite SHOULD be
 generated from the transport registry so every registered transport inherits it.
 Regressions in address-family parity, chaining, or secret redaction MUST be covered
 by tests.
+
+### VII. Measured Performance
+
+Throughput, latency, binary size, and memory footprint are user-visible
+behavior. A change justified by performance MUST include its baseline and
+post-change measurements taken with the same profile, payload, and harness;
+allocator-level or concurrency-level changes to a hot path MUST cite a profile
+attributing cost to that path. Unmeasured optimization MUST NOT land.
+
+Performance gates in the test suite (throughput ratios, setup budgets) are
+regression guards with explicit margins, not benchmarks: they MUST NOT be
+tightened to the edge of a single machine's noise, and absolute benchmark
+figures are informational, recorded with hardware, build profile, and payload.
+Binary size, peak session memory, and clean build time are tracked release
+metrics; unexpected regressions MUST be explained in the change description
+like any added complexity.
+
+Rationale: unmeasured "optimizations" routinely trade one hidden cost for
+another — fewer allocations for more copies, lower latency for more
+retransmits — and in a VPN core those trades reach the user as speed, battery,
+or reliability regressions.
 
 ## Security & Compliance Constraints
 
@@ -173,4 +188,4 @@ by tests.
   MUST stay consistent with this constitution; it MUST record the build, test,
   release, and target-list commands.
 
-**Version**: 1.1.0 | **Ratified**: 2026-09-14 | **Last Amended**: 2026-09-14
+**Version**: 1.2.0 | **Ratified**: 2026-09-14 | **Last Amended**: 2026-09-25

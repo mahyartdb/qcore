@@ -161,13 +161,22 @@ impl UdpFlow for RelayFlow {
                 format!("peer framed {len} exceeding {MAX_DATAGRAM}"),
             ));
         }
-        let mut payload = vec![0u8; len];
-        stream
-            .read_exact(&mut payload)
-            .await
-            .map_err(|e| HopError::transport(self.hop_id.clone(), format!("relay recv: {e}")))?;
         let k = len.min(buf.len());
-        buf[..k].copy_from_slice(&payload[..k]);
+        if len <= buf.len() {
+            // Fast path: frame directly into the caller's buffer — no
+            // temporary allocation and no second copy per datagram.
+            stream.read_exact(&mut buf[..len]).await.map_err(|e| {
+                HopError::transport(self.hop_id.clone(), format!("relay recv: {e}"))
+            })?;
+        } else {
+            // Truncation path (caller buffer smaller than the datagram):
+            // stage then copy the prefix.
+            let mut payload = vec![0u8; len];
+            stream.read_exact(&mut payload).await.map_err(|e| {
+                HopError::transport(self.hop_id.clone(), format!("relay recv: {e}"))
+            })?;
+            buf[..k].copy_from_slice(&payload[..k]);
+        }
         Ok((k, self.dst))
     }
 

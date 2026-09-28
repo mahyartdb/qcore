@@ -32,7 +32,7 @@ Spec tasks T001-T094 (001) and T001-T037 (002) are all complete; this file route
 
 | File | Decides |
 |---|---|
-| `.specify/memory/constitution.md` | Non-negotiables (I–VI), security constraints, workflow gates |
+| `.specify/memory/constitution.md` | Non-negotiables (I–VII), security constraints, workflow gates |
 | `specs/001-multi-protocol-vpn/spec.md` | FR-001–FR-029, SC-001–SC-008, edge cases, presets, tiers, emergency path |
 | `specs/001-multi-protocol-vpn/plan.md` | Architecture, plugin boundary, release pipeline, arena resolutions |
 | `specs/001-multi-protocol-vpn/tasks.md` | T001–T094 status + audit adjudications in Notes |

@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 /// Generate a fresh keypair via the OS RNG. Returns (secret, public).
 pub fn generate_keypair() -> ([u8; 32], [u8; 32]) {
     let mut sk = [0u8; 32];
-    getrandom::getrandom(&mut sk).expect("rng");
+    getrandom::fill(&mut sk).expect("rng");
     let secret = boringtun::x25519::StaticSecret::from(sk);
     let public = boringtun::x25519::PublicKey::from(&secret);
     (*secret.as_bytes(), *public.as_bytes())

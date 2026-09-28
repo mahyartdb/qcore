@@ -13,7 +13,7 @@
 //! wins; the loser fails closed.
 
 use crate::config::profile_dir::ProfileDirs;
-use crate::config::secret::{SecretStore, SecretString};
+use crate::config::secret::{namespace_hash, namespace_input, SecretStore, SecretString};
 use crate::identity::model::{MasqueCredential, ProviderIdentity};
 use serde::{Deserialize, Serialize};
 
@@ -55,45 +55,12 @@ pub(crate) fn role_name(role: IdentityRole) -> &'static str {
     }
 }
 fn secret_store(dirs: &ProfileDirs) -> SecretStore {
-    // Per-dir service namespace: temp test dirs, parallel profiles, and the
-    // real profile never collide in a shared OS keyring. Stable FNV-1a —
-    // NOT DefaultHasher, whose output is explicitly unstable across
-    // releases and would silently orphan the namespace (forced
-    // re-registration) on toolchain upgrades. FNV-1a is only an opaque
-    // bucket label (the keyring ACLs are the security boundary), so a
-    // non-cryptographic hash is sufficient; determinism is the requirement.
+    // Per-dir service namespace (shared FNV-1a helpers in
+    // `crate::config::secret`, also used by the import store): temp test
+    // dirs, parallel profiles, and the real profile never collide in a
+    // shared OS keyring.
     let h = namespace_hash(&namespace_input(dirs));
     SecretStore::new(format!("qcore-identity-{h:016x}"), dirs.config_dir.clone())
-}
-
-/// Canonical bytes hashed for the keyring service namespace: separators
-/// normalized to `/`, trailing separators trimmed (drive roots kept), and —
-/// on Windows only — ASCII-lowercased, because the filesystem is
-/// case-insensitive there and `Profile` vs `PROFILE` are one directory.
-/// Byte-level over the raw OS encoding, never `to_string_lossy`: distinct
-/// paths must never collapse onto one namespace via U+FFFD substitution.
-fn namespace_input(dirs: &ProfileDirs) -> Vec<u8> {
-    let raw = dirs.config_dir.as_os_str().as_encoded_bytes();
-    let mut out = Vec::with_capacity(raw.len());
-    for &b in raw {
-        out.push(if b == b'\\' { b'/' } else { b });
-    }
-    while out.len() > 1 && out.ends_with(b"/") && !out.ends_with(b":/") {
-        out.pop();
-    }
-    #[cfg(windows)]
-    out.make_ascii_lowercase();
-    out
-}
-
-/// Stable 64-bit FNV-1a (see [`secret_store`]).
-fn namespace_hash(s: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for &b in s {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    h
 }
 
 /// Pre-FNV service namespace (master): `DefaultHasher` over the lossy path.

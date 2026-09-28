@@ -10,6 +10,14 @@ use qcore::{api::EngineConfig, session::report::ConnectionReport, Engine, Prefli
 
 #[tokio::main]
 async fn main() {
+    // Optional `hold <secs>`: keep the session up that long (polling status
+    // once per second) before stopping, so a sustained-session peak can be
+    // sampled externally (see docs/perf-baselines.md). Default 0 preserves
+    // the original start→status→stop lifecycle.
+    let hold_secs: u64 = std::env::args()
+        .nth(1)
+        .and_then(|a| a.parse().ok())
+        .unwrap_or(0);
     let work = std::env::temp_dir().join("qcore-embed-host");
     let _ = std::fs::remove_dir_all(&work);
     let dirs = qcore::config::profile_dir::ProfileDirs::resolve(
@@ -59,6 +67,11 @@ async fn main() {
 
     let status = engine.status();
     eprintln!("status: {status:?}");
+
+    for _ in 0..hold_secs {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let _ = engine.status();
+    }
 
     handle.stop_all().await.expect("session stops cleanly");
     let _ = probe.await;

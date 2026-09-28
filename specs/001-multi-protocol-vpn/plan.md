@@ -294,7 +294,7 @@ signing, provenance, and the flow.
 |---|---|---|
 | `windows-2022` | `i686-pc-windows-msvc`, `x86_64-pc-windows-msvc` | CLI `.zip`, `.dll` |
 | `windows-11-arm` | `aarch64-pc-windows-msvc` | CLI `.zip`, `.dll` |
-| `ubuntu-22.04` + `cross` | `x86_64`/`i686`/`aarch64`/`armv7` linux (gnu + musl) | CLI `.tar.gz`, `.so` |
+| `ubuntu-22.04` + `cross` | `x86_64`/`i686`/`aarch64`/`armv7` linux (gnu; musl libc variant future — see `xtask/src/targets.toml:1-4`) | CLI `.tar.gz`, `.so` |
 | `ubuntu-22.04` + `cargo-ndk` | `aarch64-linux-android`, `armv7-linux-androideabi` | Termux CLI + `libqcore.so` |
 
 With a single TLS provider there are no per-target crypto exceptions.

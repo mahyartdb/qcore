@@ -2,10 +2,12 @@
 //!
 //! - Windows MSVC targets (`i686`/`x86_64`/`aarch64-pc-windows-msvc`) build on
 //!   native `windows-2022` / `windows-11-arm` runners: cross-rs cannot target MSVC.
-//! - Linux `x86_64`/`i686`/`aarch64`/`armv7` (gnu + musl) build under `cross-rs`.
+//! - Linux `x86_64`/`i686`/`aarch64`/`armv7` (gnu; musl is a libc variant, not a
+//!   separate target — see `targets.toml:1-4`, unbuilt: future) build under `cross-rs`.
 //! - Android `aarch64-linux-android` / `armv7-linux-androideabi` build under
 //!   `cargo-ndk`.
-//! - Static musl variants build under `cargo-zigbuild`.
+//! - Static musl libc-variant builds (future — no musl triple in `targets.toml`)
+//!   build under `cargo-zigbuild`.
 //!
 //! CI shells out to these tools with the pinned invocations below; `xtask build`
 //! selects the backend from the target triple in `targets.toml`.

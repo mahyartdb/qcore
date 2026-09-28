@@ -51,7 +51,7 @@ transport, kind `psiphon`. `GOOL` = preset `gool` = two `wireguard peer=warp` ho
 - Q: How should the Psiphon hop be implemented given there is no Rust Psiphon library and the spec forbids running non-Rust tunnel engines? → A: Treat the Psiphon client as an external hop process exposing a local proxy; the Rust core dials it. Relax FR-001 to allow this one sidecar.
 - Q: What interface should the first release ship: CLI, desktop GUI, or both? → A: Pure CLI over an embeddable engine core. No GUI. The core must be consumable by other apps (Aether, Xray, sing-box-like hosts).
 - Q: What embedding surface should the engine expose so other apps (including Go hosts like Xray/sing-box) can use it? → A: Rust crate + C ABI (cdylib): Rust hosts link directly, Go/C hosts link via cgo/FFI.
-- Q: Which platforms/architectures must the CLI support? → A: All of Windows x86/x64/ARM64, Linux (x86/x64/ARM/ARM64), and Android (ARM/ARM64). Windows 32-bit ARM is dropped (end-of-life, no usable Rust target). Android CLI runs in Termux as an Android-target or static-musl binary; in-app embedding uses the C ABI/JNI.
+- Q: Which platforms/architectures must the CLI support? → A: All of Windows x86/x64/ARM64, Linux (x86/x64/ARM/ARM64), and Android (ARM/ARM64). Windows 32-bit ARM is dropped (end-of-life, no usable Rust target). Android CLI runs in Termux as an Android-target binary (a static-musl libc variant would be future work — musl is a variant, not a separate target; see `xtask/src/targets.toml:1-4`); in-app embedding uses the C ABI/JNI.
 - Q: What is the maximum chain nesting depth? → A: 3 tunnel layers. GOOL and MIM each consume 2 layers because they are themselves tunnel-in-tunnel; so GOOL alone leaves room for one more hop, and GOOL-in-GOOL or GOOL+MIM (4 layers) is rejected. *(Superseded by the preset model in the next answer and FR-010a: depth is counted in hops after preset expansion; no layer-cost field exists.)*
 - Q: How are GOOL, MIM, and the WireGuard family modeled after plan refinement? → A: GOOL and MIM are chain composition presets (`wireguard,wireguard` / `masque,masque`), not transports. Transport kinds are `wireguard` (WARP, imported, AmneziaWG modes), `masque` (h2/h3 via ALPN), `tor`, `psiphon`. Depth is plain hop counting after preset expansion; the "costs 2 layers" special case is removed.
 - Q: How is the FR-008 (Tor-in-WARP must work) vs Edge-Case (Tor is TCP-only, so a UDP hop after it is rejected) contradiction resolved? → A: Add a first-class registered `relay` adapter hop (UDP-over-TCP framing). A bare `tor,wireguard` chain is rejected with the insertion named; the shipped `tor-warp` preset includes the relay, so Tor-first chains are valid.
@@ -494,7 +494,8 @@ low-level parameters.
 - **Tier A (every PR):** native host unit/contract tests, lint, secret scan, and a
   smoke test of the native artifact against the stub peer.
 - **Tier B (nightly + main):** the broad cross-build matrix and stub-peer smoke for
-  Linux gnu/musl/armv7, Windows ARM64, and Android.
+  Linux gnu/armv7, Windows ARM64, and Android (musl is a libc variant of a Linux
+  target, not a separate target — see `xtask/src/targets.toml:1-4`; unbuilt: future).
 - **Tier C (pre-release/tag):** every listed target built and smoke-tested; publish
   is blocked unless the entire Tier C matrix is green.
 

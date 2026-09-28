@@ -31,7 +31,7 @@ Decision / Rationale / Alternatives considered.
   (FR-010/FR-027).
 - **Alternatives**: the original `Hop` trait returning a concrete `TcpStream` with
   `&mut self` lifecycle (unimplementable nesting; forces locks); a full route graph
-  (chains are linear); `dlopen` plugins (breaks Android/static-musl).
+  (chains are linear); `dlopen` plugins (breaks Android/static-musl libc-variant builds).
 - **Constraint rules enforced at build time**: UDP-only-after-TCP-only rejected
   unless the registered `relay` adapter is present (the `tor-warp` preset includes
   it); port conflicts rejected (ephemeral `:0` for internal listeners); cycles
@@ -103,7 +103,8 @@ Decision / Rationale / Alternatives considered.
 - **Decision**: `quinn` + `rustls`/`ring` + `h2` is the single provider.
 - **Rationale**: `quiche` pulls a BoringSSL native build (cmake + perl + nasm)
   that fails on `i686-pc-windows-msvc` and complicates the Android NDK and
-  static-musl targets — the exact highest-risk targets the spike named. `quinn`
+  static-musl libc-variant builds (future — no musl triple in `targets.toml`;
+  see `targets.toml:1-4`) — the exact highest-risk configurations the spike named. `quinn`
   is pure Rust and builds on all 9 targets including 32-bit Windows and
   `armv7-linux-androideabi`. One provider ships per R4.
 - **Re-verification**: if `quiche` gains hermetic prebuilt BoringSSL for all 9
@@ -171,7 +172,8 @@ Decision / Rationale / Alternatives considered.
 - **Decision**: A `cargo xtask` lever (build|smoke|package|release|abi-diff) that CI
   is a thin shell over, so a reviewer can rerun the exact steps. Build matrix:
   native MSVC runners for Windows x86/x64/ARM64; `cross-rs` for Linux
-  x86/x64/ARM/ARM64; `cargo-ndk` for Android; `cargo-zigbuild` for static musl.
+  x86/x64/ARM/ARM64; `cargo-ndk` for Android; `cargo-zigbuild` for a static-musl
+  libc variant (future — no musl triple in `targets.toml`; see `targets.toml:1-4`).
   Each target gets a deterministic offline smoke test (SC-002a).
 - **Rationale**: Windows MSVC cannot be cross-built by cross-rs, so native runners
   are required. Android and Linux ARM are cleanest under cross-rs/cargo-ndk. The
@@ -257,7 +259,8 @@ Decision / Rationale / Alternatives considered.
 
 - **Decision**: Tier A (every PR): native host unit/contract, lint, secret scan,
   native stub-peer smoke. Tier B (nightly + main): broad cross matrix + stub-peer
-  smoke (Linux gnu/musl/armv7, Windows ARM64, Android). Tier C (tag): every listed
+  smoke (Linux gnu/armv7, Windows ARM64, Android; musl as libc variant only,
+  future — see `xtask/src/targets.toml:1-4`). Tier C (tag): every listed
   target built and smoked; publish blocked unless Tier C is fully green.
 - **Rationale**: Mirrors rustc's tier model and ripgrep's matrix; keeps PRs cheap
   while guaranteeing 100% coverage before publish. Runner classes `ubuntu-*-arm` and

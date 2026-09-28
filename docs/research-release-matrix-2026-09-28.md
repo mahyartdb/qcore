@@ -61,7 +61,7 @@ Local repo declares 9 triples authoritative but proves 3/9 Windows-only in `rele
 ### 7. Doc/code mismatches to close
 
 **Fact** — musl variants in `build.rs:5,23-24`, `plan.md:297`, Tier B gnu/musl have zero triples in `targets.toml`. Sources: [L1].
-**Fact** — Constitution header `:2-12` + footer `:191` v1.2.0 (2026-09-14/2026-09-25) while `AGENTS.md:9` still cites v1.1.0. Sources: [L1].
+**Fact (resolved after this note was written)** — Constitution header `:2-12` + footer `:191` v1.2.0 (2026-09-14/2026-09-25) vs `AGENTS.md:9` citing v1.1.0. Fixed by PR #22 (doc-map-vii): `AGENTS.md:9` now cites v1.2.0. Sources: [L1].
 **Assumption** — Issue #16 triage details live outside repo (no local copy found); gap wording sourced from `release.yml:11` + `AGENTS.md:27` only. Needs validation against tracker.
 
 ## Contradictions / uncertainty

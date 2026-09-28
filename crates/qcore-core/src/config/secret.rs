@@ -179,8 +179,8 @@ impl SecretStore {
     /// are silently ignored (leftovers are inert — loads prefer the current
     /// namespace).
     pub fn delete_keyring(&self, account: &str) {
-        if let Ok(entry) = keyring::Entry::new(&self.service, account) {
-            let _ = entry.delete_credential();
+        if let Ok(entry) = Self::keyring_retry(|| keyring::Entry::new(&self.service, account)) {
+            let _ = Self::keyring_retry(|| entry.delete_credential());
         }
     }
 

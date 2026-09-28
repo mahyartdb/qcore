@@ -487,6 +487,15 @@ pub fn store_import(dirs: &ProfileDirs, imp: &ConfigImport) -> Result<String, St
             .put(&format!("import/{name}/{field}"), secret)
             .map_err(|e| format!("secret store: {e}"))?;
     }
+    // Migration hygiene: the secrets now live under the current namespace.
+    // Drop any legacy-namespace keyring copies (keyring only — the file
+    // fallback is namespace-independent and shared, so files stay).
+    // Failures are silently ignored (leftovers are inert — loads prefer
+    // the current namespace).
+    let legacy = legacy_secret_store(dirs);
+    for field in imp.secrets.keys() {
+        legacy.delete_keyring(&format!("import/{name}/{field}"));
+    }
     Ok(name)
 }
 

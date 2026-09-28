@@ -9,7 +9,7 @@ use transport_masque::test_support::{H2Responder, QuinnResponder};
 
 fn cert() -> (Vec<u8>, Vec<u8>) {
     let key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-    (key.cert.der().to_vec(), key.key_pair.serialize_der())
+    (key.cert.der().to_vec(), key.signing_key.serialize_der())
 }
 
 fn cfg_for(alpn: &str, endpoint: std::net::SocketAddr) -> HopConfig {

@@ -18,7 +18,7 @@ pub fn generate_credential() -> Result<(String, SecretString), String> {
         .map_err(|e| format!("credential generation failed: {e}"))?;
     Ok((
         key.cert.pem(),
-        SecretString::new(key.key_pair.serialize_pem()),
+        SecretString::new(key.signing_key.serialize_pem()),
     ))
 }
 

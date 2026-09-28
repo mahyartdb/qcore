@@ -20,7 +20,7 @@ qcore-ffi = { version = "0.1.0", path = "../../crates/qcore-ffi" }
 base64 = { workspace = true }
 
 [dev-dependencies]
-rcgen = "0.13"
+rcgen = "0.14"
 
 [[test]]
 name = "matrix_generated"

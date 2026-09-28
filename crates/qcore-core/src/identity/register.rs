@@ -294,7 +294,7 @@ fn parse_registration(body: &str) -> Result<ParsedRegistration, RegisterError> {
 /// Returns (base64 secret, base64 public).
 fn generate_device_key() -> Result<(SecretString, String), RegisterError> {
     let mut sk = [0u8; 32];
-    getrandom::getrandom(&mut sk)
+    getrandom::fill(&mut sk)
         .map_err(|e| RegisterError::Blocked(format!("no OS randomness: {e}")))?;
     let secret = boringtun::x25519::StaticSecret::from(sk);
     let public = boringtun::x25519::PublicKey::from(&secret);
@@ -330,7 +330,7 @@ fn registration_body(public_key_b64: &str) -> String {
 /// epoch → civil date (Hinnant's algorithm).
 fn device_fingerprint() -> (String, String) {
     let mut rnd = [0u8; 8];
-    if getrandom::getrandom(&mut rnd).is_err() {
+    if getrandom::fill(&mut rnd).is_err() {
         rnd = [0x51u8; 8];
     }
     let serial: String = rnd.iter().map(|b| format!("{b:02x}")).collect();

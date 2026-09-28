@@ -30,3 +30,5 @@ Thumbs.db
 
 # Local agent tooling (per-user skills, commands, plugins — never commit)
 .opencode/
+.planning/
+.scratch/

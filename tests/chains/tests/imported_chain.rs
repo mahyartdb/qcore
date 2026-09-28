@@ -149,14 +149,9 @@ fn warp_and_personal_validate_both_orders_with_last_hop_exit() {
     let (s_sk, s_pk) = generate_keypair();
     let endpoint = "127.0.0.1:51820";
     let _ = (s_sk, c_pk);
-    // NOTE: filename (hence import ref) must stay unique per test in this
-    // binary: refs share the constant `qcore-imports` OS-keyring service, so
-    // two tests importing `wg-home.conf` would race on one keyring account
-    // (put succeeds via keyring with no file fallback, racy get misses both
-    // backends). The async test above owns `wg-home`; this one uses its own.
     let r = import_conf(
         &dir,
-        "wg-home-orders.conf",
+        "wg-home.conf",
         &conf_text(&b64(&c_sk), &b64(&s_pk), endpoint, false),
     );
     let engine = engine_in(&dir);

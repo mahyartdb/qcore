@@ -18,7 +18,7 @@
 
 use crate::chain::ChainError;
 use crate::config::profile_dir::ProfileDirs;
-use crate::config::secret::{SecretStore, SecretString};
+use crate::config::secret::{namespace_hash, namespace_input, SecretStore, SecretString};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
@@ -424,8 +424,37 @@ pub(crate) fn import_path(dirs: &ProfileDirs, import_ref: &str) -> Result<PathBu
     Ok(imports_dir(dirs).join(format!("{import_ref}.toml")))
 }
 
+/// Per-dir secret namespace (same FNV-1a scheme as the identity store in
+/// `crate::identity::store`): parallel test dirs and parallel profiles never
+/// share keyring accounts, so concurrent imports of same-named refs cannot
+/// race on one entry. New saves always go to the current namespace; reads
+/// fall back to the pre-namespace `qcore-imports` service (miss only, never
+/// on empty — mirroring the identity legacy contract).
 fn secret_store(dirs: &ProfileDirs) -> SecretStore {
+    let h = namespace_hash(&namespace_input(dirs));
+    SecretStore::new(
+        format!("qcore-imports-{h:016x}"),
+        dirs.config_dir.join("secrets"),
+    )
+}
+
+fn legacy_secret_store(dirs: &ProfileDirs) -> SecretStore {
     SecretStore::new("qcore-imports", dirs.config_dir.join("secrets"))
+}
+
+/// Resolve one import secret: current namespace first, legacy namespace on
+/// miss only.
+fn get_import_secret(
+    store: &SecretStore,
+    legacy: &SecretStore,
+    import_ref: &str,
+    field: &str,
+) -> Result<SecretString, String> {
+    let account = format!("import/{import_ref}/{field}");
+    match store.get(&account) {
+        Err(_) => legacy.get(&account),
+        ok => ok,
+    }
 }
 
 /// Persist a parsed + accepted import. Returns the stored ref (suffixed on
@@ -645,9 +674,10 @@ pub fn load_import(
         .map_err(|_| format!("unknown import `{import_ref}` (see `qcore import`)"))?;
     let stored = StoredImport::from_toml(&text)?;
     let store = secret_store(dirs);
+    let legacy = legacy_secret_store(dirs);
     let mut secrets = BTreeMap::new();
     // PrivateKey is always required for a usable import.
-    match store.get(&format!("import/{import_ref}/interface.private_key")) {
+    match get_import_secret(&store, &legacy, import_ref, "interface.private_key") {
         Ok(s) => {
             secrets.insert("interface.private_key".to_string(), s);
         }
@@ -660,7 +690,7 @@ pub fn load_import(
     // PresharedKey presence is known only via the secret store: probe per peer.
     for i in 0..stored.peers.len() {
         let field = format!("peer{i}.preshared_key");
-        if let Ok(s) = store.get(&format!("import/{import_ref}/{field}")) {
+        if let Ok(s) = get_import_secret(&store, &legacy, import_ref, &field) {
             secrets.insert(field, s);
         }
     }

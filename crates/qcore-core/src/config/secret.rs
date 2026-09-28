@@ -35,6 +35,8 @@ use std::fmt;
 
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
+use super::profile_dir::ProfileDirs;
+
 /// Zeroizing secret string. Zeroes on drop; never `Display`s the value.
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct SecretString {
@@ -225,6 +227,41 @@ impl SecretStore {
             }
         }
     }
+}
+
+/// Canonical bytes hashed for a per-dir keyring service namespace:
+/// separators normalized to `/`, trailing separators trimmed (drive roots
+/// kept), and — on Windows only — ASCII-lowercased, because the filesystem
+/// is case-insensitive there and `Profile` vs `PROFILE` are one directory.
+/// Byte-level over the raw OS encoding, never `to_string_lossy`: distinct
+/// paths must never collapse onto one namespace via U+FFFD substitution.
+pub(crate) fn namespace_input(dirs: &ProfileDirs) -> Vec<u8> {
+    let raw = dirs.config_dir.as_os_str().as_encoded_bytes();
+    let mut out = Vec::with_capacity(raw.len());
+    for &b in raw {
+        out.push(if b == b'\\' { b'/' } else { b });
+    }
+    while out.len() > 1 && out.ends_with(b"/") && !out.ends_with(b":/") {
+        out.pop();
+    }
+    #[cfg(windows)]
+    out.make_ascii_lowercase();
+    out
+}
+
+/// Stable 64-bit FNV-1a service-namespace hash. NOT `DefaultHasher`, whose
+/// output is explicitly unstable across releases and would silently orphan
+/// the namespace (forced re-registration) on toolchain upgrades. FNV-1a is
+/// only an opaque bucket label (the keyring ACLs are the security
+/// boundary), so a non-cryptographic hash is sufficient; determinism is
+/// the requirement.
+pub(crate) fn namespace_hash(s: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in s {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
 }
 
 #[cfg(test)]

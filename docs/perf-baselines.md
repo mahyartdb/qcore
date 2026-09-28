@@ -27,16 +27,20 @@ Unexpected regressions must be explained in the change description.
 - Memory harness is mock-transport only (offline stub peer) and short-lived;
   it bounds the session-lifecycle floor, not a loaded Tor/MASQUE session. A
   sustained-session harness is follow-up work, not a blocker.
-- keyring 4.2.0 was evaluated twice and REVERTED: its Windows backend
-  transiently drops reads under parallel-test load (~30-50% suite-run
-  failure rate vs ~0% on keyring 3 — assertion-speed failures in
-  identity/store/conformance paths, all keyring-read misses with no file
-  fallback present). A read retry would mask real errors and an
-  always-write file fallback would double at-rest exposure — both rejected;
-  retry is follow-up work if keyring is retried.
-- Landed instead: per-dir keyring namespaces for the import store
-  (`config/import.rs`, same FNV-1a scheme as the identity store, with a
-  `qcore-imports` legacy read fallback). This killed the proven value-race
-  (two tests, one `wg-home` ref, one shared account → wrong-secret
-  handshakes): 0 chains failures in 3 hermetic runs with the colliding refs
-  kept in place.
+- keyring 4.2.0 was evaluated three times and REVERTED, with the full
+  mechanism proven, not just the correlation. Its Windows backend drops
+  keyring ops transiently under parallel-test load; the suite then fails
+  two independent ways: (a) transient GET misses with no file fallback
+  present read as missing identity (`inject`/`store` assertion failures);
+  (b) transient PUT failures engage the file fallback, whose files land in
+  `config_dir`, where the secret-hygiene scan flags them as leaks — a
+  leftover `warp-outer_sprivate__key.secret` from a failed run confirmed
+  it. A bounded 3-attempt retry (`SecretStore::keyring_retry`, unit-tested,
+  still fails closed) cut the rate but could not eliminate backend drops,
+  and the remaining fixes (fallback relocation, test weakening) trade away
+  hygiene guarantees for a version number — rejected. Retry + per-dir
+  import namespaces (same FNV-1a scheme as the identity store, with a
+  `qcore-imports` legacy read fallback) stay: namespaces killed the proven
+  value-race (two tests, one `wg-home` ref, one shared account →
+  wrong-secret handshakes), retry hardens real users against transient
+  Credential Manager failures on keyring 3 too.

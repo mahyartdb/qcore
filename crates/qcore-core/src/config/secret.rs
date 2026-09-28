@@ -110,6 +110,28 @@ impl SecretStore {
         }
     }
 
+    /// Bounded retry for OS-keyring calls. Credential APIs (Credential
+    /// Manager, Keychain, Secret Service) fail transiently under parallel
+    /// load, and the suite hammers them from dozens of threads. Three
+    /// attempts, still fails closed: a persistent error surfaces unchanged
+    /// after ~10ms, so this masks transients, not real failures. No new
+    /// at-rest data, nothing logged. The 5ms sleeps can briefly block a
+    /// tokio worker, but only on keyring-failure paths that already perform
+    /// blocking file fallback IO.
+    fn keyring_retry<T, E>(mut op: impl FnMut() -> Result<T, E>) -> Result<T, E> {
+        let mut attempt = 0u32;
+        loop {
+            match op() {
+                ok @ Ok(_) => return ok,
+                Err(_) if attempt < 2 => {
+                    attempt += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     pub fn put(&self, account: &str, secret: &SecretString) -> Result<(), String> {
         // Transient plaintext copy (the keyring `&str` bridge): wiped on
         // drop via `Zeroizing` (pre-v1 this was a plain `String` that was
@@ -125,15 +147,14 @@ impl SecretStore {
     /// credential stores can acknowledge writes they never serve back, which
     /// would otherwise strand the secret (writable but unreadable).
     fn put_keyring(service: &str, account: &str, value: &str) -> bool {
-        let Ok(entry) = keyring::Entry::new(service, account) else {
+        let Ok(entry) = Self::keyring_retry(|| keyring::Entry::new(service, account)) else {
             return false;
         };
-        if entry.set_password(value).is_err() {
+        if Self::keyring_retry(|| entry.set_password(value)).is_err() {
             return false;
         }
-        match keyring::Entry::new(service, account) {
-            Ok(probe) => probe
-                .get_password()
+        match Self::keyring_retry(|| keyring::Entry::new(service, account)) {
+            Ok(probe) => Self::keyring_retry(|| probe.get_password())
                 .map(|back| back == value)
                 .unwrap_or(false),
             Err(_) => false,
@@ -141,8 +162,8 @@ impl SecretStore {
     }
 
     pub fn get(&self, account: &str) -> Result<SecretString, String> {
-        match keyring::Entry::new(&self.service, account) {
-            Ok(entry) => match entry.get_password() {
+        match Self::keyring_retry(|| keyring::Entry::new(&self.service, account)) {
+            Ok(entry) => match Self::keyring_retry(|| entry.get_password()) {
                 Ok(pw) => Ok(SecretString::new(pw)),
                 Err(_) => self.get_file(account),
             },
@@ -267,6 +288,43 @@ pub(crate) fn namespace_hash(s: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_returns_first_success_without_repeating() {
+        let mut calls = 0;
+        let r: Result<&str, &str> = SecretStore::keyring_retry(|| {
+            calls += 1;
+            Ok("ok")
+        });
+        assert_eq!(r, Ok("ok"));
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn retry_recovers_from_transients() {
+        let mut calls = 0;
+        let r: Result<&str, &str> = SecretStore::keyring_retry(|| {
+            calls += 1;
+            if calls < 3 {
+                Err("transient")
+            } else {
+                Ok("ok")
+            }
+        });
+        assert_eq!(r, Ok("ok"));
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn retry_fails_closed_after_three_attempts() {
+        let mut calls = 0;
+        let r: Result<&str, &str> = SecretStore::keyring_retry(|| {
+            calls += 1;
+            Err("persistent")
+        });
+        assert_eq!(r, Err("persistent"));
+        assert_eq!(calls, 3, "bounded: masks transients, not real failures");
+    }
 
     #[test]
     fn debug_never_leaks_value() {

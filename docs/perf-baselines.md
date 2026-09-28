@@ -18,7 +18,7 @@ Unexpected regressions must be explained in the change description.
 |---|---|---|
 | `qcore.exe` size | 13.92 MB | `cargo xtask build --release`, `target/release/qcore.exe` |
 | `qcore_ffi.dll` size | 15.46 MB | same build |
-| Clean build time | 290 s | `cargo clean` + timed `cargo xtask build --release` |
+| Clean build time | 290 s (n=1; re-record on toolchain/profile change) | `cargo clean` + timed `cargo xtask build --release` |
 | Peak session memory (lifecycle) | ~5.3 MB | `target/release/embed-host.exe` (mock session start→status→stop), OS-reported `PeakWorkingSet64`, max of 5 runs |
 | Peak session memory (30 s held) | ~5.3 MB | `embed-host.exe 30` (session held open, status polled 1/s), same sampler, max of 3 runs: 5.22/5.23/5.25 MB — an idle held session adds nothing measurable over the lifecycle peak |
 

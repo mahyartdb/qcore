@@ -24,7 +24,7 @@ Spec tasks T001-T094 (001) and T001-T037 (002) are all complete; this file route
 | Lint | `cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings` |
 | C ABI diff | `cargo xtask abi-diff` |
 | Per-target smoke | `cargo xtask smoke --target <triple>` |
-| Release | `cargo xtask release` (tag-driven; KNOWN GAP triaged in #16, not yet proven end-to-end: release matrix builds 3/9 `targets.toml` entries (Windows-only) — expansion deferred, needs constitution amendment + runner capacity + tag dry-run; do not tag `v*` until complete; publish job already has checkout/toolchain/cosign) |
+| Release | `cargo xtask release` (tag-driven; KNOWN GAP triaged in #16, not yet proven end-to-end: release matrix builds 3/9 `targets.toml` entries (Windows-only) — expansion deferred, needs constitution amendment + runner capacity + tag dry-run; do not tag `v*` until complete; publish job already has checkout/toolchain/cosign; bare package/release = native artifact only, per-target publishing awaits dry-run bar, Tier C green defined in release.yml header) |
 
 `cargo xtask` resolves via the `[alias]` in `.cargo/config.toml`.
 

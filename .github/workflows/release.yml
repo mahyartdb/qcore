@@ -16,6 +16,12 @@ jobs:
   # dry-run passes (AGENTS.md Release row). The publish job below already
   # has checkout + toolchain + cosign installer; its remaining gap is the
   # same unproven end-to-end run, not missing steps.
+  # Publish scope: bare `cargo xtask package` / `cargo xtask release` cover
+  # the native artifact only; per-target publishing awaits the dry-run bar.
+  # Tier C green checklist (definition only, no results claimed):
+  # - per-target build+smoke logs for all declared triples in
+  #   xtask/src/targets.toml;
+  # - per-artifact signature / attestation / SBOM checks.
   matrix:
     strategy:
       matrix:
@@ -30,6 +36,8 @@ jobs:
       - run: cargo xtask build --target ${{ matrix.target }}
       - run: cargo xtask smoke --target ${{ matrix.target }}
   publish:
+    # Publish scope: native artifact only (see header checklist);
+    # per-target publishing awaits the dry-run bar. No matrix legs published.
     needs: [matrix]
     runs-on: ubuntu-22.04
     permissions:

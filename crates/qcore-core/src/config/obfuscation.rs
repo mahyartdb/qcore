@@ -168,6 +168,16 @@ fn parse_profiles_toml(text: &str) -> Result<BTreeMap<String, ObfuscationProfile
         let pt = prof
             .as_table()
             .ok_or_else(|| format!("profile `{name}` must be a table"))?;
+        // Profile-level typos (`familiy = …`) previously loaded silently
+        // while the operator believed tuning applied (params ride opaquely
+        // to factories, so a typo becomes a no-op field). Fail closed naming
+        // the key, same standard as mode keys below. `params` contents stay
+        // opaque by design (plugin extensibility lives there).
+        for k in pt.keys() {
+            if k != "family" && k != "compatible_modes" && k != "params" {
+                return Err(format!("profile `{name}` has unknown key `{k}`"));
+            }
+        }
         let family = match pt.get("family").and_then(|x| x.as_str()) {
             Some(s) => ObfFamily::parse(s)
                 .ok_or_else(|| format!("profile `{name}` family `{s}` (noize|awg)"))?,
@@ -375,6 +385,17 @@ mod tests {
             assert!(profiles.contains_key(name), "ships {name}");
         }
         assert_eq!(profiles["awg-balanced"].params["jc"].scalar(), "6");
+    }
+
+    #[test]
+    fn unknown_profile_key_fails_closed() {
+        // `familiy` (typo) must not load silently while the operator believes
+        // tuning applied; `params` contents stay opaque (plugin namespace).
+        let bad = "[myprof]\nfamily = \"noize\"\nfamiliy = \"noize\"\ncompatible_modes = [{kind = \"masque\"}]\n";
+        let err = parse_profiles_toml(bad).unwrap_err();
+        assert!(err.contains("familiy"), "names the key: {err}");
+        let ok = "[myprof]\nfamily = \"noize\"\ncompatible_modes = [{kind = \"masque\"}]\n[myprof.params]\njunk_size = [1, 10]\n";
+        assert!(parse_profiles_toml(ok).is_ok());
     }
 
     #[test]

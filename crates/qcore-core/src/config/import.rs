@@ -172,8 +172,8 @@ impl ConfigImport {
         // seen per section instance.
         let mut seen_iface_keys = std::collections::HashSet::new();
         let mut seen_peer_keys: Vec<std::collections::HashSet<String>> = Vec::new();
-        for (lineno, line) in raw.lines().enumerate() {
-            let line = line.split(['#', ';']).next().unwrap_or("").trim();
+        for (lineno, raw_line) in raw.lines().enumerate() {
+            let line = raw_line.split(['#', ';']).next().unwrap_or("").trim();
             if line.is_empty() {
                 continue;
             }
@@ -184,17 +184,47 @@ impl ConfigImport {
                     seen_peer_keys.push(std::collections::HashSet::new());
                     peer_index = imp.peers.len() - 1;
                 } else if section == "interface" {
+                    // A second [Interface] with disjoint keys would silently
+                    // merge (only cross-block duplicate keys trip the guard):
+                    // reject, symmetric with the multi-[Peer] gate below.
+                    if seen_iface {
+                        imp.reject(format!(
+                            "line {}: duplicate [Interface] section",
+                            lineno + 1
+                        ));
+                    }
                     seen_iface = true;
                 } else {
                     imp.reject(format!("line {}: unknown section `{line}`", lineno + 1));
                 }
                 continue;
             }
-            let (k, v) = match line.split_once('=') {
-                Some((k, v)) => (k.trim(), v.trim()),
-                None => {
-                    imp.reject(format!("line {}: expected `Key = Value`", lineno + 1));
-                    continue;
+            // Free-form AWG keys (`I1..I5`) keep everything after `=`: their
+            // values may legitimately contain `#`/`;`, and line-level
+            // stripping silently truncates them (then the export bakes the
+            // loss in). All other keys strip inline comments as before.
+            let raw_key = raw_line
+                .split_once('=')
+                .map(|(k, _)| k.trim().to_lowercase());
+            let free_form = matches!(
+                raw_key.as_deref(),
+                Some("i1") | Some("i2") | Some("i3") | Some("i4") | Some("i5")
+            );
+            let (k, v) = if free_form {
+                match raw_line.split_once('=') {
+                    Some((k, v)) => (k.trim(), v.trim()),
+                    None => {
+                        imp.reject(format!("line {}: expected `Key = Value`", lineno + 1));
+                        continue;
+                    }
+                }
+            } else {
+                match line.split_once('=') {
+                    Some((k, v)) => (k.trim(), v.trim()),
+                    None => {
+                        imp.reject(format!("line {}: expected `Key = Value`", lineno + 1));
+                        continue;
+                    }
                 }
             };
             if k.is_empty() || v.is_empty() {
@@ -301,9 +331,8 @@ impl ConfigImport {
             }
             if let Some(aips) = peer.get("allowed_ips") {
                 for part in aips.split(',').map(str::trim) {
-                    if !part.contains('/') {
-                        field_errors
-                            .push(format!("peer {i} `AllowedIPs` entry `{part}` is not CIDR"));
+                    if let Err(e) = check_cidr(part) {
+                        field_errors.push(format!("peer {i} `AllowedIPs` entry `{part}`: {e}"));
                     }
                 }
             }
@@ -313,8 +342,8 @@ impl ConfigImport {
         }
         if let Some(addr) = imp.interface.get("address").cloned() {
             for part in addr.split(',').map(str::trim) {
-                if !part.contains('/') {
-                    imp.reject(format!("`Address` entry `{part}` is not CIDR"));
+                if let Err(e) = check_cidr(part) {
+                    imp.reject(format!("`Address` entry `{part}`: {e}"));
                 }
             }
         }
@@ -334,6 +363,23 @@ impl ConfigImport {
     }
 }
 
+fn check_cidr(entry: &str) -> Result<(), String> {
+    let (ip, prefix) = entry
+        .split_once('/')
+        .ok_or_else(|| "is not CIDR (need `address/prefix`)".to_string())?;
+    let addr: std::net::IpAddr = ip
+        .parse()
+        .map_err(|_| format!("`{ip}` is not an IP literal"))?;
+    let max: u8 = if addr.is_ipv4() { 32 } else { 128 };
+    let bits: u8 = prefix
+        .parse()
+        .map_err(|_| format!("prefix `{prefix}` is not numeric"))?;
+    if bits > max {
+        return Err(format!("prefix `{bits}` exceeds /{max}"));
+    }
+    Ok(())
+}
+
 fn check_endpoint(ep: &str) -> Result<(), String> {
     let (host, port) = ep
         .rsplit_once(':')
@@ -341,16 +387,57 @@ fn check_endpoint(ep: &str) -> Result<(), String> {
     if host.is_empty() {
         return Err(format!("`{ep}` has an empty host"));
     }
-    port.parse::<u16>()
-        .map(|_| ())
+    // Unbracketed IPv6 is ambiguous (`::1`, `2001:db8::1:51820`): the last
+    // colon split misreads address bytes as host/port, so require brackets
+    // and reject any other multi-colon host.
+    if host.starts_with('[') {
+        if !host.ends_with(']') {
+            return Err(format!("`{ep}` has an unbalanced bracket"));
+        }
+        host[1..host.len() - 1]
+            .parse::<std::net::Ipv6Addr>()
+            .map_err(|_| format!("`{ep}` is not bracketed IPv6 with port"))?;
+    } else {
+        if host.contains(':') {
+            return Err(format!(
+                "`{ep}` is ambiguous: bracket IPv6 hosts (`[::1]:{}`)",
+                "<port>"
+            ));
+        }
+        if host.parse::<std::net::IpAddr>().is_err()
+            && !host
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b'_')
+        {
+            return Err(format!("`{ep}` has an invalid hostname"));
+        }
+    }
+    let port: u16 = port
+        .parse()
         .map_err(|_| format!("port `{port}` is not numeric"))?;
+    if port == 0 {
+        return Err("port `0` is not a connectable endpoint".to_string());
+    }
     Ok(())
 }
+
+/// AWG numeric keys that must ALL be present when any AWG key is: a lone
+/// `Jc = 6` previously flipped to Amneziawg with every other param
+/// zero-filled (while a hand-truncated stored record fails closed), so live
+/// imports and stored records disagreed. `I1..I5` stay optional free-form.
+const REQUIRED_AWG_NUMERICS: &[&str] = &[
+    "jc", "jmin", "jmax", "s1", "s2", "s3", "s4", "h1", "h2", "h3", "h4",
+];
 
 fn parse_awg(
     raw: &BTreeMap<String, String>,
     iface: &BTreeMap<String, String>,
 ) -> Result<AwgParams, String> {
+    for k in REQUIRED_AWG_NUMERICS {
+        if !raw.contains_key(*k) {
+            return Err(format!("awg `{k}` missing"));
+        }
+    }
     let num = |k: &str| -> Result<u32, String> {
         raw.get(k)
             .map(|v| {
@@ -417,6 +504,12 @@ fn sanitize_ref(stem: &str) -> String {
         .collect();
     if s.is_empty() {
         s = "import".to_string();
+    }
+    // `CON`/`NUL`/… stay alphanumeric through the map above, but `<ref>.toml`
+    // collides with the Windows console device even with an extension (the
+    // read path refuses such refs): suffix so store-then-load round-trips.
+    if is_reserved_import_ref(&s) {
+        s.push_str("-import");
     }
     s
 }
@@ -537,7 +630,13 @@ pub fn store_import(dirs: &ProfileDirs, imp: &ConfigImport) -> Result<String, St
     dirs.ensure_dirs().map_err(|e| e.to_string())?;
     let dir = imports_dir(dirs);
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    // Defense in depth: the write path sanitizes instead of guarding, so a
+    // reserved stem reaching here (hand-built `ConfigImport`, old data) must
+    // not land on a device file even with an extension.
     let mut name = imp.ref_name.clone();
+    if is_reserved_import_ref(&name) {
+        name.push_str("-import");
+    }
     let mut n = 2u32;
     while dir.join(format!("{name}.toml")).exists() {
         name = format!("{}-{n}", imp.ref_name);
@@ -1272,5 +1371,102 @@ mod tests {
             err.contains("multiple") && err.contains("[Peer]"),
             "got: {err}"
         );
+    }
+
+    fn wg_hop(priv_b64: &str, pub_b64: &str, extra_iface: &str, endpoint: &str) -> String {
+        format!(
+            "[Interface]\nPrivateKey = {priv_b64}\n{extra_iface}\n[Peer]\nPublicKey = {pub_b64}\nAllowedIPs = 0.0.0.0/0\nEndpoint = {endpoint}\n"
+        )
+    }
+
+    #[test]
+    fn duplicate_interface_section_rejected() {
+        let (priv_b64, pub_b64) = keys();
+        let text = format!(
+            "[Interface]\nPrivateKey = {priv_b64}\nAddress = 10.0.0.2/32\n[Interface]\nDNS = 1.1.1.1\n[Peer]\nPublicKey = {pub_b64}\nAllowedIPs = 0.0.0.0/0\nEndpoint = 203.0.113.10:51820\n"
+        );
+        let imp = ConfigImport::parse_str(&text, std::path::Path::new("dup-iface.conf"))
+            .expect("verdict");
+        assert_eq!(imp.verdict, ImportVerdict::Rejected);
+        assert!(
+            imp.reasons.join(" ").contains("[Interface]"),
+            "names section: {:?}",
+            imp.reasons
+        );
+    }
+
+    #[test]
+    fn reserved_stem_sanitizes_and_round_trips() {
+        assert_eq!(sanitize_ref("CON"), "CON-import");
+        assert_eq!(sanitize_ref("aux"), "aux-import");
+        assert_eq!(sanitize_ref("wg-home"), "wg-home");
+        // Collision suffixes are never device names either.
+        assert!(!is_reserved_import_ref("CON-import"));
+    }
+
+    #[test]
+    fn partial_awg_keys_rejected_like_stored() {
+        let (priv_b64, pub_b64) = keys();
+        let text = format!("[Interface]\nPrivateKey = {priv_b64}\nAddress = 10.0.0.2/32\nJc = 6\n[Peer]\nPublicKey = {pub_b64}\nAllowedIPs = 0.0.0.0/0\nEndpoint = 203.0.113.20:51820\n");
+        let imp = ConfigImport::parse_str(&text, std::path::Path::new("partial-awg.conf"))
+            .expect("verdict");
+        assert_eq!(imp.verdict, ImportVerdict::Rejected);
+        assert!(
+            imp.reasons.join(" ").contains("awg `"),
+            "names missing key: {:?}",
+            imp.reasons
+        );
+    }
+
+    #[test]
+    fn bad_cidr_rejected() {
+        assert!(check_cidr("10.0.0.2/32").is_ok());
+        assert!(check_cidr("::/0").is_ok());
+        assert!(check_cidr("999.999.999.999/99").is_err());
+        assert!(check_cidr("garbage/garbage").is_err());
+        assert!(check_cidr("10.0.0.1").is_err());
+        assert!(check_cidr("10.0.0.1/33").is_err());
+        let (priv_b64, pub_b64) = keys();
+        let imp = ConfigImport::parse_str(
+            &wg_hop(
+                &priv_b64,
+                &pub_b64,
+                "Address = 999.999.999.999/99",
+                "203.0.113.10:51820",
+            ),
+            std::path::Path::new("bad-cidr.conf"),
+        )
+        .expect("verdict");
+        assert_eq!(imp.verdict, ImportVerdict::Rejected);
+    }
+
+    #[test]
+    fn ambiguous_endpoints_rejected() {
+        assert!(check_endpoint("example.com:51820").is_ok());
+        assert!(check_endpoint("1.2.3.4:51820").is_ok());
+        assert!(check_endpoint("[2001:db8::1]:51820").is_ok());
+        for bad in [
+            "::1",
+            "2001:db8::1:51820",
+            "::::80",
+            "1.2.3.4:0",
+            "1.2.3.4:notaport",
+        ] {
+            assert!(check_endpoint(bad).is_err(), "{bad} must be rejected");
+        }
+    }
+
+    #[test]
+    fn free_form_i_values_keep_hash_and_semi() {
+        let (priv_b64, pub_b64) = keys();
+        let text = format!(
+            "[Interface]\nPrivateKey = {priv_b64}\nAddress = 10.0.0.2/32\nJc = 6\nJmin = 64\nJmax = 256\nS1 = 24\nS2 = 18\nS3 = 30\nS4 = 16\nH1 = 1234567\nH2 = 2345678\nH3 = 3456789\nH4 = 4567890\nI1 = foo#bar\nI2 = foo;bar\n[Peer]\nPublicKey = {pub_b64}\nAllowedIPs = 0.0.0.0/0\nEndpoint = 203.0.113.20:51820\n"
+        );
+        let imp =
+            ConfigImport::parse_str(&text, std::path::Path::new("hash-val.conf")).expect("verdict");
+        assert_eq!(imp.verdict, ImportVerdict::Accepted, "{:?}", imp.reasons);
+        let awg = imp.awg.expect("awg detected");
+        assert_eq!(awg.i1.as_deref(), Some("foo#bar"));
+        assert_eq!(awg.i2.as_deref(), Some("foo;bar"));
     }
 }

@@ -210,19 +210,30 @@ impl SecretStore {
 
     #[cfg(unix)]
     fn put_file(&self, account: &str, value: &str) -> Result<(), String> {
-        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         std::fs::create_dir_all(&self.fallback_dir).map_err(|e| e.to_string())?;
-        std::fs::OpenOptions::new()
+        // Harden the directory too: `create_dir_all` inherits umask (often
+        // 0755), leaving secret filenames enumerable; secrets need 0700.
+        let _ =
+            std::fs::set_permissions(&self.fallback_dir, std::fs::Permissions::from_mode(0o700));
+        let path = self.account_path(account);
+        let file = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .mode(0o600)
-            .open(self.account_path(account))
+            .open(&path)
             .and_then(|mut f| {
                 use std::io::Write;
+                // `mode` applies only at creation: a pre-existing 0644 file
+                // (backup restore, planted file) keeps its bits through
+                // `truncate`, so enforce after open, then write.
+                f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
                 f.write_all(value.as_bytes())
             })
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        drop(file);
+        Ok(())
     }
 
     #[cfg(not(unix))]

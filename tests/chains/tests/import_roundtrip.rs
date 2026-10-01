@@ -96,6 +96,21 @@ fn export_redacts_secrets() {
 }
 
 #[test]
+fn shipped_bogus_fixture_rejected_at_library_level() {
+    // The real `tests/fixtures/bogus.conf` (sole defect: unknown field) must
+    // be rejected by `ConfigImport::parse` itself — not only by the
+    // CWD-dependent CLI smoke that shells out to `import`. If the strict gate
+    // ever regresses to accept, this fails; today it pins the invariant.
+    let imp = ConfigImport::parse(&fixture("bogus.conf")).expect("parses to a verdict");
+    assert_eq!(imp.verdict, ImportVerdict::Rejected);
+    assert!(
+        imp.reasons.join(" ").contains("Bogus"),
+        "names field: {:?}",
+        imp.reasons
+    );
+}
+
+#[test]
 fn unknown_fields_rejected_by_name() {
     let path = write_temp(
         "bogus.conf",
@@ -134,7 +149,7 @@ fn malformed_endpoint_rejected_naming_field() {
 fn overlapping_h_headers_rejected() {
     let path = write_temp(
         "overlap.conf",
-        "[Interface]\nPrivateKey = BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=\nJc = 6\nJmin = 64\nJmax = 256\nH1 = 111\nH2 = 111\n\n[Peer]\nPublicKey = CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk=\nEndpoint = 203.0.113.10:51820\n",
+        "[Interface]\nPrivateKey = BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=\nJc = 6\nJmin = 64\nJmax = 256\nS1 = 24\nS2 = 18\nS3 = 30\nS4 = 16\nH1 = 111\nH2 = 111\nH3 = 3456789\nH4 = 4567890\n\n[Peer]\nPublicKey = CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk=\nEndpoint = 203.0.113.10:51820\n",
     );
     let imp = ConfigImport::parse(&path).expect("parses to a verdict");
     assert_eq!(imp.verdict, ImportVerdict::Rejected);

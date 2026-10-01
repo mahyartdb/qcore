@@ -85,7 +85,18 @@ impl Dialer for RelayDialer {
     }
 
     async fn dial_udp(&self, dst: SocketAddr) -> Result<Box<dyn UdpFlow>, HopError> {
-        let stream = self.carrier.dial_tcp(dst).await.map_err(|e| {
+        let stream = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            self.carrier.dial_tcp(dst),
+        )
+        .await
+        .map_err(|_| {
+            HopError::transport(
+                self.hop_id.clone(),
+                format!("relay tcp carrier to {dst} timed out (unreachable transport)"),
+            )
+        })?
+        .map_err(|e| {
             HopError::transport(
                 self.hop_id.clone(),
                 format!("relay tcp carrier to {dst}: {}", e.message),
@@ -150,10 +161,18 @@ impl UdpFlow for RelayFlow {
     async fn recv_from(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr), HopError> {
         let mut stream = self.stream.lock().await;
         let mut len = [0u8; 4];
-        stream
-            .read_exact(&mut len)
-            .await
-            .map_err(|e| HopError::transport(self.hop_id.clone(), format!("relay recv: {e}")))?;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            stream.read_exact(&mut len),
+        )
+        .await
+        .map_err(|_| {
+            HopError::transport(
+                self.hop_id.clone(),
+                "relay recv timed out (unreachable transport)".to_string(),
+            )
+        })?
+        .map_err(|e| HopError::transport(self.hop_id.clone(), format!("relay recv: {e}")))?;
         let len = u32::from_be_bytes(len) as usize;
         if len > MAX_DATAGRAM {
             return Err(HopError::transport(
@@ -165,16 +184,34 @@ impl UdpFlow for RelayFlow {
         if len <= buf.len() {
             // Fast path: frame directly into the caller's buffer — no
             // temporary allocation and no second copy per datagram.
-            stream.read_exact(&mut buf[..len]).await.map_err(|e| {
-                HopError::transport(self.hop_id.clone(), format!("relay recv: {e}"))
-            })?;
+            tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                stream.read_exact(&mut buf[..len]),
+            )
+            .await
+            .map_err(|_| {
+                HopError::transport(
+                    self.hop_id.clone(),
+                    "relay recv timed out (unreachable transport)".to_string(),
+                )
+            })?
+            .map_err(|e| HopError::transport(self.hop_id.clone(), format!("relay recv: {e}")))?;
         } else {
             // Truncation path (caller buffer smaller than the datagram):
             // stage then copy the prefix.
             let mut payload = vec![0u8; len];
-            stream.read_exact(&mut payload).await.map_err(|e| {
-                HopError::transport(self.hop_id.clone(), format!("relay recv: {e}"))
-            })?;
+            tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                stream.read_exact(&mut payload),
+            )
+            .await
+            .map_err(|_| {
+                HopError::transport(
+                    self.hop_id.clone(),
+                    "relay recv timed out (unreachable transport)".to_string(),
+                )
+            })?
+            .map_err(|e| HopError::transport(self.hop_id.clone(), format!("relay recv: {e}")))?;
             buf[..k].copy_from_slice(&payload[..k]);
         }
         Ok((k, self.dst))

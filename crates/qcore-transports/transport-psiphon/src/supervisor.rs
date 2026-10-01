@@ -171,6 +171,11 @@ impl SidecarSupervisor {
                             if let Some(addr) = l.strip_prefix(READY_PREFIX) {
                                 match addr.trim().parse::<SocketAddr>() {
                                     Ok(socks_addr) => {
+                                        // Sidecar must bind loopback; ignore
+                                        // non-loopback announcements.
+                                        if !socks_addr.ip().is_loopback() {
+                                            continue;
+                                        }
                                         return Ok(RunningSidecar {
                                             child: Some(child),
                                             socks_addr,

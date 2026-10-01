@@ -87,6 +87,10 @@ pub fn parse_fields(cfg: &HopConfig) -> Result<AwgParams, String> {
         "awg_random_trailers",
         "awg_disable_cookies",
     ];
+    /// Max pre-handshake junk packets per handshake.
+    const MAX_JUNK_COUNT: u32 = 16;
+    /// Max junk packet size (bounded framing checked before allocating).
+    const MAX_JUNK_SIZE: u32 = 65535;
     if let Some(k) = cfg
         .fields
         .keys()
@@ -94,10 +98,33 @@ pub fn parse_fields(cfg: &HopConfig) -> Result<AwgParams, String> {
     {
         return Err(format!("unknown AmneziaWG field `{k}`"));
     }
+    let jc = num(cfg, "awg_jc")?;
+    let jmin = num(cfg, "awg_jmin")?;
+    let jmax = num(cfg, "awg_jmax")?;
+    if jc > MAX_JUNK_COUNT {
+        return Err(format!(
+            "field `awg_jc` value `{jc}` exceeds cap {MAX_JUNK_COUNT}"
+        ));
+    }
+    if jmin > MAX_JUNK_SIZE {
+        return Err(format!(
+            "field `awg_jmin` value `{jmin}` exceeds cap {MAX_JUNK_SIZE}"
+        ));
+    }
+    if jmax > MAX_JUNK_SIZE {
+        return Err(format!(
+            "field `awg_jmax` value `{jmax}` exceeds cap {MAX_JUNK_SIZE}"
+        ));
+    }
+    if jmin > jmax {
+        return Err(format!(
+            "field `awg_jmin` value `{jmin}` exceeds `awg_jmax` value `{jmax}`"
+        ));
+    }
     Ok(AwgParams {
-        jc: num(cfg, "awg_jc")?,
-        jmin: num(cfg, "awg_jmin")?,
-        jmax: num(cfg, "awg_jmax")?,
+        jc,
+        jmin,
+        jmax,
         s1: num(cfg, "awg_s1")?,
         s2: num(cfg, "awg_s2")?,
         s3: num(cfg, "awg_s3")?,
@@ -124,17 +151,15 @@ pub fn junk_train(a: &AwgParams) -> Vec<Vec<u8>> {
     if a.jc == 0 {
         return Vec::new();
     }
+    // Defense-in-depth caps even for directly constructed params.
+    let count = a.jc.min(16);
+    let lo = (a.jmin.max(1) as usize).min(65535);
+    let hi = (a.jmax.max(a.jmin.max(1)) as usize).min(65535);
     let mut rng = qcore_transport_api::obfuscate::XorShift64::new(
         qcore_transport_api::obfuscate::XorShift64::seed(),
     );
-    (0..a.jc)
-        .map(|_| {
-            qcore_transport_api::obfuscate::junk_packet(
-                &mut rng,
-                a.jmin.max(1) as usize,
-                a.jmax.max(a.jmin.max(1)) as usize,
-            )
-        })
+    (0..count)
+        .map(|_| qcore_transport_api::obfuscate::junk_packet(&mut rng, lo, hi))
         .collect()
 }
 

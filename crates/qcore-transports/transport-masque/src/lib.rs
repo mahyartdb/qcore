@@ -185,7 +185,20 @@ impl MasqueHop {
                     format!("nested uplink via carrier: {}", e.message),
                 )
             })?;
-            let (sender, conn) = h2::client::handshake(stream).await.map_err(|e| {
+            let (sender, conn) = tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                h2::client::handshake(stream),
+            )
+            .await
+            .map_err(|_| {
+                HopError::transport(
+                    hop_id.clone(),
+                    format!(
+                        "nested uplink via carrier: masque H2 handshake to {endpoint} timed out"
+                    ),
+                )
+            })?
+            .map_err(|e| {
                 HopError::transport(hop_id.clone(), format!("masque H2 handshake: {e}"))
             })?;
             let task = tokio::spawn(async move {
@@ -210,7 +223,18 @@ impl MasqueHop {
             let local = tcp
                 .local_addr()
                 .map_err(|e| HopError::transport(hop_id.clone(), format!("h2 local: {e}")))?;
-            let (sender, conn) = h2::client::handshake(tcp).await.map_err(|e| {
+            let (sender, conn) = tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                h2::client::handshake(tcp),
+            )
+            .await
+            .map_err(|_| {
+                HopError::transport(
+                    hop_id.clone(),
+                    format!("masque H2 handshake to {endpoint} timed out (unreachable transport)"),
+                )
+            })?
+            .map_err(|e| {
                 HopError::transport(hop_id.clone(), format!("masque H2 handshake: {e}"))
             })?;
             let task = tokio::spawn(async move {
@@ -350,9 +374,17 @@ struct H3Dialer {
 impl Dialer for H3Dialer {
     async fn dial_tcp(&self, _dst: SocketAddr) -> Result<Box<dyn ByteStream>, HopError> {
         let (send, recv) =
-            self.conn.open_bi().await.map_err(|e| {
-                HopError::transport(self.hop_id.clone(), format!("open stream: {e}"))
-            })?;
+            tokio::time::timeout(std::time::Duration::from_secs(15), self.conn.open_bi())
+                .await
+                .map_err(|_| {
+                    HopError::transport(
+                        self.hop_id.clone(),
+                        "masque QUIC open stream timed out (unreachable transport)".to_string(),
+                    )
+                })?
+                .map_err(|e| {
+                    HopError::transport(self.hop_id.clone(), format!("open stream: {e}"))
+                })?;
         Ok(Box::new(QuicStream { send, recv }))
     }
 
@@ -540,12 +572,32 @@ async fn h2_connect(
     nested: bool,
 ) -> Result<(h2::client::SendRequest<Bytes>, SocketAddr), HopError> {
     if nested {
-        let stream = carrier.dial_tcp(endpoint).await.map_err(|e| {
+        let stream = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            carrier.dial_tcp(endpoint),
+        )
+        .await
+        .map_err(|_| {
+            HopError::transport(
+                hop_id,
+                format!("nested uplink via carrier: masque H2 dial to {endpoint} timed out"),
+            )
+        })?
+        .map_err(|e| {
             HopError::transport(hop_id, format!("nested uplink via carrier: {}", e.message))
         })?;
-        let (sender, conn) = h2::client::handshake(stream)
-            .await
-            .map_err(|e| HopError::transport(hop_id, format!("h2 handshake: {e}")))?;
+        let (sender, conn) = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            h2::client::handshake(stream),
+        )
+        .await
+        .map_err(|_| {
+            HopError::transport(
+                hop_id,
+                format!("nested uplink via carrier: masque H2 handshake to {endpoint} timed out"),
+            )
+        })?
+        .map_err(|e| HopError::transport(hop_id, format!("h2 handshake: {e}")))?;
         tokio::spawn(async move {
             let mut conn = conn;
             let _ = (&mut conn).await;
@@ -553,15 +605,33 @@ async fn h2_connect(
         let local: SocketAddr = unspecified_bind(&endpoint);
         return Ok((sender, local));
     }
-    let tcp = tokio::net::TcpStream::connect(endpoint)
-        .await
-        .map_err(|e| HopError::transport(hop_id, format!("h2 tcp: {e}")))?;
+    let tcp = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        tokio::net::TcpStream::connect(endpoint),
+    )
+    .await
+    .map_err(|_| {
+        HopError::transport(
+            hop_id,
+            format!("masque H2 dial to {endpoint} timed out (unreachable transport)"),
+        )
+    })?
+    .map_err(|e| HopError::transport(hop_id, format!("h2 tcp: {e}")))?;
     let local = tcp
         .local_addr()
         .map_err(|e| HopError::transport(hop_id, format!("h2 local: {e}")))?;
-    let (sender, conn) = h2::client::handshake(tcp)
-        .await
-        .map_err(|e| HopError::transport(hop_id, format!("h2 handshake: {e}")))?;
+    let (sender, conn) = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        h2::client::handshake(tcp),
+    )
+    .await
+    .map_err(|_| {
+        HopError::transport(
+            hop_id,
+            format!("masque H2 handshake to {endpoint} timed out (unreachable transport)"),
+        )
+    })?
+    .map_err(|e| HopError::transport(hop_id, format!("h2 handshake: {e}")))?;
     tokio::spawn(async move {
         let mut conn = conn;
         let _ = (&mut conn).await;
@@ -587,8 +657,14 @@ async fn h2_dial_tcp(
     let (response, send) = sender
         .send_request(request, false)
         .map_err(|e| HopError::transport(hop_id.clone(), format!("h2 request: {e}")))?;
-    let recv = response
+    let recv = tokio::time::timeout(std::time::Duration::from_secs(15), response)
         .await
+        .map_err(|_| {
+            HopError::transport(
+                hop_id.clone(),
+                format!("masque H2 response from {dst} timed out (unreachable transport)"),
+            )
+        })?
         .map_err(|e| HopError::transport(hop_id.clone(), format!("h2 response: {e}")))?
         .into_body();
     // Drain headers/body start: server echoes request body chunks.
@@ -596,6 +672,7 @@ async fn h2_dial_tcp(
         send,
         recv,
         fragment,
+        pending: Vec::new(),
     }))
 }
 
@@ -603,6 +680,8 @@ struct H2Stream {
     send: h2::SendStream<Bytes>,
     recv: h2::RecvStream,
     fragment: Option<usize>,
+    /// Buffered tail when one H2 DATA frame exceeds the caller's read buffer.
+    pending: Vec<u8>,
 }
 
 impl tokio::io::AsyncRead for H2Stream {
@@ -612,13 +691,21 @@ impl tokio::io::AsyncRead for H2Stream {
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         use std::task::Poll;
+        // Serve a buffered tail first; the remainder stays for the next read.
+        if !self.pending.is_empty() {
+            let n = self.pending.len().min(buf.remaining());
+            buf.put_slice(&self.pending[..n]);
+            self.pending.drain(..n);
+            return Poll::Ready(Ok(()));
+        }
         match self.recv.poll_data(cx) {
             Poll::Ready(Some(Ok(data))) => {
                 let n = data.len().min(buf.remaining());
                 buf.put_slice(&data[..n]);
-                let _ = self.recv.flow_control().release_capacity(n);
-                // Return remainder to flow control accounting is best-effort;
-                // unread tail is dropped (loopback tests use small writes).
+                let _ = self.recv.flow_control().release_capacity(data.len());
+                if n < data.len() {
+                    self.pending.extend_from_slice(&data[n..]);
+                }
                 Poll::Ready(Ok(()))
             }
             Poll::Ready(Some(Err(e))) => Poll::Ready(Err(std::io::Error::new(
@@ -692,8 +779,14 @@ async fn h2_dial_udp(
     let (response, send) = sender
         .send_request(request, false)
         .map_err(|e| HopError::transport(hop_id.clone(), format!("h2 request: {e}")))?;
-    let recv = response
+    let recv = tokio::time::timeout(std::time::Duration::from_secs(15), response)
         .await
+        .map_err(|_| {
+            HopError::transport(
+                hop_id.clone(),
+                format!("masque H2 response from {dst} timed out (unreachable transport)"),
+            )
+        })?
         .map_err(|e| HopError::transport(hop_id.clone(), format!("h2 response: {e}")))?
         .into_body();
     Ok(Box::new(H2Dgrams {
@@ -715,6 +808,9 @@ struct H2Dgrams {
     local: SocketAddr,
 }
 
+/// Max framed payload per H2 datagram (bounded framing checked before allocating).
+const MAX_H2_DATAGRAM: usize = 65535;
+
 #[async_trait::async_trait]
 impl UdpFlow for H2Dgrams {
     async fn send_to(&self, buf: &[u8], dst: SocketAddr) -> Result<(), HopError> {
@@ -722,6 +818,12 @@ impl UdpFlow for H2Dgrams {
             return Err(HopError::transport(
                 self.hop_id.clone(),
                 "masque datagram flow is bound to its dial destination",
+            ));
+        }
+        if buf.len() > MAX_H2_DATAGRAM {
+            return Err(HopError::transport(
+                self.hop_id.clone(),
+                format!("datagram {} exceeds {MAX_H2_DATAGRAM}", buf.len()),
             ));
         }
         let mut frame = Vec::with_capacity(4 + buf.len());
@@ -744,6 +846,13 @@ impl UdpFlow for H2Dgrams {
                     let len =
                         u32::from_be_bytes(pending[..4].try_into().expect("len prefix is 4 bytes"))
                             as usize;
+                    // Bounded framing checked before allocating (networking).
+                    if len > MAX_H2_DATAGRAM {
+                        return Err(HopError::transport(
+                            self.hop_id.clone(),
+                            format!("peer framed {len} exceeding {MAX_H2_DATAGRAM}"),
+                        ));
+                    }
                     if pending.len() >= 4 + len {
                         let data: Vec<u8> = pending.drain(..4 + len).skip(4).collect();
                         let n = len.min(buf.len());

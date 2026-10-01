@@ -42,7 +42,10 @@ impl XorShift64 {
     /// Uniform value in `[lo, hi]` (inclusive, order-independent).
     pub fn range(&mut self, lo: usize, hi: usize) -> usize {
         let (lo, hi) = if lo <= hi { (lo, hi) } else { (hi, lo) };
-        lo + (self.next_u64() as usize % (hi - lo + 1))
+        // Overflow-safe span in u128: `hi - lo + 1` overflows usize for the
+        // full range (lo=0, hi=MAX) and would divide by zero.
+        let span = (hi as u128 - lo as u128) + 1;
+        (lo as u128 + (self.next_u64() as u128 % span)) as usize
     }
 }
 

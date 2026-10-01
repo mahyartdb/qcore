@@ -140,17 +140,25 @@ impl ByteStream for TorStream {}
 #[async_trait::async_trait]
 impl Dialer for TorDialer {
     async fn dial_tcp(&self, dst: SocketAddr) -> Result<Box<dyn ByteStream>, HopError> {
-        let stream = self
-            .client
-            .connect((dst.ip().to_string(), dst.port()))
-            .await
-            .map_err(|e| {
-                HopError::new(
-                    HopErrorKind::Transport,
-                    Some(self.hop_id.clone()),
-                    format!("tor connect to {dst}: {e}"),
-                )
-            })?;
+        let stream = tokio::time::timeout(
+            Duration::from_secs(15),
+            self.client.connect((dst.ip().to_string(), dst.port())),
+        )
+        .await
+        .map_err(|_| {
+            HopError::new(
+                HopErrorKind::Transport,
+                Some(self.hop_id.clone()),
+                format!("tor connect to {dst} timed out (unreachable transport)"),
+            )
+        })?
+        .map_err(|e| {
+            HopError::new(
+                HopErrorKind::Transport,
+                Some(self.hop_id.clone()),
+                format!("tor connect to {dst}: {e}"),
+            )
+        })?;
         Ok(Box::new(TorStream { inner: stream }))
     }
 

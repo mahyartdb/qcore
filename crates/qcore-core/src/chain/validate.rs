@@ -103,10 +103,13 @@ pub fn validate(
     }
 
     // Cycles: a hop targeting its own listener rejects before starting.
+    // Compare the endpoint host for equality, not substring: hop `wg-0`
+    // must not reject `wg-01.example.com:51820`.
     for (i, hop) in hops.iter().enumerate() {
         let cfg = hop.config.to_factory_config();
         if let Some(ep) = cfg.get("endpoint") {
-            if ep.contains(&hop.id) {
+            let host = ep.rsplit_once(':').map(|(h, _)| h).unwrap_or(ep);
+            if host == hop.id {
                 return Err(ChainError::new(
                     Some(i),
                     Some(hop.id.clone()),
@@ -294,5 +297,22 @@ pub(crate) mod tests {
     #[test]
     fn empty_chain_rejected() {
         assert!(validate(&[], 3, &TestDescriptors::standard()).is_err());
+    }
+
+    #[test]
+    fn similar_endpoint_prefix_is_not_a_cycle() {
+        use crate::config::HopSpec;
+        let spec = HopSpec {
+            id: "wg-0".into(),
+            config: crate::config::HopConfig::Wireguard(WireguardConfig {
+                peer: "warp".into(),
+                import_ref: None,
+                obfuscation: None,
+                family: "dual".into(),
+                endpoint: Some("wg-01.example.com:51820".into()),
+            }),
+        };
+        validate(std::slice::from_ref(&spec), 3, &TestDescriptors::standard())
+            .expect("prefix match is not self-targeting");
     }
 }

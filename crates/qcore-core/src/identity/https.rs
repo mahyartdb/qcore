@@ -103,6 +103,14 @@ fn parse_url(url: &str) -> Result<Url, HttpError> {
         Some(i) => (&rest[..i], rest[i..].to_string()),
         None => (rest, "/".to_string()),
     };
+    // The path is written verbatim into the request line: reject anything
+    // that splits it (CR/LF → header injection, space → line split,
+    // `..` traversal is left to the provider but never constructed here).
+    if path.bytes().any(|b| b <= 0x20 || b == 0x7F) {
+        return Err(HttpError::Usage(
+            "bad provider URL (path must not contain whitespace or controls)".to_string(),
+        ));
+    }
     let (host, port) = match authority.rsplit_once(':') {
         Some((h, p)) if !p.contains(']') => (
             h.to_string(),
@@ -320,7 +328,21 @@ fn parse_response(raw: &[u8]) -> Result<HttpResponse, HttpError> {
     for line in lines {
         if let Some((k, v)) = line.split_once(':') {
             match k.trim().to_ascii_lowercase().as_str() {
-                "content-length" => content_length = v.trim().parse().ok(),
+                "content-length" => {
+                    // Invalid or duplicated lengths fail closed: silently
+                    // treating them as close-delimited (or last-wins) is a
+                    // smuggling primitive and masks truncated bodies.
+                    let n: usize = v.trim().parse().map_err(|_| {
+                        HttpError::Blocked(format!(
+                            "bad content-length `{}`",
+                            v.trim().chars().take(32).collect::<String>()
+                        ))
+                    })?;
+                    if content_length.is_some() {
+                        return Err(HttpError::Blocked("duplicate content-length".to_string()));
+                    }
+                    content_length = Some(n);
+                }
                 "transfer-encoding" if v.to_ascii_lowercase().contains("chunked") => {
                     chunked = true;
                 }
@@ -332,6 +354,14 @@ fn parse_response(raw: &[u8]) -> Result<HttpResponse, HttpError> {
     if chunked {
         body = decode_chunked(&body)?;
     } else if let Some(n) = content_length {
+        // A short close is a truncated body, not a complete one: accepting
+        // it feeds partial provider records downstream.
+        if body.len() < n {
+            return Err(HttpError::Blocked(format!(
+                "truncated response body ({} of {n} bytes)",
+                body.len()
+            )));
+        }
         if body.len() > n {
             body.truncate(n);
         }
@@ -375,8 +405,20 @@ fn decode_chunked(raw: &[u8]) -> Result<Vec<u8>, HttpError> {
         if size == 0 {
             break;
         }
-        if rest.len() < size + 2 {
+        // Overflow-safe framing: `size + 2` wraps on 64-bit for a hostile
+        // `FFFFFFFFFFFFFFFF` size line (panic in debug, wrap in release).
+        let need = size
+            .checked_add(2)
+            .ok_or_else(|| HttpError::Blocked("bad chunked body (size overflows)".to_string()))?;
+        if rest.len() < need {
             return Err(HttpError::Blocked("truncated chunked body".to_string()));
+        }
+        // The 2 bytes after chunk data must be CRLF: skipping blindly
+        // mis-aligns the next size line and silently corrupts the body.
+        if &rest[size..size + 2] != b"\r\n" {
+            return Err(HttpError::Blocked(
+                "bad chunked body (missing chunk CRLF)".to_string(),
+            ));
         }
         out.extend_from_slice(&rest[..size]);
         rest = &rest[size + 2..];
@@ -464,5 +506,47 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(e, HttpError::Rejected { status: 404, .. }), "{e}");
+    }
+
+    #[test]
+    fn truncated_content_length_is_blocked() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{\"id\":\"a\"}";
+        let e = parse_response(raw).unwrap_err();
+        assert!(matches!(e, HttpError::Blocked(_)), "{e}");
+        assert!(e.to_string().contains("truncated"), "{e}");
+    }
+
+    #[test]
+    fn bad_and_duplicate_content_length_blocked() {
+        let bad = b"HTTP/1.1 200 OK\r\nContent-Length: abc\r\n\r\n{\"id\":\"d1\"}";
+        assert!(matches!(
+            parse_response(bad).unwrap_err(),
+            HttpError::Blocked(_)
+        ));
+        let dup = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 100\r\n\r\n12345";
+        let e = parse_response(dup).unwrap_err();
+        assert!(matches!(e, HttpError::Blocked(_)), "{e}");
+    }
+
+    #[test]
+    fn chunked_overflow_and_missing_crlf_blocked() {
+        let huge = b"FFFFFFFFFFFFFFFF\r\n\r\n";
+        assert!(matches!(
+            decode_chunked(huge).unwrap_err(),
+            HttpError::Blocked(_)
+        ));
+        let no_crlf = b"4\r\nABCDXX5\r\nHELLO\r\n0\r\n\r\n";
+        assert!(matches!(
+            decode_chunked(no_crlf).unwrap_err(),
+            HttpError::Blocked(_)
+        ));
+        let ok = b"5\r\nHELLO\r\n0\r\n\r\n";
+        assert_eq!(decode_chunked(ok).unwrap(), b"HELLO");
+    }
+
+    #[test]
+    fn url_path_with_controls_rejected() {
+        assert!(parse_url("https://api.example.com/reg/abc\r\nX-Inject: 1").is_err());
+        assert!(parse_url("https://api.example.com/reg/a b").is_err());
     }
 }

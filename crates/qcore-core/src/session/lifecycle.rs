@@ -132,7 +132,9 @@ pub async fn bring_up(
         // for masque hops); chain and imports still win.
         if let Some(material) = materials.identities.get(&spec.id) {
             for (k, v) in &material.fields {
-                fcfg.fields.entry(k.clone()).or_insert_with(|| v.clone());
+                fcfg.fields
+                    .entry(k.clone())
+                    .or_insert_with(|| v.as_str().to_string());
             }
         }
         // US5: profile params fill whatever is still unset; the active name

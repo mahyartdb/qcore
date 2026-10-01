@@ -11,10 +11,15 @@ use crate::config::{HopConfig, HopSpec};
 use crate::identity::store::{load, role_name, IdentityRole};
 use crate::scan::cache::read_winners;
 use std::collections::HashMap;
+use zeroize::Zeroizing;
 
 /// Factory fields injected for one hop (mirrors `ImportMaterial` shape).
+/// Key values are `Zeroizing`: the map drops after bring-up and the hex
+/// copies of 32-byte secrets wipe instead of lingering as plain `String`s
+/// (the one plain copy that must exist lives in the factory config the
+/// transport consumes, same as any authored `private_key=` value).
 pub struct IdentityMaterial {
-    pub fields: Vec<(String, String)>,
+    pub fields: Vec<(String, Zeroizing<String>)>,
 }
 
 /// Resolve identity material for every hop that needs it. Returns hop-id →
@@ -77,7 +82,7 @@ pub fn materials_for_chain(
                     hop.id.clone(),
                     IdentityMaterial {
                         fields: vec![
-                            ("endpoint".to_string(), endpoint),
+                            ("endpoint".to_string(), Zeroizing::new(endpoint)),
                             ("private_key".to_string(), private_hex),
                             ("peer_public_key".to_string(), peer_hex),
                         ],
@@ -95,7 +100,7 @@ pub fn materials_for_chain(
                 out.insert(
                     hop.id.clone(),
                     IdentityMaterial {
-                        fields: vec![("endpoint".to_string(), endpoint)],
+                        fields: vec![("endpoint".to_string(), Zeroizing::new(endpoint))],
                     },
                 );
             }
@@ -120,7 +125,8 @@ fn winner_endpoint(dirs: &ProfileDirs, keys: &[&str], family: &str) -> Option<St
 /// Base64 key material → lowercase hex. Corrupt material fails toward
 /// re-registration, never toward a half-built tunnel. Shares the 32-byte
 /// validation with the import gate (`b64_decode_32`) instead of re-owning it.
-fn b64_to_hex(b64: &[u8], hop_id: &str, role: &str) -> Result<String, (String, String)> {
+/// `Zeroizing` so the transient hex wipes with the material map.
+fn b64_to_hex(b64: &[u8], hop_id: &str, role: &str) -> Result<Zeroizing<String>, (String, String)> {
     let corrupt = || {
         (
             hop_id.to_string(),
@@ -129,7 +135,7 @@ fn b64_to_hex(b64: &[u8], hop_id: &str, role: &str) -> Result<String, (String, S
     };
     let s = std::str::from_utf8(b64).map_err(|_| corrupt())?;
     let raw = crate::config::import::b64_decode_32(s).map_err(|_| corrupt())?;
-    Ok(crate::config::import::hex_encode(&raw))
+    Ok(Zeroizing::new(crate::config::import::hex_encode(&raw)))
 }
 
 #[cfg(test)]
@@ -230,11 +236,11 @@ mod tests {
         let map = resolve(&d, &[warp_hop("wireguard-0", None)]);
         let fields: std::collections::BTreeMap<_, _> =
             map["wireguard-0"].fields.iter().cloned().collect();
-        assert_eq!(fields["endpoint"], "162.159.192.1:2408");
+        assert_eq!(fields["endpoint"].as_str(), "162.159.192.1:2408");
         // bytes 0x01..0x20 as 64 lowercase hex chars.
         let expect: String = (1u8..=32).map(|b| format!("{b:02x}")).collect();
-        assert_eq!(fields["private_key"], expect);
-        assert_eq!(fields["peer_public_key"], expect);
+        assert_eq!(fields["private_key"].as_str(), expect);
+        assert_eq!(fields["peer_public_key"].as_str(), expect);
         let _ = std::fs::remove_dir_all(&d.config_dir);
     }
 
@@ -246,7 +252,7 @@ mod tests {
         let map = resolve(&d, &[warp_hop("wireguard-0", Some("1.2.3.4:2408"))]);
         let fields: std::collections::BTreeMap<_, _> =
             map["wireguard-0"].fields.iter().cloned().collect();
-        assert_eq!(fields["endpoint"], "1.2.3.4:2408");
+        assert_eq!(fields["endpoint"].as_str(), "1.2.3.4:2408");
         let _ = std::fs::remove_dir_all(&d.config_dir);
     }
 
@@ -265,9 +271,9 @@ mod tests {
         let inner: std::collections::BTreeMap<_, _> =
             map["wireguard-1"].fields.iter().cloned().collect();
         // Separately registered identities: distinct key material per hop.
-        assert_ne!(outer["private_key"], inner["private_key"]);
-        assert!(outer["private_key"].starts_with("01"));
-        assert!(inner["private_key"].starts_with("a0"));
+        assert_ne!(outer["private_key"].as_str(), inner["private_key"].as_str());
+        assert!(outer["private_key"].as_str().starts_with("01"));
+        assert!(inner["private_key"].as_str().starts_with("a0"));
         let _ = std::fs::remove_dir_all(&d.config_dir);
     }
 
@@ -313,7 +319,7 @@ mod tests {
         let map = resolve(&d, &[masque]);
         let fields: std::collections::BTreeMap<_, _> =
             map["masque-0"].fields.iter().cloned().collect();
-        assert_eq!(fields["endpoint"], "162.159.192.1:443");
+        assert_eq!(fields["endpoint"].as_str(), "162.159.192.1:443");
         assert_eq!(fields.len(), 1, "endpoint only — no keys for masque");
         let _ = std::fs::remove_dir_all(&d.config_dir);
     }

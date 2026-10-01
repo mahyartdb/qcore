@@ -208,8 +208,9 @@ impl SessionHandle {
             .collect()
     }
 
-    /// Tear down all hops reverse-order (exit first). Keepalive watchers are
-    /// aborted before their hops stop (same ownership rule as `unwind`).
+    /// Tear down all hops reverse-order (exit first). Keepalive watchers and
+    /// event forwarders are aborted before their hops stop (same ownership
+    /// rule as `unwind`).
     /// Best effort like `unwind`: a failing exit hop must not abandon inner
     /// hops still running.
     pub async fn stop_all(&self) -> Result<(), qcore_transport_api::HopError> {
@@ -217,6 +218,9 @@ impl SessionHandle {
         for s in self.started.iter().rev() {
             if let Some(keepalive) = &s.keepalive {
                 keepalive.abort();
+            }
+            if let Some(forwarder) = &s.forwarder {
+                forwarder.abort();
             }
             if let Err(e) = s.hop.stop().await {
                 if first_err.is_none() {
@@ -469,6 +473,7 @@ mod tests {
             }),
             congested_drops: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             keepalive: None,
+            forwarder: None,
         }
     }
 

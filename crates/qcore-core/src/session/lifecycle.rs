@@ -47,6 +47,10 @@ pub struct StartedHop {
     /// Crate-internal (`pub(crate)`): teardown bookkeeping, not embedder
     /// API — future internal handles stay minor for the same reason.
     pub(crate) keepalive: Option<tokio::task::AbortHandle>,
+    /// Per-hop event forwarder abort handle. Same ownership rule as keepalive:
+    /// teardown aborts before stopping the hop, otherwise the forwarder blocks
+    /// on `recv` forever holding the hop alive.
+    pub(crate) forwarder: Option<tokio::task::AbortHandle>,
 }
 
 /// Per-hop material merged into factory configs at bring-up (in memory
@@ -170,7 +174,7 @@ pub async fn bring_up(
         let tx = events.clone();
         let forwarder_drops = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let forwarder_hop_id = spec.id.clone();
-        {
+        let forwarder_abort = {
             let forwarder_drops = forwarder_drops.clone();
             tokio::spawn(async move {
                 loop {
@@ -192,8 +196,9 @@ pub async fn bring_up(
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
-            });
-        }
+            })
+            .abort_handle()
+        };
         let keepalive_abort = if keepalive.enabled {
             Some(
                 spawn_keepalive(
@@ -224,19 +229,24 @@ pub async fn bring_up(
             hop,
             congested_drops: forwarder_drops,
             keepalive: keepalive_abort,
+            forwarder: Some(forwarder_abort),
         });
     }
     Ok(started)
 }
 
 /// Stop started hops reverse-order, best effort (unwind path). Each hop's
-/// keepalive watcher is aborted before its hop stops: aborting is the only
-/// stop signal (a missing bus receiver must NOT kill the watcher —
-/// receivers attach transiently), and dropping the handle would detach.
+/// keepalive watcher and event forwarder are aborted before its hop stops:
+/// aborting is the only stop signal (a missing bus receiver must NOT kill the
+/// watcher — receivers attach transiently), and dropping the handle would
+/// detach.
 async fn unwind(started: &[StartedHop]) {
     for s in started.iter().rev() {
         if let Some(keepalive) = &s.keepalive {
             keepalive.abort();
+        }
+        if let Some(forwarder) = &s.forwarder {
+            forwarder.abort();
         }
         let _ = s.hop.stop().await;
     }
@@ -369,6 +379,7 @@ mod tests {
             hop,
             congested_drops: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             keepalive: Some(handle.abort_handle()),
+            forwarder: None,
         }];
         assert!(!abort.is_finished());
         unwind(&started).await;

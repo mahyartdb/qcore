@@ -76,7 +76,7 @@ impl From<HttpError> for RegisterError {
         match e {
             HttpError::Blocked(e) => RegisterError::Blocked(e),
             HttpError::Usage(e) => RegisterError::Protocol(e),
-            HttpError::Rejected { status, detail } if matches!(status, 401 | 404 | 410) => {
+            HttpError::Rejected { status, detail } if matches!(status, 401 | 403 | 404 | 410) => {
                 RegisterError::Refused(format!("status {status}: {detail}"))
             }
             HttpError::Rejected { status, detail } => {
@@ -109,7 +109,7 @@ pub async fn register_fresh(
     let mut outcome = RegisterOutcome {
         identity: ProviderIdentity {
             device_id: parsed.device_id,
-            access_token: SecretString::new(parsed.token),
+            access_token: SecretString::new(parsed.token.as_str()),
             private_key_b64,
             peer_key_b64: parsed.peer_key_b64,
             interface_v4: parsed.interface_v4,
@@ -245,7 +245,7 @@ pub(crate) struct LicenseUpgrade {
 
 struct ParsedRegistration {
     device_id: String,
-    token: String,
+    token: Zeroizing<String>,
     peer_key_b64: String,
     interface_v4: String,
     interface_v6: String,
@@ -266,7 +266,7 @@ fn parse_registration(body: &str) -> Result<ParsedRegistration, RegisterError> {
             .ok_or_else(|| proto(name))
     };
     let device_id = str_at("/id", "id")?;
-    let token = str_at("/token", "token")?;
+    let token = Zeroizing::new(str_at("/token", "token")?);
     let peer_key_b64 = str_at("/config/peers/0/public_key", "config.peers[0].public_key")?;
     use base64::Engine as _;
     let peer_bytes = base64::engine::general_purpose::STANDARD
@@ -284,6 +284,19 @@ fn parse_registration(body: &str) -> Result<ParsedRegistration, RegisterError> {
         "/config/interface/addresses/v6",
         "config.interface.addresses.v6",
     )?);
+    // Interface addresses are injected verbatim into tunnel configs: they
+    // must be IP literals, not provider typos (`999.999.999.999` previously
+    // stored and injected as-is).
+    for (name, addr) in [("v4", &interface_v4), ("v6", &interface_v6)] {
+        if addr.parse::<std::net::IpAddr>().is_err() {
+            return Err(RegisterError::Protocol(format!(
+                "config.interface.addresses.{name} (`{addr}` is not an IP literal)"
+            )));
+        }
+    }
+    // The raw JSON `Value` still holds a plain copy of the bearer token:
+    // drop it at the earliest point (all extracted fields are owned).
+    drop(v);
     Ok(ParsedRegistration {
         device_id,
         token,
@@ -369,9 +382,39 @@ mod tests {
         let body = r#"{"id":"d1","token":"t1","config":{"peers":[{"public_key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","endpoint":{"v4":"162.159.192.1:2408"}}],"interface":{"addresses":{"v4":"172.16.0.2/32","v6":"2606:4700:110::2/128"}}},"account":{"type":"free"}}"#;
         let p = parse_registration(body).expect("parses");
         assert_eq!(p.device_id, "d1");
-        assert_eq!(p.token, "t1");
+        assert_eq!(p.token.as_str(), "t1");
         assert_eq!(p.interface_v4, "172.16.0.2");
         assert_eq!(p.interface_v6, "2606:4700:110::2");
+    }
+
+    #[test]
+    fn non_ip_interface_addresses_rejected() {
+        let body = r#"{"id":"d1","token":"t1","config":{"peers":[{"public_key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}],"interface":{"addresses":{"v4":"999.999.999.999/32","v6":"not-an-ip/128"}}}}"#;
+        let e = match parse_registration(body) {
+            Ok(_) => panic!("999.999.999.999 must not parse as an interface address"),
+            Err(e) => e,
+        };
+        assert!(e.to_string().contains("v4"), "{e}");
+    }
+
+    #[test]
+    fn forbidden_status_is_refusal() {
+        // 403 (revoked/forbidden) must re-register like 401/404/410 — never
+        // loop forever as `Keep`.
+        for status in [401u16, 403, 404, 410] {
+            let e = RegisterError::from(HttpError::Rejected {
+                status,
+                detail: "gone".to_string(),
+            });
+            assert!(matches!(e, RegisterError::Refused(_)), "{status}: {e}");
+        }
+        assert!(matches!(
+            RegisterError::from(HttpError::Rejected {
+                status: 429,
+                detail: "slow".to_string()
+            }),
+            RegisterError::Rejected(_)
+        ));
     }
 
     #[test]

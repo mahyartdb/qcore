@@ -102,7 +102,7 @@ async fn rotation_window_triggers_rotate() {
             device_id: "dev-old".into(),
             access_token: SecretString::new("tok-old"),
             private_key_b64: SecretString::new("cHJpdmF0ZTE="),
-            peer_key_b64: "cGVlcjE=".into(),
+            peer_key_b64: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
             interface_v4: "172.16.0.2".into(),
             interface_v6: "2606:4700:110::2".into(),
             masque: Some(MasqueCredential {

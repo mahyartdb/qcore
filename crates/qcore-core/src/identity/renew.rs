@@ -121,6 +121,12 @@ pub async fn renew_role(
         }
         Err(e) => match classify(&e) {
             RenewalClass::Reregister => {
+                // Quarantine first: if the fresh registration below fails
+                // (offline), the stored record must say refused so connects
+                // stop using a known-dead identity (`inject` honors the
+                // flag). A successful reregister overwrites with refused=false.
+                id.refused = true;
+                let _ = save(dirs, role, &id);
                 reregister(dirs, role, opts, license, Some(&id.device_id)).await
             }
             RenewalClass::Keep => RegistrationReport {

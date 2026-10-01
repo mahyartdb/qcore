@@ -73,8 +73,12 @@ pub fn report_for_error(e: super::register::RegisterError) -> RegistrationReport
             prefixed_cause("provider refused: ", &e),
         ),
         RegisterError::Rejected(e) => (
-            ReportAction::Refused,
-            prefixed_cause("provider refused registration: ", &e),
+            // Not a refusal: rate limits (429), server errors (5xx), and
+            // other non-committal answers keep the identity (renewal
+            // `classify` maps them to Keep). Reporting `refused` here told
+            // operators the identity was dead while renewal kept reusing it.
+            ReportAction::Blocked,
+            prefixed_cause("provider did not accept the call (retry/rescan): ", &e),
         ),
         RegisterError::Protocol(e) => (
             ReportAction::Blocked,
@@ -115,6 +119,23 @@ mod tests {
             license_applied: false,
         };
         assert_eq!(b.exit_code(), 2);
+    }
+
+    #[test]
+    fn rejected_is_blocked_not_refused() {
+        // 429/5xx are not identity death: the report must say retry/rescan
+        // (Blocked, exit 2), never `refused` while renewal keeps the identity.
+        let r = report_for_error(super::super::register::RegisterError::Rejected(
+            "status 429: slow down".into(),
+        ));
+        assert_eq!(r.action, ReportAction::Blocked);
+        assert_eq!(r.exit_code(), 2);
+        assert!(r.cause.contains("retry"), "got: {}", r.cause);
+        assert!(
+            !r.cause.contains("refused registration"),
+            "got: {}",
+            r.cause
+        );
     }
 
     #[test]

@@ -59,19 +59,26 @@ impl MasqueCredential {
     pub const RENEW_BEFORE_DAYS: u64 = 7;
 
     /// True when inside the rotation window (or past expiry): a connect MUST
-    /// rotate before using this credential (FR-005).
+    /// rotate before using this credential (FR-005). A clock older than
+    /// issuance (wound back, pre-epoch) cannot prove health: rotate instead
+    /// of reporting healthy on an expired credential.
     pub fn needs_rotation(&self, now_ms: u64) -> bool {
+        if now_ms < self.issued_at_ms {
+            return true;
+        }
         let lifetime_ms = self.lifetime_days.saturating_mul(86_400_000);
         let margin_ms = self.renew_before_days.saturating_mul(86_400_000);
         now_ms.saturating_add(margin_ms) >= self.issued_at_ms.saturating_add(lifetime_ms)
     }
 
-    /// True when fully past lifetime: connects fail naming renewal.
+    /// True when fully past lifetime: connects fail naming renewal. A clock
+    /// older than issuance proves nothing (see `needs_rotation`).
     pub fn expired(&self, now_ms: u64) -> bool {
-        now_ms
-            >= self
-                .issued_at_ms
-                .saturating_add(self.lifetime_days.saturating_mul(86_400_000))
+        now_ms >= self.issued_at_ms
+            && now_ms
+                >= self
+                    .issued_at_ms
+                    .saturating_add(self.lifetime_days.saturating_mul(86_400_000))
     }
 }
 
@@ -111,5 +118,20 @@ mod tests {
         assert!(old.needs_rotation(now));
         assert!(old.expired(now));
         assert!(!cred(now).expired(now));
+    }
+
+    #[test]
+    fn wound_back_clock_rotates_instead_of_healthy() {
+        // Pre-epoch clock with a real credential: rotation due (fail toward
+        // renewal), never expired (the clock proves nothing).
+        let c = cred(1_800_000_000_000u64);
+        assert!(c.needs_rotation(0));
+        assert!(!c.expired(0));
+        // Wound back to issuance time on a 400-day-old cert: same.
+        let old = cred(1_800_000_000_000u64);
+        assert!(old.needs_rotation(1_800_000_000_000u64 - 400 * 86_400_000u64));
+        // Far-future issuance never reads as permanently fresh.
+        let future = cred(u64::MAX);
+        assert!(future.needs_rotation(1_800_000_000_000u64));
     }
 }

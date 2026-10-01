@@ -63,6 +63,16 @@ fn secret_store(dirs: &ProfileDirs) -> SecretStore {
     SecretStore::new(format!("qcore-identity-{h:016x}"), dirs.config_dir.clone())
 }
 
+/// Sync marker binding one save's secrets to its record (crash-window
+/// guard): FNV-1a over `device_id || 0x00 || access_token`, hex-encoded so it
+/// stores as an ordinary secret string.
+fn sync_marker(device_id: &str, token: &SecretString) -> String {
+    let mut input = Vec::with_capacity(device_id.len() + 1 + token.expose().len());
+    input.extend_from_slice(device_id.as_bytes());
+    input.push(0);
+    input.extend_from_slice(token.expose());
+    format!("{:016x}", namespace_hash(&input))
+}
 /// Pre-FNV service namespace (master): `DefaultHasher` over the lossy path.
 /// Migration-only — never use for new namespaces. Reproduces entries
 /// written by binaries whose toolchain shares the current SipHash-1-3 (all
@@ -124,7 +134,17 @@ struct MasqueRecord {
 pub fn load(dirs: &ProfileDirs, role: IdentityRole) -> Option<ProviderIdentity> {
     let raw = std::fs::read_to_string(identity_file(dirs, role)).ok()?;
     let rec: IdentityRecord = toml::from_str(&raw).ok()?;
-    if rec.device_id.is_empty() || rec.peer_key_b64.is_empty() {
+    // Partial records read as missing (module contract): empty ids/keys,
+    // empty interface addresses (injected verbatim downstream), or a peer
+    // key that is not 32 bytes are all corruption, never a healthy load.
+    if rec.device_id.is_empty()
+        || rec.peer_key_b64.is_empty()
+        || rec.interface_v4.is_empty()
+        || rec.interface_v6.is_empty()
+        || rec.interface_v4.parse::<std::net::IpAddr>().is_err()
+        || rec.interface_v6.parse::<std::net::IpAddr>().is_err()
+        || crate::config::import::b64_decode_32(&rec.peer_key_b64).is_err()
+    {
         return None;
     }
     let store = secret_store(dirs);
@@ -137,6 +157,12 @@ pub fn load(dirs: &ProfileDirs, role: IdentityRole) -> Option<ProviderIdentity> 
     }
     let masque = match rec.masque {
         Some(m) => {
+            // Degenerate lifecycles poison rotation instead of failing
+            // closed: `lifetime 0` is permanently expired, `renew_before >
+            // lifetime` rotates on every renew. Both read as missing.
+            if m.lifetime_days == 0 || m.renew_before_days > m.lifetime_days {
+                return None;
+            }
             let key_pem = get_account(&store, &legacy, &format!("{pfx}/masque_key")).ok()?;
             if key_pem.is_empty() || m.cert_pem.is_empty() {
                 return None;
@@ -151,6 +177,20 @@ pub fn load(dirs: &ProfileDirs, role: IdentityRole) -> Option<ProviderIdentity> 
         }
         None => None,
     };
+    // Secrets and record are written in two steps (secrets, then atomic
+    // rename): a crash between them pairs a new token with an old device id
+    // (or vice versa) and the next load would burn the identity with a
+    // spurious `Refused`. The sync marker ties one save's secrets to its
+    // record: mismatch reads as missing (re-register), never as refusal.
+    // Absent marker = pre-marker record: accept (back-compat; every save
+    // since writes one, so partial states always carry a stale marker).
+    if let Ok(marker) = get_account(&store, &legacy, &format!("{pfx}/sync")) {
+        if !marker.is_empty()
+            && marker.expose() != sync_marker(&rec.device_id, &access_token).as_bytes()
+        {
+            return None;
+        }
+    }
     Some(ProviderIdentity {
         device_id: rec.device_id,
         access_token,
@@ -193,6 +233,15 @@ pub fn save(dirs: &ProfileDirs, role: IdentityRole, id: &ProviderIdentity) -> Re
         }
         None => None,
     };
+    // Crash-window guard (see `load`): binds this save's secrets to the
+    // record about to be committed. Written before the rename so any torn
+    // state carries a stale marker and reads as missing, never mismatched.
+    store
+        .put(
+            &format!("{pfx}/sync"),
+            &SecretString::new(sync_marker(&id.device_id, &id.access_token)),
+        )
+        .map_err(|e| format!("identity secret store failed: {e}"))?;
     let rec = IdentityRecord {
         device_id: id.device_id.clone(),
         peer_key_b64: id.peer_key_b64.clone(),
@@ -243,25 +292,59 @@ fn atomic_write_0600(path: &std::path::Path, bytes: &[u8]) -> Result<(), String>
         use std::io::Write;
         f.write_all(bytes)
             .map_err(|e| format!("identity write failed: {e}"))?;
+        // Durability: a power loss after `rename` without fsync loses the
+        // new record while the secrets already rotated (compounds the
+        // crash window the sync marker guards).
+        f.sync_all()
+            .map_err(|e| format!("identity write failed: {e}"))?;
     }
     #[cfg(not(unix))]
     {
         std::fs::write(&tmp, bytes).map_err(|e| format!("identity write failed: {e}"))?;
     }
-    std::fs::rename(&tmp, path).map_err(|e| format!("identity commit failed: {e}"))?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        // Do not litter `*.tmp.*` files on the rename error path.
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("identity commit failed: {e}"));
+    }
+    #[cfg(unix)]
+    {
+        // Best-effort directory sync so the rename itself survives a crash.
+        // Ignored on failure: the record is still atomically committed.
+        if let Ok(dir) = std::fs::File::open(path.parent().unwrap_or(std::path::Path::new("."))) {
+            let _ = dir.sync_all();
+        }
+    }
     Ok(())
 }
 
 /// Exclusive registration lock. A live lock fails the second writer; a lock
-/// older than 10 minutes is stolen (crashed predecessor).
+/// older than 10 minutes is stolen (crashed predecessor). The file carries
+/// an owner token so a holder never unlinks another holder's live lock on
+/// drop (the old unconditional unlink let a third writer in mid-registration).
 fn acquire_lock(dirs: &ProfileDirs, role: IdentityRole) -> Result<LockGuard, String> {
     let path = dirs.config_dir.join(format!("{}.lock", role.file_name()));
+    let token = format!(
+        "{}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+        lock_counter()
+    );
     match std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&path)
     {
-        Ok(_) => Ok(LockGuard { path }),
+        Ok(mut f) => {
+            use std::io::Write;
+            // Best-effort owner mark: a lock file we cannot tag still
+            // excludes (create_new won), it just cannot be stolen precisely.
+            let _ = f.write_all(token.as_bytes());
+            Ok(LockGuard { path, token })
+        }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             let stale = std::fs::metadata(&path)
                 .and_then(|m| m.modified())
@@ -277,13 +360,32 @@ fn acquire_lock(dirs: &ProfileDirs, role: IdentityRole) -> Result<LockGuard, Str
     }
 }
 
+fn lock_counter() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+}
+
 struct LockGuard {
     path: std::path::PathBuf,
+    token: String,
 }
 
 impl Drop for LockGuard {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        // Only unlink our own lock: another holder's live file must survive
+        // our drop (stale-steal already removed only 10-minute-old files).
+        match std::fs::read_to_string(&self.path) {
+            Ok(content) if content == self.token => {
+                let _ = std::fs::remove_file(&self.path);
+            }
+            // Untagged lock from an older binary: fall back to the old
+            // behavior (remove) — it predates tokens, and leaving it would
+            // wedge registration for 10 minutes.
+            Ok(content) if content.is_empty() => {
+                let _ = std::fs::remove_file(&self.path);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -291,7 +393,7 @@ impl Drop for LockGuard {
 mod tests {
     use super::*;
     use crate::config::secret::SecretString;
-    use crate::identity::model::now_ms;
+    use crate::identity::model::{now_ms, MasqueCredential};
 
     fn dirs(tag: &str) -> ProfileDirs {
         let dir = std::env::temp_dir().join(format!(
@@ -307,7 +409,8 @@ mod tests {
             device_id: "dev-1".into(),
             access_token: SecretString::new("tok-1"),
             private_key_b64: SecretString::new("cHJpdmF0ZTE="),
-            peer_key_b64: "cGVlcjE=".into(),
+            // 32 zero bytes (valid length; content never leaves the store).
+            peer_key_b64: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
             interface_v4: "172.16.0.2".into(),
             interface_v6: "2606:4700:110::2".into(),
             masque: None,
@@ -338,6 +441,81 @@ mod tests {
         assert!(load(&d, IdentityRole::Outer).is_none());
         std::fs::write(identity_file(&d, IdentityRole::Outer), "device_id = \"\"").unwrap();
         assert!(load(&d, IdentityRole::Outer).is_none());
+        let _ = std::fs::remove_dir_all(&d.config_dir);
+    }
+
+    #[test]
+    fn partial_record_reads_as_missing() {
+        let d = dirs("partial");
+        d.ensure_dirs().unwrap();
+        // Empty interface addresses must not load as healthy.
+        let mut partial = sample();
+        partial.interface_v4 = String::new();
+        save(&d, IdentityRole::Outer, &partial).expect("saves");
+        assert!(
+            load(&d, IdentityRole::Outer).is_none(),
+            "empty v4 reads as missing"
+        );
+        // Degenerate masque lifecycle must not load as healthy.
+        let mut bad_life = sample();
+        bad_life.masque = Some(MasqueCredential {
+            cert_pem: "cert".into(),
+            key_pem: SecretString::new("key"),
+            issued_at_ms: now_ms(),
+            lifetime_days: 7,
+            renew_before_days: 365,
+        });
+        save(&d, IdentityRole::Outer, &bad_life).expect("saves");
+        assert!(
+            load(&d, IdentityRole::Outer).is_none(),
+            "renew_before > lifetime reads as missing"
+        );
+        let _ = std::fs::remove_dir_all(&d.config_dir);
+    }
+
+    #[test]
+    fn torn_save_reads_as_missing_not_mismatched() {
+        // Crash between secrets and record: new token, old device id. The
+        // sync marker must fail this toward missing (re-register), never
+        // toward a mismatched pair that burns the identity as refused.
+        let d = dirs("torn");
+        save(&d, IdentityRole::Outer, &sample()).expect("saves");
+        // Rotate only the token secret (simulated torn write).
+        secret_store(&d)
+            .put(
+                "warp-outer/access_token",
+                &SecretString::new("tok-NEW-uncommitted"),
+            )
+            .expect("torn put");
+        assert!(
+            load(&d, IdentityRole::Outer).is_none(),
+            "torn secrets read as missing"
+        );
+        let _ = std::fs::remove_dir_all(&d.config_dir);
+    }
+
+    #[test]
+    fn lock_drop_keeps_foreign_lock() {
+        let d = dirs("locktok");
+        d.ensure_dirs().unwrap();
+        let first = acquire_lock(&d, IdentityRole::Outer).expect("first lock");
+        // A foreign live lock file must survive our drop.
+        let foreign = acquire_lock(&d, IdentityRole::Outer);
+        assert!(foreign.is_err(), "second writer still fails closed");
+        drop(first);
+        // Our own file was ours: gone after drop.
+        let path = d
+            .config_dir
+            .join(format!("{}.lock", IdentityRole::Outer.file_name()));
+        assert!(!path.exists(), "own lock unlinked on drop");
+        // A planted foreign lock is never unlinked by our guard.
+        std::fs::write(&path, "someone-else").unwrap();
+        let guard = LockGuard {
+            path: path.clone(),
+            token: "ours".to_string(),
+        };
+        drop(guard);
+        assert!(path.exists(), "foreign lock survives foreign drop");
         let _ = std::fs::remove_dir_all(&d.config_dir);
     }
 

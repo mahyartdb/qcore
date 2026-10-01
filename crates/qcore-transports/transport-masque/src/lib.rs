@@ -96,7 +96,9 @@ enum Conn {
 struct H2Conn {
     nested: bool,
     fragment: Option<usize>,
-    _task: tokio::task::JoinHandle<()>,
+    /// Bring-up connection driver: aborted on `stop()` (a detached task
+    /// would hold the bring-up TCP+H2 connection open past teardown).
+    driver: tokio::task::AbortHandle,
 }
 
 /// A running MASQUE hop.
@@ -247,6 +249,7 @@ impl MasqueHop {
         let _ = events.send(HopEvent::Started {
             hop_id: hop_id.clone(),
         });
+        let task = task.abort_handle();
         Ok(Arc::new(MasqueHop {
             hop_id,
             endpoint,
@@ -254,7 +257,7 @@ impl MasqueHop {
             conn: Conn::H2(H2Conn {
                 nested,
                 fragment,
-                _task: task,
+                driver: task,
             }),
             carrier,
             events,
@@ -342,8 +345,11 @@ impl RunningHop for MasqueHop {
     }
 
     async fn stop(&self) -> Result<(), HopError> {
-        if let Conn::H3(conn) = &self.conn {
-            conn.close(0u32.into(), b"stop");
+        match &self.conn {
+            Conn::H3(conn) => conn.close(0u32.into(), b"stop"),
+            // Reap the bring-up driver: without this the H2 connection it
+            // holds stays open past teardown.
+            Conn::H2(c) => c.driver.abort(),
         }
         let _ = self.events.send(HopEvent::Stopped {
             hop_id: self.hop_id.clone(),
@@ -571,7 +577,14 @@ async fn h2_connect(
     endpoint: SocketAddr,
     carrier: &Arc<dyn Dialer>,
     nested: bool,
-) -> Result<(h2::client::SendRequest<Bytes>, SocketAddr), HopError> {
+) -> Result<
+    (
+        h2::client::SendRequest<Bytes>,
+        SocketAddr,
+        tokio::task::AbortHandle,
+    ),
+    HopError,
+> {
     if nested {
         let stream = tokio::time::timeout(
             std::time::Duration::from_secs(15),
@@ -599,12 +612,16 @@ async fn h2_connect(
             )
         })?
         .map_err(|e| HopError::transport(hop_id, format!("h2 handshake: {e}")))?;
-        tokio::spawn(async move {
+        // The driver owns the TCP+H2 connection: bind its lifetime to the
+        // returned abort handle so cancellation or stream drop reaps it
+        // instead of leaking a detached task holding the socket.
+        let driver = tokio::spawn(async move {
             let mut conn = conn;
             let _ = (&mut conn).await;
-        });
+        })
+        .abort_handle();
         let local: SocketAddr = unspecified_bind(&endpoint);
-        return Ok((sender, local));
+        return Ok((sender, local, driver));
     }
     let tcp = tokio::time::timeout(
         std::time::Duration::from_secs(15),
@@ -633,11 +650,13 @@ async fn h2_connect(
         )
     })?
     .map_err(|e| HopError::transport(hop_id, format!("h2 handshake: {e}")))?;
-    tokio::spawn(async move {
+    // Same lifetime binding as the nested path above.
+    let driver = tokio::spawn(async move {
         let mut conn = conn;
         let _ = (&mut conn).await;
-    });
-    Ok((sender, local))
+    })
+    .abort_handle();
+    Ok((sender, local, driver))
 }
 
 async fn h2_dial_tcp(
@@ -649,7 +668,7 @@ async fn h2_dial_tcp(
     nested: bool,
     fragment: Option<usize>,
 ) -> Result<Box<dyn ByteStream>, HopError> {
-    let (mut sender, _) = h2_connect(&hop_id, endpoint, carrier, nested).await?;
+    let (mut sender, _, driver) = h2_connect(&hop_id, endpoint, carrier, nested).await?;
     let request = http::Request::builder()
         .method("POST")
         .uri(format!("http://{dst}/stream"))
@@ -674,6 +693,7 @@ async fn h2_dial_tcp(
         recv,
         fragment,
         pending: Vec::new(),
+        driver,
     }))
 }
 
@@ -683,6 +703,16 @@ struct H2Stream {
     fragment: Option<usize>,
     /// Buffered tail when one H2 DATA frame exceeds the caller's read buffer.
     pending: Vec<u8>,
+    /// Per-dial connection driver: aborting on drop reaps the TCP+H2
+    /// connection when the stream goes away (a cancelled dial or a dropped
+    /// stream must not leave a detached task holding the socket).
+    driver: tokio::task::AbortHandle,
+}
+
+impl Drop for H2Stream {
+    fn drop(&mut self) {
+        self.driver.abort();
+    }
 }
 
 impl tokio::io::AsyncRead for H2Stream {
@@ -728,20 +758,39 @@ impl tokio::io::AsyncRead for H2Stream {
 impl tokio::io::AsyncWrite for H2Stream {
     fn poll_write(
         mut self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
+        cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
-        // Noize fragmentation (US5 T070): chunk writes at the profile size.
-        let n = obfuscate::chunk_for_send(buf.len().min(16384), self.fragment);
-        match self
-            .send
-            .send_data(Bytes::copy_from_slice(&buf[..n]), false)
-        {
-            Ok(()) => std::task::Poll::Ready(Ok(n)),
-            Err(e) => std::task::Poll::Ready(Err(std::io::Error::new(
+        use std::task::Poll;
+        // Honor H2 flow-control windows: park on `Pending`/zero capacity so
+        // a stalled peer applies backpressure instead of unbounded buffering
+        // (or a misreported `BrokenPipe` that tears down a healthy stream).
+        // Closed/reset streams still fail fast below.
+        match self.send.poll_capacity(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(None) => Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "h2 stream closed",
+            ))),
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Err(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
                 e.to_string(),
             ))),
+            Poll::Ready(Some(Ok(0))) => Poll::Pending,
+            Poll::Ready(Some(Ok(_))) => {
+                // Noize fragmentation (US5 T070): chunk writes at the profile size.
+                let n = obfuscate::chunk_for_send(buf.len().min(16384), self.fragment);
+                match self
+                    .send
+                    .send_data(Bytes::copy_from_slice(&buf[..n]), false)
+                {
+                    Ok(()) => Poll::Ready(Ok(n)),
+                    Err(e) => Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        e.to_string(),
+                    ))),
+                }
+            }
         }
     }
 
@@ -771,7 +820,7 @@ async fn h2_dial_udp(
     carrier: &Arc<dyn Dialer>,
     nested: bool,
 ) -> Result<Box<dyn UdpFlow>, HopError> {
-    let (mut sender, _) = h2_connect(&hop_id, endpoint, carrier, nested).await?;
+    let (mut sender, _, driver) = h2_connect(&hop_id, endpoint, carrier, nested).await?;
     let request = http::Request::builder()
         .method("POST")
         .uri(format!("http://{dst}/datagrams"))
@@ -797,6 +846,7 @@ async fn h2_dial_udp(
         pending: tokio::sync::Mutex::new(Vec::new()),
         dst,
         local,
+        driver,
     }))
 }
 
@@ -807,6 +857,14 @@ struct H2Dgrams {
     pending: tokio::sync::Mutex<Vec<u8>>,
     dst: SocketAddr,
     local: SocketAddr,
+    /// Per-dial connection driver (same lifetime binding as `H2Stream`).
+    driver: tokio::task::AbortHandle,
+}
+
+impl Drop for H2Dgrams {
+    fn drop(&mut self) {
+        self.driver.abort();
+    }
 }
 
 /// Max framed payload per H2 datagram (bounded framing checked before allocating).
@@ -1060,6 +1118,9 @@ mod tests {
             pending: tokio::sync::Mutex::new(Vec::new()),
             dst,
             local,
+            // Test-owned driver: aborted with the flow on drop (same
+            // lifetime binding as production dials).
+            driver: tokio::spawn(std::future::pending::<()>()).abort_handle(),
         };
         (flow, server_send)
     }

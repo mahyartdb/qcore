@@ -124,6 +124,12 @@ pub trait RunningHop: Send + Sync {
 }
 
 /// The plugin boundary: builds a hop with a carrier dialer.
+///
+/// Cancellation safety: the engine races `build` against the connection
+/// budget (`tokio::time::timeout`) and drops the future on expiry. A timed
+/// out build has no handle to stop, so partial resources (sockets, sidecar
+/// children) MUST be owned by the future itself and released on drop —
+/// nothing may outlive cancellation except through the returned `RunningHop`.
 #[async_trait::async_trait]
 pub trait HopFactory: Send + Sync {
     fn descriptor(&self) -> &'static TransportDescriptor;

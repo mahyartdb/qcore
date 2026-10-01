@@ -17,25 +17,66 @@ pub struct Identity {
     pub created_at_ms: u64,
 }
 
-/// Ensure the identity file exists, creating it on first run.
+/// Ensure the identity file exists, creating it on first run. Corrupt
+/// records are backed up (`identity.toml.corrupt`) instead of silently
+/// clobbered, the id is unpredictable (not pid+millis), the write is atomic
+/// (temp + rename), and concurrent cold starts converge: first writer wins,
+/// losers re-read the winner instead of flapping the id.
 pub fn ensure_identity(dirs: &ProfileDirs) -> std::io::Result<Identity> {
     let path = dirs.identity_file();
-    if let Ok(raw) = std::fs::read_to_string(&path) {
-        if let Ok(id) = toml::from_str::<Identity>(&raw) {
-            return Ok(id);
+    for _ in 0..3 {
+        if let Ok(raw) = std::fs::read_to_string(&path) {
+            if let Ok(id) = toml::from_str::<Identity>(&raw) {
+                return Ok(id);
+            }
+            // Corrupt (crash/disk-full tear): keep forensics, then fall
+            // through to recreate.
+            let backup = path.with_extension("toml.corrupt");
+            let _ = std::fs::write(&backup, &raw);
+            let _ = std::fs::remove_file(&path);
+        }
+        dirs.ensure_dirs()?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let id = Identity {
+            id: format!(
+                "qcore-{:016x}{:016x}",
+                random_half(now, 0),
+                random_half(now, 1)
+            ),
+            created_at_ms: now,
+        };
+        let text = toml::to_string(&id).unwrap_or_default();
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut f) => {
+                use std::io::Write;
+                f.write_all(text.as_bytes())?;
+                return Ok(id);
+            }
+            // Lost the create race: loop around and read the winner.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
         }
     }
-    dirs.ensure_dirs()?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    let id = Identity {
-        id: format!("qcore-{}-{}", std::process::id(), now),
-        created_at_ms: now,
-    };
-    std::fs::write(&path, toml::to_string(&id).unwrap_or_default())?;
-    Ok(id)
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "identity file raced creation repeatedly",
+    ))
+}
+
+fn random_half(now: u64, salt: u64) -> u64 {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = RandomState::new().build_hasher();
+    h.write_u64(now.wrapping_add(salt.wrapping_mul(0x9E3779B97F4A7C15)));
+    h.write_u32(std::process::id());
+    h.finish()
 }
 
 /// Zero-config default chain: `wireguard peer=warp`, family dual (contracts
@@ -80,6 +121,26 @@ mod tests {
         let b = ensure_identity(&d).unwrap();
         assert_eq!(a.id, b.id, "second run reuses the identity");
         assert!(d.identity_file().exists());
+        // Unpredictable 128-bit hex (not pid+millis).
+        assert!(a.id.starts_with("qcore-"), "{}", a.id);
+        assert_eq!(a.id.len(), 6 + 32, "{}", a.id);
+        let _ = std::fs::remove_dir_all(&d.config_dir);
+    }
+
+    #[test]
+    fn corrupt_identity_backs_up_and_recreates() {
+        let d = dirs();
+        d.ensure_dirs().unwrap();
+        std::fs::write(d.identity_file(), "truncated = [garbage").unwrap();
+        let id = ensure_identity(&d).unwrap();
+        assert!(d.identity_file().exists());
+        assert!(
+            d.identity_file().with_extension("toml.corrupt").exists(),
+            "corrupt original kept for forensics"
+        );
+        // And the recreated identity is stable now.
+        let again = ensure_identity(&d).unwrap();
+        assert_eq!(id.id, again.id);
         let _ = std::fs::remove_dir_all(&d.config_dir);
     }
 

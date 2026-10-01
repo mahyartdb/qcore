@@ -107,7 +107,11 @@ pub fn detect_broken_ipv6(v4_ok: bool, v6_ok: bool, mode: FamilyMode) -> FamilyF
     }
 }
 
-/// Staggered Happy Eyeballs TCP dial over pre-ordered addresses.
+/// Staggered Happy Eyeballs TCP dial (RFC 8305) over pre-ordered addresses:
+/// attempt `i` starts at `i * attempt_delay` (or immediately when an
+/// earlier attempt fails fast); the first success wins and losers are
+/// aborted. The old serial loop awaited the full per-address `timeout`
+/// before trying the next family, defeating the stagger on blackholes.
 pub async fn eyeballs_dial(
     addrs: &[SocketAddr],
     attempt_delay: Duration,
@@ -119,21 +123,72 @@ pub async fn eyeballs_dial(
             "no addresses to dial",
         ));
     }
+    let start = std::time::Instant::now();
+    let mut set = tokio::task::JoinSet::new();
+    set.spawn(connect_one(*addrs.first().expect("checked"), timeout));
+    let mut spawned = 1usize;
     let mut errors = Vec::new();
-    for (i, addr) in addrs.iter().enumerate() {
-        if i > 0 {
-            tokio::time::sleep(attempt_delay).await;
-        }
-        match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(*addr)).await {
-            Ok(Ok(s)) => return Ok((s, *addr)),
-            Ok(Err(e)) => errors.push(e.to_string()),
-            Err(_) => errors.push("attempt timed out".to_string()),
+    loop {
+        // Next stagger deadline (attempt i starts at i * delay from start).
+        let wake = start + attempt_delay * spawned as u32;
+        tokio::select! {
+            biased;
+            res = set.join_next() => {
+                match res {
+                    Some(Ok(Ok(hit))) => return Ok(hit),
+                    Some(Ok(Err(e))) => {
+                        errors.push(e);
+                        // Fast failure starts the next attempt now (RFC 8305
+                        // §4): no reason to sit out the stagger on a refusal.
+                        if spawned < addrs.len() {
+                            set.spawn(connect_one(addrs[spawned], timeout));
+                            spawned += 1;
+                        } else if set.is_empty() {
+                            break;
+                        }
+                    }
+                    Some(Err(join)) => {
+                        errors.push(join.to_string());
+                        if spawned >= addrs.len() && set.is_empty() {
+                            break;
+                        }
+                    }
+                    // All in-flight done but attempts remain: wait out the
+                    // stagger, then start the next (looping bare would
+                    // busy-spin: join_next on an empty set is always ready
+                    // and would starve the sleep arm under `biased`).
+                    None => {
+                        if spawned >= addrs.len() {
+                            break;
+                        }
+                        let wake2 = start + attempt_delay * spawned as u32;
+                        tokio::time::sleep_until(wake2.into()).await;
+                        set.spawn(connect_one(addrs[spawned], timeout));
+                        spawned += 1;
+                    }
+                }
+            }
+            _ = tokio::time::sleep_until(wake.into()), if spawned < addrs.len() => {
+                set.spawn(connect_one(addrs[spawned], timeout));
+                spawned += 1;
+            }
         }
     }
     Err(std::io::Error::new(
         std::io::ErrorKind::ConnectionRefused,
         format!("all {} attempts failed: {}", addrs.len(), errors.join("; ")),
     ))
+}
+
+async fn connect_one(
+    addr: SocketAddr,
+    timeout: Duration,
+) -> Result<(tokio::net::TcpStream, SocketAddr), String> {
+    match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(addr)).await {
+        Ok(Ok(s)) => Ok((s, addr)),
+        Ok(Err(e)) => Err(format!("{addr}: {e}")),
+        Err(_) => Err(format!("{addr}: attempt timed out")),
+    }
 }
 
 /// Owned TCP byte stream (orphan-rule-safe wrapper around `TcpStream`).
@@ -447,5 +502,30 @@ mod tests {
                 .unwrap();
         assert_eq!(used, addr);
         assert!(stream.peer_addr().is_ok());
+    }
+
+    #[tokio::test]
+    async fn eyeballs_races_attempts_in_parallel() {
+        // Two guaranteed-hanging dials (firewalled ports refuse fast on
+        // some hosts, hang on others — either way each attempt takes up to
+        // `timeout`): racing finishes in ~`timeout`, serial would take ~2x.
+        // Deterministic in any environment; pins the overlap, not a timing.
+        let a: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let b: SocketAddr = "127.0.0.1:2".parse().unwrap();
+        let t0 = std::time::Instant::now();
+        let e = eyeballs_dial(&[a, b], Duration::from_millis(10), Duration::from_secs(2))
+            .await
+            .unwrap_err();
+        let msg = e.to_string();
+        assert!(msg.contains("all 2 attempts failed"), "{msg}");
+        assert!(
+            msg.contains("127.0.0.1:1") && msg.contains("127.0.0.1:2"),
+            "{msg}"
+        );
+        assert!(
+            t0.elapsed() < Duration::from_secs(3),
+            "attempts raced (~2 s), not serialized (~4 s): {:?}",
+            t0.elapsed()
+        );
     }
 }

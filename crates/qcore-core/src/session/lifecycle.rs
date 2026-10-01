@@ -172,35 +172,14 @@ pub async fn bring_up(
         // carrying the cumulative total, so loss is observable even when the
         // session bus itself drops the re-emission. Only `Closed` ends the
         // forwarder.
-        let mut rx = hop.events();
-        let tx = events.clone();
         let forwarder_drops = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let forwarder_hop_id = spec.id.clone();
-        let forwarder_abort = {
-            let forwarder_drops = forwarder_drops.clone();
-            tokio::spawn(async move {
-                loop {
-                    match rx.recv().await {
-                        Ok(e) => {
-                            if tx.send(e).is_err() {
-                                break;
-                            }
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                            let total = forwarder_drops
-                                .fetch_add(n, std::sync::atomic::Ordering::Relaxed)
-                                + n;
-                            let _ = tx.send(HopEvent::Congested {
-                                hop_id: forwarder_hop_id.clone(),
-                                dropped: total,
-                            });
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    }
-                }
-            })
-            .abort_handle()
-        };
+        let forwarder_abort = spawn_forwarder(
+            hop.events(),
+            events.clone(),
+            forwarder_hop_id,
+            forwarder_drops.clone(),
+        );
         let keepalive_abort = if keepalive.enabled {
             Some(
                 spawn_keepalive(
@@ -237,20 +216,70 @@ pub async fn bring_up(
     Ok(started)
 }
 
-/// Stop started hops reverse-order, best effort (unwind path). Each hop's
-/// keepalive watcher and event forwarder are aborted before its hop stops:
-/// aborting is the only stop signal (a missing bus receiver must NOT kill the
-/// watcher — receivers attach transiently), and dropping the handle would
-/// detach.
+/// Per-hop event forwarder: pumps one hop's bus into the session bus.
+/// Survives zero session receivers (the engine subscribes transiently);
+/// only the hop bus closing ends it. Returns the abort handle for teardown.
+fn spawn_forwarder(
+    mut rx: tokio::sync::broadcast::Receiver<HopEvent>,
+    tx: tokio::sync::broadcast::Sender<HopEvent>,
+    hop_id: String,
+    drops: Arc<std::sync::atomic::AtomicU64>,
+) -> tokio::task::AbortHandle {
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(e) => {
+                    let _ = tx.send(e);
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    let total = drops.fetch_add(n, std::sync::atomic::Ordering::Relaxed) + n;
+                    let _ = tx.send(HopEvent::Congested {
+                        hop_id: hop_id.clone(),
+                        dropped: total,
+                    });
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    })
+    .abort_handle()
+}
+
+/// Stop started hops reverse-order, best effort (unwind path). Abort all
+/// watchers first, yield so aborts land, then stop hops: aborting is the only
+/// stop signal for watcher tasks, and stopping the socket immediately used
+/// to race the watcher into emitting a spurious post-stop `Failed`.
 async fn unwind(started: &[StartedHop]) {
-    for s in started.iter().rev() {
+    for s in started.iter() {
         if let Some(keepalive) = &s.keepalive {
             keepalive.abort();
         }
         if let Some(forwarder) = &s.forwarder {
             forwarder.abort();
         }
+    }
+    // One scheduler pass so abort delivery wins over the socket close below
+    // (transport `health()` racing `stop()` on another task is still the
+    // transport's own contract to honor).
+    tokio::task::yield_now().await;
+    for s in started.iter().rev() {
         let _ = s.hop.stop().await;
+    }
+}
+
+impl Drop for StartedHop {
+    /// Last-resort task hygiene: abort watchers so a handle dropped without
+    /// `stop_all()` does not linger tasks holding the hop alive. Socket and
+    /// sidecar teardown still needs `stop()` (`stop_all`); Drop cannot await
+    /// it, so this only stops the bleeding (fd/task growth per forgotten
+    /// session), not the session itself.
+    fn drop(&mut self) {
+        if let Some(keepalive) = &self.keepalive {
+            keepalive.abort();
+        }
+        if let Some(forwarder) = &self.forwarder {
+            forwarder.abort();
+        }
     }
 }
 
@@ -396,5 +425,95 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert!(finished, "keepalive watcher survived unwind");
+    }
+
+    #[tokio::test]
+    async fn forwarder_survives_zero_receivers() {
+        // No session subscriber yet (engine drops the initial handle): the
+        // first event must not kill the forwarder — a late subscriber still
+        // gets later events.
+        let (hop_tx, _) = tokio::sync::broadcast::channel::<HopEvent>(16);
+        let (sess_tx, _) = tokio::sync::broadcast::channel::<HopEvent>(16);
+        let drops = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let abort = spawn_forwarder(hop_tx.subscribe(), sess_tx.clone(), "h0".into(), drops);
+        hop_tx
+            .send(HopEvent::Started {
+                hop_id: "h0".into(),
+            })
+            .expect("hop bus sends");
+        // Let the forwarder observe the zero-receiver send.
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!abort.is_finished(), "forwarder died on zero receivers");
+        // Late subscriber still receives subsequent events.
+        let mut late = sess_tx.subscribe();
+        hop_tx
+            .send(HopEvent::Started {
+                hop_id: "h0".into(),
+            })
+            .expect("hop bus sends");
+        let got = tokio::time::timeout(std::time::Duration::from_secs(2), late.recv())
+            .await
+            .expect("late event arrives")
+            .expect("recv ok");
+        assert!(matches!(got, HopEvent::Started { .. }), "{got:?}");
+        abort.abort();
+    }
+
+    #[tokio::test]
+    async fn dropped_handle_aborts_watchers() {
+        // A StartedHop dropped without stop_all() must not linger tasks.
+        let hop: Arc<dyn RunningHop> = Arc::new(StubHop {
+            events: tokio::sync::broadcast::channel(16).0,
+        });
+        let (tx, _rx) = tokio::sync::broadcast::channel(16);
+        let (hop_tx, _) = tokio::sync::broadcast::channel::<HopEvent>(16);
+        let started = StartedHop {
+            hop_id: "h0".into(),
+            kind: "stub".into(),
+            family: "ipv4".into(),
+            endpoint: None,
+            via: "root".into(),
+            nested: false,
+            inner_mtu: 1500,
+            obfuscation: None,
+            hop,
+            congested_drops: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            keepalive: Some(
+                spawn_keepalive(
+                    "h0".into(),
+                    Arc::new(StubHop {
+                        events: hop_tx.clone(),
+                    }),
+                    KeepalivePolicy {
+                        enabled: true,
+                        interval_secs: 3600,
+                    },
+                    tx,
+                )
+                .abort_handle(),
+            ),
+            forwarder: Some(spawn_forwarder(
+                hop_tx.subscribe(),
+                tokio::sync::broadcast::channel(16).0,
+                "h0".into(),
+                Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            )),
+        };
+        let (ka, fw) = (
+            started.keepalive.clone().expect("ka"),
+            started.forwarder.clone().expect("fw"),
+        );
+        drop(started);
+        let mut finished = false;
+        for _ in 0..100 {
+            if ka.is_finished() && fw.is_finished() {
+                finished = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(finished, "dropped handle left watcher tasks behind");
     }
 }

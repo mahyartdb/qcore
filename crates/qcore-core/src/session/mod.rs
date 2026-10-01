@@ -215,13 +215,18 @@ impl SessionHandle {
     /// hops still running.
     pub async fn stop_all(&self) -> Result<(), qcore_transport_api::HopError> {
         let mut first_err = None;
-        for s in self.started.iter().rev() {
+        // Abort all watchers first, yield so aborts land, then stop hops:
+        // same anti-race phasing as `unwind`.
+        for s in self.started.iter() {
             if let Some(keepalive) = &s.keepalive {
                 keepalive.abort();
             }
             if let Some(forwarder) = &s.forwarder {
                 forwarder.abort();
             }
+        }
+        tokio::task::yield_now().await;
+        for s in self.started.iter().rev() {
             if let Err(e) = s.hop.stop().await {
                 if first_err.is_none() {
                     first_err = Some(e);

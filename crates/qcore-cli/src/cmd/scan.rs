@@ -92,7 +92,10 @@ pub async fn run_scan_request(
         evict_stale_lkg(dirs, &report)?;
     } else {
         persist_verified(dirs, &report)?;
-        if let Some(top) = report.ranked.first() {
+        if let Some(top) = report.ranked.iter().find(|c| {
+            c.confidence == qcore_core::scan::Confidence::Verified
+                && c.reachability == qcore_core::scan::Reachability::Passed
+        }) {
             let _ = cache::record_winner(
                 dirs,
                 transport,
@@ -213,4 +216,58 @@ fn candidate_json(c: &qcore_core::scan::EndpointCandidate) -> serde_json::Value 
             qcore_core::scan::Confidence::Uncertain => "uncertain",
         },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use qcore_core::scan::{Confidence, ProbeKind};
+
+    fn test_dirs(tag: &str) -> ProfileDirs {
+        let dir = std::env::temp_dir().join(format!("qcore-cli-scan-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let d = ProfileDirs::resolve(Some(dir.join("cfg")), Some(dir.join("prof")));
+        d.ensure_dirs().unwrap();
+        std::fs::write(
+            d.profile_dir.join("warp.toml"),
+            "[warp]\nports = [2408]\nseeds = []\nranges = []\nv6_ranges = []\nv6_seeds = []\n[masque]\nports = [443]\nseeds = []\nranges = []\nv6_ranges = []\nv6_seeds = []\n[defaults]\nscan_profile = \"balanced\"\n",
+        )
+        .unwrap();
+        d
+    }
+
+    #[tokio::test]
+    async fn handshake_scan_never_records_winner() {
+        let d = test_dirs("handshake-no-promote");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { while let Ok((_, _)) = listener.accept().await {} });
+        std::fs::write(
+            d.profile_dir.join("scan.toml"),
+            format!("[discovery.warp]\nseeds = [\"{addr}\"]\n"),
+        )
+        .unwrap();
+        let profile = qcore_core::scan::ScanProfile {
+            name: "turbo".to_string(),
+            concurrency: 8,
+            rtt_budget_ms: 400,
+            probe_kind: ProbeKind::Handshake,
+            family_order: vec!["ipv4".to_string()],
+            stealth: false,
+        };
+        let report = run_scan_request(&d, "warp", profile, "ipv4")
+            .await
+            .expect("scan runs");
+        assert_eq!(report.ranked.len(), 1);
+        assert_eq!(report.ranked[0].confidence, Confidence::Uncertain);
+        assert!(
+            cache::read_winners(&d).is_empty(),
+            "uncertain must not enter winner cache"
+        );
+        assert!(
+            qcore_core::session::reconnect::last_known_good(&d).is_none(),
+            "uncertain must not become LKG"
+        );
+        let _ = std::fs::remove_dir_all(&d.config_dir);
+    }
 }

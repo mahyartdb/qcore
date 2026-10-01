@@ -210,12 +210,22 @@ impl SessionHandle {
 
     /// Tear down all hops reverse-order (exit first). Keepalive watchers are
     /// aborted before their hops stop (same ownership rule as `unwind`).
+    /// Best effort like `unwind`: a failing exit hop must not abandon inner
+    /// hops still running.
     pub async fn stop_all(&self) -> Result<(), qcore_transport_api::HopError> {
+        let mut first_err = None;
         for s in self.started.iter().rev() {
             if let Some(keepalive) = &s.keepalive {
                 keepalive.abort();
             }
-            s.hop.stop().await?;
+            if let Err(e) = s.hop.stop().await {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+        if let Some(e) = first_err {
+            return Err(e);
         }
         Ok(())
     }
@@ -364,5 +374,130 @@ mod tests {
             SessionStatus::NotRunning
         ));
         assert_eq!(SessionStatus::NotRunning.exit_code(), 10);
+    }
+
+    struct StopProbe {
+        stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        fail: bool,
+        events: tokio::sync::broadcast::Sender<HopEvent>,
+    }
+
+    static STOP_PROBE_DESCRIPTOR: qcore_transport_api::TransportDescriptor =
+        qcore_transport_api::TransportDescriptor {
+            kind: "stop-probe",
+            capabilities: qcore_transport_api::Capabilities {
+                accepts_tcp_carrier: false,
+                accepts_udp_carrier: false,
+                dials_tcp: false,
+                dials_udp: false,
+            },
+            obfuscation_families: &[],
+            config_schema: "stop-probe/v1",
+            needs_sidecar: false,
+        };
+
+    struct StubStopDialer;
+
+    #[async_trait::async_trait]
+    impl Dialer for StubStopDialer {
+        async fn dial_tcp(
+            &self,
+            _dst: std::net::SocketAddr,
+        ) -> Result<Box<dyn qcore_transport_api::ByteStream>, qcore_transport_api::HopError>
+        {
+            Err(qcore_transport_api::HopError::validation("unused"))
+        }
+        async fn dial_udp(
+            &self,
+            _dst: std::net::SocketAddr,
+        ) -> Result<Box<dyn qcore_transport_api::UdpFlow>, qcore_transport_api::HopError> {
+            Err(qcore_transport_api::HopError::validation("unused"))
+        }
+        fn capabilities(&self) -> qcore_transport_api::Capabilities {
+            qcore_transport_api::Capabilities {
+                accepts_tcp_carrier: false,
+                accepts_udp_carrier: false,
+                dials_tcp: false,
+                dials_udp: false,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl qcore_transport_api::RunningHop for StopProbe {
+        fn descriptor(&self) -> &'static qcore_transport_api::TransportDescriptor {
+            &STOP_PROBE_DESCRIPTOR
+        }
+        fn dialer(&self) -> Arc<dyn Dialer> {
+            Arc::new(StubStopDialer)
+        }
+        fn health(&self) -> qcore_transport_api::HopHealth {
+            qcore_transport_api::HopHealth::Healthy
+        }
+        fn events(&self) -> tokio::sync::broadcast::Receiver<HopEvent> {
+            self.events.subscribe()
+        }
+        async fn stop(&self) -> Result<(), qcore_transport_api::HopError> {
+            self.stopped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            if self.fail {
+                return Err(qcore_transport_api::HopError::validation("exit boom"));
+            }
+            Ok(())
+        }
+    }
+
+    fn started_probe(
+        id: &str,
+        fail: bool,
+        stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> crate::session::lifecycle::StartedHop {
+        let (tx, _rx) = tokio::sync::broadcast::channel(8);
+        crate::session::lifecycle::StartedHop {
+            hop_id: id.to_string(),
+            kind: "stop-probe".to_string(),
+            family: "ipv4".to_string(),
+            endpoint: None,
+            via: "root".to_string(),
+            nested: false,
+            inner_mtu: 1500,
+            obfuscation: None,
+            hop: Arc::new(StopProbe {
+                stopped,
+                fail,
+                events: tx,
+            }),
+            congested_drops: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            keepalive: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_all_continues_past_exit_failure() {
+        let inner_stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let exit_stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handle = SessionHandle {
+            id: "s-stop".to_string(),
+            exit_hop_id: "exit".to_string(),
+            chain: ChainSer {
+                hops: vec![],
+                max_depth: 3,
+            },
+            started: vec![
+                started_probe("inner", false, inner_stopped.clone()),
+                started_probe("exit", true, exit_stopped.clone()),
+            ],
+            events: tokio::sync::broadcast::channel(8).0,
+        };
+        let err = handle.stop_all().await.expect_err("exit error surfaces");
+        assert!(err.message.contains("exit boom"), "got: {err:?}");
+        assert!(
+            exit_stopped.load(std::sync::atomic::Ordering::SeqCst),
+            "exit stop ran"
+        );
+        assert!(
+            inner_stopped.load(std::sync::atomic::Ordering::SeqCst),
+            "inner stop still ran after exit failure"
+        );
     }
 }

@@ -76,19 +76,23 @@ unsafe fn rust_to_j(env: JniEnv, s: &str) -> JString {
 }
 
 /// Reinterpret a handle integer as the engine pointer it came from.
-/// Returns `None` for non-positive handles (0/negative are never valid
-/// engine addresses) so callers fail closed without dereferencing.
+/// Returns `None` for non-positive or non-live handles so callers fail
+/// closed without dereferencing forged/stale pointers.
 ///
 /// # Safety
 /// A positive `handle` must be a live engine pointer previously produced
-/// as `out as i64` by `engineNew`; non-positive values are rejected
-/// before any pointer use.
+/// as `out as i64` by `engineNew` and not yet freed; anything else is
+/// rejected before any pointer use.
 unsafe fn with_engine<T>(handle: i64, f: impl FnOnce(*mut crate::QcoreEngine) -> T) -> Option<T> {
     if handle <= 0 {
         return None;
     }
-    // SAFETY: positive `handle` restores the live pointer per the contract above.
-    Some(f(handle as *mut crate::QcoreEngine))
+    let ptr = handle as *mut crate::QcoreEngine;
+    if !crate::handle_is_live(ptr) {
+        return None;
+    }
+    // SAFETY: `ptr` is live per the check above.
+    Some(f(ptr))
 }
 
 fn take_string(ptr: *mut c_char) -> String {

@@ -88,6 +88,52 @@ fn unwind_guard<F: FnOnce() -> c_int + std::panic::UnwindSafe>(f: F) -> c_int {
     std::panic::catch_unwind(f).unwrap_or(-1)
 }
 
+static LIVE_HANDLES: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<usize>>> =
+    std::sync::OnceLock::new();
+
+fn live_handles() -> &'static std::sync::Mutex<std::collections::HashSet<usize>> {
+    LIVE_HANDLES.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+fn track_handle(ptr: *mut QcoreEngine) {
+    if let Ok(mut set) = live_handles().lock() {
+        set.insert(ptr as usize);
+    }
+}
+
+/// Returns true only for a live handle from [`qcore_engine_new`] not yet freed.
+pub(crate) fn handle_is_live(ptr: *mut QcoreEngine) -> bool {
+    if ptr.is_null() {
+        return false;
+    }
+    live_handles()
+        .lock()
+        .map(|set| set.contains(&(ptr as usize)))
+        .unwrap_or(false)
+}
+
+/// Removes from the live set; returns true if it was live.
+fn untrack_handle(ptr: *mut QcoreEngine) -> bool {
+    live_handles()
+        .lock()
+        .map(|mut set| set.remove(&(ptr as usize)))
+        .unwrap_or(false)
+}
+
+fn check_handle(handle: *mut QcoreEngine, err_out: *mut *mut QcoreError) -> Result<(), c_int> {
+    if handle.is_null() {
+        return Err(fail(err_out, 6, "null engine handle".to_string()));
+    }
+    if !handle_is_live(handle) {
+        return Err(fail(
+            err_out,
+            6,
+            "invalid or freed engine handle".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// FFI runtime sizing knob (#15): clamped, advisory, default 2.
 /// Non-integer/zero values fall back to the default (never an error).
 fn ffi_worker_threads(v: &serde_json::Value) -> usize {
@@ -206,6 +252,7 @@ pub unsafe extern "C" fn qcore_engine_new(
             Err(e) => return fail(err_out, 3, format!("runtime unavailable: {e}")),
         };
         *unsafe { &mut *out } = Box::into_raw(Box::new(QcoreEngine { engine, rt }));
+        track_handle(*unsafe { &mut *out });
         0
     })
 }
@@ -221,6 +268,9 @@ pub unsafe extern "C" fn qcore_engine_free(handle: *mut QcoreEngine) -> c_int {
     unwind_guard(|| {
         if handle.is_null() {
             return 0;
+        }
+        if !untrack_handle(handle) {
+            return 6;
         }
         let engine = unsafe { Box::from_raw(handle) };
         let _ = engine.rt.block_on(engine.engine.stop());
@@ -243,8 +293,8 @@ pub unsafe extern "C" fn qcore_engine_start(
     err_out: *mut *mut QcoreError,
 ) -> c_int {
     unwind_guard(|| {
-        if handle.is_null() {
-            return fail(err_out, 6, "null engine handle".to_string());
+        if let Err(code) = check_handle(handle, err_out) {
+            return code;
         }
         // SAFETY: `chain_expr` validity is the caller's Safety contract for this entry point.
         let expr = match unsafe { c_str(chain_expr) } {
@@ -277,8 +327,8 @@ pub unsafe extern "C" fn qcore_engine_status_json(
     err_out: *mut *mut QcoreError,
 ) -> c_int {
     unwind_guard(|| {
-        if handle.is_null() {
-            return fail(err_out, 6, "null engine handle".to_string());
+        if let Err(code) = check_handle(handle, err_out) {
+            return code;
         }
         // SAFETY: `session_id` validity is the caller's Safety contract for this entry point.
         let id = match unsafe { c_str(session_id) } {
@@ -304,14 +354,15 @@ pub unsafe extern "C" fn qcore_engine_stop(
     err_out: *mut *mut QcoreError,
 ) -> c_int {
     unwind_guard(|| {
-        if handle.is_null() {
-            return fail(err_out, 6, "null engine handle".to_string());
+        if let Err(code) = check_handle(handle, err_out) {
+            return code;
         }
         // SAFETY: `session_id` validity is the caller's Safety contract for this entry point.
         let id = match unsafe { c_str(session_id) } {
             Err(e) => return fail(err_out, 6, e),
             Ok(s) => s,
         };
+        // SAFETY: `handle` is live (checked above).
         let e = unsafe { &*handle };
         match e.rt.block_on(e.engine.stop_session(&id)) {
             Err(r) => fail_report(err_out, &r),
@@ -336,8 +387,8 @@ pub unsafe extern "C" fn qcore_scan(
     err_out: *mut *mut QcoreError,
 ) -> c_int {
     unwind_guard(|| {
-        if handle.is_null() {
-            return fail(err_out, 6, "null engine handle".to_string());
+        if let Err(code) = check_handle(handle, err_out) {
+            return code;
         }
         // SAFETY: scan string args' validity is the caller's Safety contract for this entry point.
         let (transport, profile_name, family) =
@@ -345,6 +396,10 @@ pub unsafe extern "C" fn qcore_scan(
                 (Ok(t), Ok(p), Ok(f)) => (t, p, f),
                 _ => return fail(err_out, 6, "scan arguments must be UTF-8".to_string()),
             };
+        if out_json.is_null() {
+            return fail(err_out, 6, "null out-param".to_string());
+        }
+        // SAFETY: `handle` is live (checked above).
         let e = unsafe { &*handle };
         let dirs = e.engine.config_dirs();
         let profile = match qcore_core::scan::load_profile(&dirs, &profile_name) {
@@ -389,8 +444,8 @@ pub unsafe extern "C" fn qcore_import_config(
     err_out: *mut *mut QcoreError,
 ) -> c_int {
     unwind_guard(|| {
-        if handle.is_null() {
-            return fail(err_out, 6, "null engine handle".to_string());
+        if let Err(code) = check_handle(handle, err_out) {
+            return code;
         }
         // SAFETY: `path` validity is the caller's Safety contract for this entry point.
         let path = match unsafe { c_str(path) } {
@@ -436,14 +491,15 @@ pub unsafe extern "C" fn qcore_export_config(
     err_out: *mut *mut QcoreError,
 ) -> c_int {
     unwind_guard(|| {
-        if handle.is_null() {
-            return fail(err_out, 6, "null engine handle".to_string());
+        if let Err(code) = check_handle(handle, err_out) {
+            return code;
         }
         // SAFETY: `import_ref` validity is the caller's Safety contract for this entry point.
         let import_ref = match unsafe { c_str(import_ref) } {
             Err(e) => return fail(err_out, 6, e),
             Ok(s) => s,
         };
+        // SAFETY: `handle` is live (checked above).
         let e = unsafe { &*handle };
         let dirs = e.engine.config_dirs();
         let (stored, secrets) = match qcore_core::config::import::load_import(&dirs, &import_ref) {
@@ -607,6 +663,107 @@ mod tests {
         let rc = unsafe { qcore_engine_new(cfg.as_ptr(), &mut out as *mut _, &mut err as *mut _) };
         assert_eq!(rc, 0, "engine_new accepts the knob");
         assert!(!out.is_null());
+        assert_eq!(unsafe { qcore_engine_free(out) }, 0);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn forged_handle_fails_closed_not_ub() {
+        let chain = CString::new("mock").unwrap();
+        let mut out: *mut c_char = std::ptr::null_mut();
+        let mut err: *mut QcoreError = std::ptr::null_mut();
+        let forged = 0x1234 as *mut QcoreEngine;
+        assert!(!forged.is_null());
+        let rc = unsafe {
+            qcore_engine_start(
+                forged,
+                chain.as_ptr(),
+                &mut out as *mut _,
+                &mut err as *mut _,
+            )
+        };
+        assert_eq!(rc, 6, "forged handle must fail closed with usage error");
+        assert!(out.is_null());
+        if !err.is_null() {
+            assert_eq!(unsafe { qcore_error_free(err) }, 0);
+        }
+    }
+
+    #[test]
+    fn double_free_is_usage_not_ub() {
+        let base = std::env::temp_dir().join(format!("qcore-ffi-dfree-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let cfg = serde_json::json!({
+            "config_dir": base.join("config").to_str().unwrap(),
+            "profile_dir": base.join("profiles").to_str().unwrap(),
+        })
+        .to_string();
+        let cfg = CString::new(cfg).unwrap();
+        let mut out: *mut QcoreEngine = std::ptr::null_mut();
+        let mut err: *mut QcoreError = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { qcore_engine_new(cfg.as_ptr(), &mut out as *mut _, &mut err as *mut _) },
+            0
+        );
+        assert!(!out.is_null());
+        assert_eq!(unsafe { qcore_engine_free(out) }, 0);
+        assert_eq!(
+            unsafe { qcore_engine_free(out) },
+            6,
+            "second free must fail closed"
+        );
+        let chain = CString::new("mock").unwrap();
+        let mut sout: *mut c_char = std::ptr::null_mut();
+        let mut serr: *mut QcoreError = std::ptr::null_mut();
+        let rc = unsafe {
+            qcore_engine_start(
+                out,
+                chain.as_ptr(),
+                &mut sout as *mut _,
+                &mut serr as *mut _,
+            )
+        };
+        assert_eq!(rc, 6, "use-after-free must fail closed");
+        if !serr.is_null() {
+            assert_eq!(unsafe { qcore_error_free(serr) }, 0);
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn scan_null_out_is_usage_not_empty() {
+        let base = std::env::temp_dir().join(format!("qcore-ffi-scan-null-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let cfg = serde_json::json!({
+            "config_dir": base.join("config").to_str().unwrap(),
+            "profile_dir": base.join("profiles").to_str().unwrap(),
+        })
+        .to_string();
+        let cfg = CString::new(cfg).unwrap();
+        let mut out: *mut QcoreEngine = std::ptr::null_mut();
+        let mut err: *mut QcoreError = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { qcore_engine_new(cfg.as_ptr(), &mut out as *mut _, &mut err as *mut _) },
+            0
+        );
+        let t = CString::new("mock").unwrap();
+        let p = CString::new("balanced").unwrap();
+        let f = CString::new("dual").unwrap();
+        let mut serr: *mut QcoreError = std::ptr::null_mut();
+        let rc = unsafe {
+            qcore_scan(
+                out,
+                t.as_ptr(),
+                p.as_ptr(),
+                f.as_ptr(),
+                std::ptr::null_mut(),
+                &mut serr as *mut _,
+            )
+        };
+        assert_eq!(rc, 6, "null out_json must be usage error, not empty-scan 4");
+        if !serr.is_null() {
+            assert_eq!(unsafe { qcore_error_free(serr) }, 0);
+        }
         assert_eq!(unsafe { qcore_engine_free(out) }, 0);
         let _ = std::fs::remove_dir_all(&base);
     }

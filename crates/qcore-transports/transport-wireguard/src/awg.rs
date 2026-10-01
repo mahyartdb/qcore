@@ -121,6 +121,57 @@ pub fn parse_fields(cfg: &HopConfig) -> Result<AwgParams, String> {
             "field `awg_jmin` value `{jmin}` exceeds `awg_jmax` value `{jmax}`"
         ));
     }
+    // Sizes ride the wire as packet lengths: cap them like junk sizes.
+    for k in ["awg_s1", "awg_s2", "awg_s3", "awg_s4"] {
+        let v = num(cfg, k)?;
+        if v > MAX_JUNK_SIZE {
+            return Err(format!(
+                "field `{k}` value `{v}` exceeds cap {MAX_JUNK_SIZE}"
+            ));
+        }
+    }
+    let (h1, h2, h3, h4) = (
+        num(cfg, "awg_h1")?,
+        num(cfg, "awg_h2")?,
+        num(cfg, "awg_h3")?,
+        num(cfg, "awg_h4")?,
+    );
+    // Same pairwise-distinctness rule as the import gate: overlapping
+    // headers accepted here but rejected there (or vice versa) would split
+    // live vs stored behavior.
+    {
+        let present: Vec<u32> = [h1, h2, h3, h4].into_iter().filter(|v| *v != 0).collect();
+        let mut sorted = present.clone();
+        sorted.sort();
+        sorted.dedup();
+        if sorted.len() != present.len() {
+            return Err(
+                "fields `awg_h1..awg_h4` must be non-overlapping (pairwise distinct)".to_string(),
+            );
+        }
+    }
+    // Free-form junk strings: bounded printable text, never controls or
+    // megabytes (they are echoed into handshake-adjacent buffers).
+    for k in ["awg_i1", "awg_i2", "awg_i3", "awg_i4", "awg_i5"] {
+        if let Some(v) = cfg.get(k) {
+            if v.len() > 1024 {
+                return Err(format!("field `{k}` exceeds 1024 bytes"));
+            }
+            if !v.bytes().all(|b| b.is_ascii_graphic() || b == b' ') {
+                return Err(format!("field `{k}` must be printable ASCII"));
+            }
+        }
+    }
+    let content_padding_min = num(cfg, "awg_content_padding_min")?;
+    let content_padding_max = num(cfg, "awg_content_padding_max")?;
+    if content_padding_min > MAX_JUNK_SIZE || content_padding_max > MAX_JUNK_SIZE {
+        return Err(format!("awg content padding exceeds cap {MAX_JUNK_SIZE}"));
+    }
+    if content_padding_min > content_padding_max {
+        return Err(format!(
+            "field `awg_content_padding_min` value `{content_padding_min}` exceeds `awg_content_padding_max` value `{content_padding_max}`"
+        ));
+    }
     Ok(AwgParams {
         jc,
         jmin,
@@ -129,18 +180,18 @@ pub fn parse_fields(cfg: &HopConfig) -> Result<AwgParams, String> {
         s2: num(cfg, "awg_s2")?,
         s3: num(cfg, "awg_s3")?,
         s4: num(cfg, "awg_s4")?,
-        h1: num(cfg, "awg_h1")?,
-        h2: num(cfg, "awg_h2")?,
-        h3: num(cfg, "awg_h3")?,
-        h4: num(cfg, "awg_h4")?,
+        h1,
+        h2,
+        h3,
+        h4,
         i1: cfg.get("awg_i1").map(str::to_string),
         i2: cfg.get("awg_i2").map(str::to_string),
         i3: cfg.get("awg_i3").map(str::to_string),
         i4: cfg.get("awg_i4").map(str::to_string),
         i5: cfg.get("awg_i5").map(str::to_string),
         header_protection: flag(cfg, "awg_header_protection")?,
-        content_padding_min: num(cfg, "awg_content_padding_min")?,
-        content_padding_max: num(cfg, "awg_content_padding_max")?,
+        content_padding_min,
+        content_padding_max,
         random_trailers: flag(cfg, "awg_random_trailers")?,
         disable_cookies: flag(cfg, "awg_disable_cookies")?,
     })
@@ -199,6 +250,25 @@ mod tests {
     #[test]
     fn unknown_awg_field_rejected() {
         assert!(parse_fields(&cfg(&[("awg_bogus", "1")])).is_err());
+    }
+
+    #[test]
+    fn awg_param_ranges_validated() {
+        // Overlapping headers rejected (same rule as the import gate).
+        assert!(parse_fields(&cfg(&[("awg_h1", "5"), ("awg_h2", "5")])).is_err());
+        // Oversized padding rejected.
+        assert!(parse_fields(&cfg(&[("awg_content_padding_min", "70000")])).is_err());
+        // Inverted padding rejected.
+        assert!(parse_fields(&cfg(&[
+            ("awg_content_padding_min", "100"),
+            ("awg_content_padding_max", "10"),
+        ]))
+        .is_err());
+        // Non-printable junk strings rejected; 10 KB strings rejected.
+        assert!(parse_fields(&cfg(&[("awg_i1", "a\nb")])).is_err());
+        assert!(parse_fields(&cfg(&[("awg_i1", &"x".repeat(2048))])).is_err());
+        // Oversized sizes rejected.
+        assert!(parse_fields(&cfg(&[("awg_s1", "70000")])).is_err());
     }
 
     #[test]

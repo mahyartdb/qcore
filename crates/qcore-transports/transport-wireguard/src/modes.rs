@@ -23,6 +23,51 @@ pub fn parse_key_hex(s: &str) -> Result<[u8; 32], String> {
     Ok(out)
 }
 
+/// Resolve `host:port` where host is an IP literal, `[v6]`, or DNS name.
+/// IP literals parse synchronously; names go through the async resolver with
+/// family filtering (dual keeps resolver order). Standard `.conf` files
+/// routinely carry hostnames — failing them at build with `bad endpoint`
+/// after import accepted them was late and confusing.
+pub async fn resolve_endpoint(hostport: &str, family: &str) -> Result<SocketAddr, String> {
+    if let Ok(addr) = hostport.parse::<SocketAddr>() {
+        if addr.port() == 0 {
+            return Err("bad endpoint: port `0` is not connectable".to_string());
+        }
+        return Ok(addr);
+    }
+    // Bracketed v6 that failed to parse above is malformed, not a name.
+    if hostport.starts_with('[') {
+        return Err(format!("bad endpoint: `{hostport}` is not `[ipv6]:port`"));
+    }
+    // Unbracketed multi-colon input is ambiguous (see import `check_endpoint`
+    // which rejects it there too): do not guess.
+    let (host, port_str) = hostport
+        .rsplit_once(':')
+        .ok_or_else(|| format!("bad endpoint: `{hostport}` is not host:port"))?;
+    if host.is_empty() || host.contains(':') {
+        return Err(format!("bad endpoint: `{hostport}` is not host:port"));
+    }
+    let port: u16 = port_str
+        .parse()
+        .map_err(|_| format!("bad endpoint: port `{port_str}` is not numeric"))?;
+    if port == 0 {
+        return Err("bad endpoint: port `0` is not connectable".to_string());
+    }
+    let mut addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|e| format!("bad endpoint: resolve `{host}`: {e}"))?
+        .collect();
+    match family {
+        "ipv4" => addrs.retain(|a| a.is_ipv4()),
+        "ipv6" => addrs.retain(|a| a.is_ipv6()),
+        _ => {}
+    }
+    addrs
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("bad endpoint: no {family} address for `{host}`"))
+}
+
 /// Resolve factory fields into peer parameters.
 pub fn resolve(cfg: &HopConfig) -> Result<WgParams, String> {
     let peer = cfg.get("peer").unwrap_or("warp");
@@ -200,5 +245,30 @@ mod tests {
         ]))
         .expect_err("bad awg value");
         assert!(err.contains("awg_jc"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn endpoint_hostnames_resolve() {
+        // `localhost` exercises the resolver path offline (hosts file, no
+        // DNS); literals never touch the resolver.
+        let lit = resolve_endpoint("127.0.0.1:51820", "dual")
+            .await
+            .expect("literal");
+        assert_eq!(lit, "127.0.0.1:51820".parse().unwrap());
+        let via_dns = resolve_endpoint("localhost:51820", "dual")
+            .await
+            .expect("localhost");
+        assert!(via_dns.ip().is_loopback(), "{via_dns}");
+        assert!(resolve_endpoint("no-such-host.invalid:51820", "dual")
+            .await
+            .is_err());
+        assert!(
+            resolve_endpoint("::1", "dual").await.is_err(),
+            "unbracketed v6"
+        );
+        assert!(
+            resolve_endpoint("1.2.3.4:0", "dual").await.is_err(),
+            "port 0"
+        );
     }
 }

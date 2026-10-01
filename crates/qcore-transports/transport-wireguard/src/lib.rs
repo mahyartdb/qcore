@@ -95,6 +95,19 @@ impl qcore_transport_api::HopFactory for WireguardFactory {
         carrier: Arc<dyn Dialer>,
     ) -> Result<Arc<dyn RunningHop>, HopError> {
         let hop_id = cfg.get("hop_id").unwrap_or("wireguard-0").to_string();
+        // Hostnames resolve here (async) so standard `.conf` endpoints work:
+        // the sync `modes::resolve` below then always sees an IP literal.
+        let mut cfg = cfg;
+        if let Some(ep) = cfg.get("endpoint") {
+            if ep.parse::<SocketAddr>().is_err() {
+                let family = cfg.get("family").unwrap_or("dual").to_string();
+                let resolved = modes::resolve_endpoint(&ep, &family)
+                    .await
+                    .map_err(|e| HopError::new(HopErrorKind::Config, Some(hop_id.clone()), e))?;
+                cfg.fields
+                    .insert("endpoint".to_string(), resolved.to_string());
+            }
+        }
         let params = modes::resolve(&cfg)
             .map_err(|e| HopError::new(HopErrorKind::Config, Some(hop_id.clone()), e))?;
         WireguardHop::bring_up(hop_id, params, carrier).await
@@ -629,6 +642,17 @@ impl UdpFlow for WgUdpFlow {
             return Err(HopError::transport(
                 self.hop_id.clone(),
                 "wireguard flow is bound to its dial destination",
+            ));
+        }
+        // Bound before framing: the `as u16` IP-length header in `wrap_ip`
+        // wraps past 65535 and the peer would receive a truncated lie.
+        if self.prefix.len().saturating_add(buf.len()) > 65535 {
+            return Err(HopError::transport(
+                self.hop_id.clone(),
+                format!(
+                    "datagram {} exceeds 65535",
+                    self.prefix.len().saturating_add(buf.len())
+                ),
             ));
         }
         let frame = stream::encode_dgram_prefixed(&self.prefix, buf);

@@ -39,6 +39,13 @@ const DGRAM: u8 = 0x04;
 /// [`StreamTable::stream_drops`], surfaced as [`HopEvent::Congested`].
 pub const STREAM_QUEUE_CAP: usize = 1024;
 
+/// Cap on concurrent streams per table: lanes are individually bounded
+/// (1024 + 1024-seq window) but the id space is a full u32, so one
+/// malicious/buggy authenticated peer opening streams without FIN could grow
+/// memory without bound. Past the cap, new OPENs are dropped and counted
+/// (fail-closed backpressure, observable as `Congested`).
+pub const MAX_STREAMS: usize = 1024;
+
 /// IP protocol number carrying tunnel-channel frames (RFC 3692 experimental).
 pub const CHANNEL_IP_PROTO: u8 = 253;
 
@@ -228,14 +235,24 @@ pub fn dispatch(table: &StreamTable, frame: Vec<u8>) -> Result<(), String> {
         OPEN => {
             let (id, _dst) = parse_open(&frame[1..])?;
             let mut t = table.inner.lock().unwrap();
-            t.streams.entry(id).or_insert_with(|| {
-                let (tx, _) = tokio::sync::mpsc::channel(STREAM_QUEUE_CAP);
-                StreamEntry {
-                    tx,
-                    expect: 0,
-                    pending: BTreeMap::new(),
+            if !t.streams.contains_key(&id) {
+                if t.streams.len() >= MAX_STREAMS {
+                    // Table full: drop the OPEN and count it (bounded,
+                    // observable) instead of growing without bound.
+                    drop(t);
+                    table.record_stream_drops(1);
+                    return Ok(());
                 }
-            });
+                let (tx, _) = tokio::sync::mpsc::channel(STREAM_QUEUE_CAP);
+                t.streams.insert(
+                    id,
+                    StreamEntry {
+                        tx,
+                        expect: 0,
+                        pending: BTreeMap::new(),
+                    },
+                );
+            }
             Ok(())
         }
         DATA => {
@@ -359,6 +376,11 @@ pub async fn open_stream(
     let (tx, rx) = tokio::sync::mpsc::channel(STREAM_QUEUE_CAP);
     {
         let mut t = table.inner.lock().unwrap();
+        // Same bound as inbound OPENs: an unbounded outbound burst is the
+        // same memory hole through the local API.
+        if t.streams.len() >= MAX_STREAMS {
+            return Err("too many concurrent streams".to_string());
+        }
         t.streams.insert(
             id,
             StreamEntry {
@@ -636,6 +658,34 @@ mod tests {
         }
         assert_eq!(max_seen, 76, "cumulative total survives bus lag");
         assert_eq!(seen_hop, "wg-test-0");
+    }
+
+    fn open_frame(id: u32) -> Vec<u8> {
+        let dst = "127.0.0.1:1";
+        let mut f = Vec::with_capacity(6 + dst.len());
+        f.push(OPEN);
+        f.extend_from_slice(&id.to_be_bytes());
+        f.push(dst.len() as u8);
+        f.extend_from_slice(dst.as_bytes());
+        f
+    }
+
+    #[test]
+    fn stream_table_caps_concurrent_opens() {
+        let table = StreamTable::new();
+        for id in 0..MAX_STREAMS as u32 {
+            dispatch(&table, open_frame(id)).expect("opens within cap");
+        }
+        assert_eq!(table.stream_drops(), 0);
+        for id in MAX_STREAMS as u32..MAX_STREAMS as u32 + 50 {
+            dispatch(&table, open_frame(id)).expect("over-cap OPENs drop, not error");
+        }
+        assert_eq!(table.stream_drops(), 50, "flood beyond cap is counted");
+        assert_eq!(
+            table.inner.lock().unwrap().streams.len(),
+            MAX_STREAMS,
+            "table stays bounded"
+        );
     }
 
     #[test]

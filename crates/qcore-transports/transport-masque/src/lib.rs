@@ -481,6 +481,7 @@ impl UdpFlow for QuicDgrams {
                 "masque datagram flow is bound to its dial destination",
             ));
         }
+        check_datagram_len(&self.hop_id, buf.len())?;
         let mut frame = Vec::with_capacity(self.prefix.len() + buf.len());
         frame.extend_from_slice(&self.prefix);
         frame.extend_from_slice(buf);
@@ -811,6 +812,41 @@ struct H2Dgrams {
 /// Max framed payload per H2 datagram (bounded framing checked before allocating).
 const MAX_H2_DATAGRAM: usize = 65535;
 
+/// Cap on buffered-but-unframed H2 datagram bytes: one max-size frame plus
+/// its 4-byte length prefix. Anything beyond that is a hostile or broken
+/// peer trickling bytes forever; fail closed instead of growing `pending`.
+const MAX_H2_PENDING: usize = MAX_H2_DATAGRAM + 4;
+
+/// Fail-fast datagram size gate shared by the H3 (QUIC DATAGRAM) and H2
+/// (length-prefixed DATA) UDP paths. Runs before any frame allocation or
+/// transport call, so an oversized caller buffer is rejected without
+/// allocating or depending on QUIC/H2 peer behavior.
+fn check_datagram_len(hop_id: &str, len: usize) -> Result<(), HopError> {
+    if len > MAX_H2_DATAGRAM {
+        return Err(HopError::transport(
+            hop_id,
+            format!("datagram {len} exceeds {MAX_H2_DATAGRAM}"),
+        ));
+    }
+    Ok(())
+}
+
+/// Bounded append for the H2 datagram reassembly buffer: refuses to grow
+/// `pending` past [`MAX_H2_PENDING`] instead of extending without limit.
+fn push_pending(pending: &mut Vec<u8>, data: &[u8], hop_id: &str) -> Result<(), HopError> {
+    if pending.len().saturating_add(data.len()) > MAX_H2_PENDING {
+        return Err(HopError::transport(
+            hop_id,
+            format!(
+                "datagram buffer {} exceeds {MAX_H2_PENDING}",
+                pending.len() + data.len()
+            ),
+        ));
+    }
+    pending.extend_from_slice(data);
+    Ok(())
+}
+
 #[async_trait::async_trait]
 impl UdpFlow for H2Dgrams {
     async fn send_to(&self, buf: &[u8], dst: SocketAddr) -> Result<(), HopError> {
@@ -820,12 +856,7 @@ impl UdpFlow for H2Dgrams {
                 "masque datagram flow is bound to its dial destination",
             ));
         }
-        if buf.len() > MAX_H2_DATAGRAM {
-            return Err(HopError::transport(
-                self.hop_id.clone(),
-                format!("datagram {} exceeds {MAX_H2_DATAGRAM}", buf.len()),
-            ));
-        }
+        check_datagram_len(&self.hop_id, buf.len())?;
         let mut frame = Vec::with_capacity(4 + buf.len());
         frame.extend_from_slice(&(buf.len() as u32).to_be_bytes());
         frame.extend_from_slice(buf);
@@ -871,7 +902,10 @@ impl UdpFlow for H2Dgrams {
             match chunk {
                 Some(data) => {
                     let n = data.len();
-                    self.pending.lock().await.extend_from_slice(&data);
+                    {
+                        let mut pending = self.pending.lock().await;
+                        push_pending(&mut pending, &data, &self.hop_id)?;
+                    }
                     let mut recv = self.recv.lock().await;
                     let _ = recv.flow_control().release_capacity(n);
                 }
@@ -941,5 +975,141 @@ mod tests {
             "names hop: {err}"
         );
         assert_eq!(err.kind, HopErrorKind::Transport);
+    }
+
+    #[test]
+    fn datagram_size_gate_rejects_oversize_before_alloc() {
+        // Shared H3/H2 gate: a 200k caller buffer must Err without allocating
+        // a frame or touching QUIC/H2 (QuicDgrams::send_to calls this first).
+        let err = check_datagram_len("masque-h3-0", 200_000).expect_err("200k must be rejected");
+        assert!(
+            err.message.contains("datagram 200000 exceeds 65535"),
+            "H2-shaped cap message: {err}"
+        );
+        assert!(check_datagram_len("masque-h3-0", MAX_H2_DATAGRAM).is_ok());
+        assert!(check_datagram_len("masque-h3-0", MAX_H2_DATAGRAM + 1).is_err());
+    }
+
+    #[test]
+    fn h2_pending_trickle_stays_bounded() {
+        // Endless 1-byte chunks must never grow pending past MAX_H2_PENDING.
+        let mut pending = Vec::new();
+        let mut rejected_at = None;
+        for i in 0..200_000 {
+            if let Err(e) = push_pending(&mut pending, &[0x55], "masque-h2-0") {
+                rejected_at = Some((i, e));
+                break;
+            }
+            assert!(pending.len() <= MAX_H2_PENDING, "bounded at chunk {i}");
+        }
+        let (count, err) = rejected_at.expect("trickle must trip the ceiling");
+        assert_eq!(pending.len(), MAX_H2_PENDING);
+        assert_eq!(count, MAX_H2_PENDING);
+        assert!(
+            err.message.contains("exceeds"),
+            "fail-closed message: {err}"
+        );
+    }
+
+    /// Real h2 stream pair (client send/recv + server peer) backing an
+    /// H2Dgrams flow, so send/recv caps are exercised without mocks.
+    async fn h2_pair(hop_id: &str, dst: SocketAddr) -> (H2Dgrams, h2::SendStream<Bytes>) {
+        let (client_io, server_io) = tokio::io::duplex(256 * 1024);
+        let client_handshake = tokio::spawn(async move {
+            let (sender, conn) = h2::client::handshake(client_io)
+                .await
+                .expect("client handshake");
+            tokio::spawn(async move {
+                let mut conn = conn;
+                let _ = (&mut conn).await;
+            });
+            sender
+        });
+        let mut server = h2::server::handshake(server_io)
+            .await
+            .expect("server handshake");
+        let mut sender = client_handshake.await.expect("client task");
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("http://127.0.0.1/datagrams")
+            .body(())
+            .unwrap();
+        let (resp_fut, client_send) = sender.send_request(request, false).expect("send_request");
+        let (req, mut respond) = server
+            .accept()
+            .await
+            .expect("accept Some")
+            .expect("accept Ok");
+        drop(req.into_body());
+        let response = http::Response::builder().status(200).body(()).unwrap();
+        let server_send = respond
+            .send_response(response, false)
+            .expect("send_response");
+        tokio::spawn(async move {
+            let mut server = server;
+            while let Some(accepted) = server.accept().await {
+                let _ = accepted;
+            }
+        });
+        let client_recv = resp_fut.await.expect("response").into_body();
+        let local: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let flow = H2Dgrams {
+            hop_id: hop_id.to_string(),
+            send: tokio::sync::Mutex::new(client_send),
+            recv: tokio::sync::Mutex::new(client_recv),
+            pending: tokio::sync::Mutex::new(Vec::new()),
+            dst,
+            local,
+        };
+        (flow, server_send)
+    }
+
+    #[tokio::test]
+    async fn h2_send_to_rejects_oversize() {
+        let dst: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let (flow, _server) = h2_pair("masque-h2-0", dst).await;
+        let big = vec![0u8; 200_000];
+        let err = flow
+            .send_to(&big, dst)
+            .await
+            .expect_err("200k datagram must be rejected");
+        assert!(
+            err.message.contains("exceeds 65535"),
+            "same shape as relay cap: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn h2_recv_rejects_pending_overflow() {
+        let dst: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let (flow, mut server_send) = h2_pair("masque-h2-0", dst).await;
+        // Chunk 1: one complete 10-byte datagram + 60_000 bytes of filler
+        // that open a second frame declaring len 65535 (valid, incomplete).
+        let mut first = Vec::with_capacity(14 + 60_000);
+        first.extend_from_slice(&10u32.to_be_bytes());
+        first.extend_from_slice(&[0xAB; 10]);
+        first.extend_from_slice(&65535u32.to_be_bytes());
+        first.resize(14 + 60_000, 0xCD);
+        server_send
+            .send_data(Bytes::from(first), false)
+            .expect("feed chunk 1");
+        let mut buf = vec![0u8; 70_000];
+        let (n, from) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), flow.recv_from(&mut buf))
+                .await
+                .expect("recv arrives")
+                .expect("first frame ok");
+        assert_eq!(from, dst);
+        assert_eq!(n, 10);
+        assert_eq!(&buf[..n], &[0xAB; 10]);
+        // Chunk 2 pushes the incomplete second frame past MAX_H2_DATAGRAM+4.
+        server_send
+            .send_data(Bytes::from(vec![0xEF; 8192]), false)
+            .expect("feed chunk 2");
+        let err = tokio::time::timeout(std::time::Duration::from_secs(5), flow.recv_from(&mut buf))
+            .await
+            .expect("recv resolves")
+            .expect_err("pending overflow must fail closed");
+        assert!(err.message.contains("exceeds"), "bounded pending: {err}");
     }
 }

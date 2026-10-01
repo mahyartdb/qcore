@@ -193,6 +193,8 @@ impl PacketSock for FlowSock {
 }
 
 /// Pre-handshake junk train over the uplink (best-effort; failures ignored).
+/// Defense-in-depth caps: count and sizes are already validated at parse,
+/// directly constructed params are clamped here too.
 async fn send_junk(
     udp: &Arc<dyn PacketSock>,
     peer: SocketAddr,
@@ -200,13 +202,17 @@ async fn send_junk(
     min: usize,
     max: usize,
 ) {
+    use qcore_transport_api::obfuscate::{MAX_JUNK_COUNT, MAX_JUNK_SIZE};
+    let count = count.min(MAX_JUNK_COUNT as usize);
+    let min = min.clamp(1, MAX_JUNK_SIZE);
+    let max = max.max(min).min(MAX_JUNK_SIZE);
     if count == 0 || max == 0 {
         return;
     }
     let mut rng = qcore_transport_api::obfuscate::XorShift64::new(
         qcore_transport_api::obfuscate::XorShift64::seed(),
     );
-    for _ in 0..count.min(16) {
+    for _ in 0..count {
         let packet = qcore_transport_api::obfuscate::junk_packet(&mut rng, min, max);
         udp.send_to(&packet, peer).await.ok();
     }

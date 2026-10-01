@@ -49,9 +49,17 @@ impl XorShift64 {
     }
 }
 
-/// One random-fill junk datagram of `min..=max` bytes.
+/// Caps shared with the AWG path (`awg.rs`): no junk datagram exceeds a UDP
+/// payload and no train exceeds 16 packets.
+pub const MAX_JUNK_SIZE: usize = 65_535;
+pub const MAX_JUNK_COUNT: u32 = 16;
+
+/// One random-fill junk datagram of `min..=max` bytes, clamped to
+/// `1..=MAX_JUNK_SIZE` so no input can drive a huge allocation.
 pub fn junk_packet(rng: &mut XorShift64, min: usize, max: usize) -> Vec<u8> {
-    let n = rng.range(min.max(1), max.max(min.max(1))).max(1);
+    let lo = min.clamp(1, MAX_JUNK_SIZE);
+    let hi = max.max(lo).min(MAX_JUNK_SIZE);
+    let n = rng.range(lo, hi).clamp(1, MAX_JUNK_SIZE);
     let mut out = vec![0u8; n];
     for chunk in out.chunks_mut(8) {
         let w = rng.next_u64().to_le_bytes();
@@ -73,29 +81,68 @@ pub struct NoizeParams {
 
 impl NoizeParams {
     /// `None` when no `noize_*` field is present (profile not selected).
+    /// Lenient view for compat (masque fragment path): invalid values yield
+    /// `None`, never silent zero-params.
     pub fn from_fields(fields: &std::collections::BTreeMap<String, String>) -> Option<Self> {
+        Self::try_from_fields(fields).ok().flatten()
+    }
+
+    /// Strict parse: non-numeric values, sizes above [`MAX_JUNK_SIZE`],
+    /// counts above [`MAX_JUNK_COUNT`], inverted ranges, or bad fragment
+    /// values are `Err` naming the field (matching `awg_jc=many` behavior).
+    pub fn try_from_fields(
+        fields: &std::collections::BTreeMap<String, String>,
+    ) -> Result<Option<Self>, String> {
         if !fields.keys().any(|k| k.starts_with("noize_")) {
-            return None;
+            return Ok(None);
         }
-        let num = |k: &str| {
-            fields
-                .get(k)
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(0)
+        let num = |k: &str| -> Result<usize, String> {
+            match fields.get(k) {
+                None => Ok(0),
+                Some(v) => v
+                    .parse::<usize>()
+                    .map_err(|_| format!("`{k}` value `{v}` is not a non-negative integer")),
+            }
         };
-        let junk_before = num("noize_junk_before") as u32;
-        let junk_min = num("noize_junk_min");
-        let junk_max = num("noize_junk_max");
-        let fragment = fields
-            .get("noize_fragment")
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|f| *f > 0);
-        Some(NoizeParams {
-            junk_before,
+        let junk_before = num("noize_junk_before")?;
+        let junk_min = num("noize_junk_min")?;
+        let junk_max = num("noize_junk_max")?;
+        if junk_before > MAX_JUNK_COUNT as usize {
+            return Err(format!(
+                "`noize_junk_before` value `{junk_before}` exceeds {MAX_JUNK_COUNT}"
+            ));
+        }
+        if junk_min > MAX_JUNK_SIZE || junk_max > MAX_JUNK_SIZE {
+            let bad = if junk_min > MAX_JUNK_SIZE {
+                junk_min
+            } else {
+                junk_max
+            };
+            return Err(format!("noize junk size `{bad}` exceeds {MAX_JUNK_SIZE}"));
+        }
+        if junk_min > 0 && junk_max > 0 && junk_min > junk_max {
+            return Err(format!(
+                "`noize_junk_min` value `{junk_min}` exceeds `noize_junk_max` value `{junk_max}`"
+            ));
+        }
+        let fragment = match fields.get("noize_fragment") {
+            None => None,
+            Some(v) => match v.parse::<usize>() {
+                Err(_) => {
+                    return Err(format!(
+                        "`noize_fragment` value `{v}` is not a non-negative integer"
+                    ));
+                }
+                Ok(0) => None,
+                Ok(f) => Some(f),
+            },
+        };
+        Ok(Some(NoizeParams {
+            junk_before: junk_before as u32,
             junk_min,
             junk_max,
             fragment,
-        })
+        }))
     }
 }
 
@@ -115,5 +162,54 @@ mod tests {
     #[test]
     fn params_absent_without_fields() {
         assert!(NoizeParams::from_fields(&Default::default()).is_none());
+    }
+
+    fn fields(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn huge_junk_max_rejected_not_allocated() {
+        let f = fields(&[
+            ("noize_junk_before", "16"),
+            ("noize_junk_min", "1"),
+            ("noize_junk_max", "200000000"),
+        ]);
+        let err = NoizeParams::try_from_fields(&f).expect_err("huge max must error");
+        assert!(err.contains("noize"), "names the field: {err}");
+        let mut rng = XorShift64::new(7);
+        assert!(junk_packet(&mut rng, 32, 200_000_000).len() <= MAX_JUNK_SIZE);
+    }
+
+    #[test]
+    fn non_numeric_junk_before_errors_not_silent_zero() {
+        let f = fields(&[("noize_junk_before", "many")]);
+        let err = NoizeParams::try_from_fields(&f).expect_err("non-numeric must error");
+        assert!(err.contains("noize_junk_before"), "names the field: {err}");
+        assert!(NoizeParams::from_fields(&f).is_none());
+    }
+
+    #[test]
+    fn junk_count_capped_at_parse() {
+        let ok = fields(&[("noize_junk_before", "16")]);
+        assert!(NoizeParams::try_from_fields(&ok).unwrap().is_some());
+        let over = fields(&[("noize_junk_before", "17")]);
+        assert!(NoizeParams::try_from_fields(&over).is_err());
+    }
+
+    #[test]
+    fn inverted_junk_range_rejected_and_builder_clamped() {
+        let f = fields(&[
+            ("noize_junk_before", "4"),
+            ("noize_junk_min", "256"),
+            ("noize_junk_max", "64"),
+        ]);
+        assert!(NoizeParams::try_from_fields(&f).is_err());
+        let mut rng = XorShift64::new(9);
+        assert!((1..=MAX_JUNK_SIZE).contains(&junk_packet(&mut rng, 256, 64).len()));
+        assert!((1..=MAX_JUNK_SIZE).contains(&junk_packet(&mut rng, 0, 0).len()));
     }
 }

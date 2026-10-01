@@ -93,7 +93,8 @@ fn resolve_fields(cfg: &HopConfig, peer: &str) -> Result<WgParams, String> {
     } else {
         None
     };
-    let noize = qcore_transport_api::obfuscate::NoizeParams::from_fields(&cfg.fields);
+    let noize = qcore_transport_api::obfuscate::NoizeParams::try_from_fields(&cfg.fields)
+        .map_err(|e| format!("wireguard hop: {e}"))?;
     Ok(WgParams {
         peer_endpoint: endpoint,
         private_key,

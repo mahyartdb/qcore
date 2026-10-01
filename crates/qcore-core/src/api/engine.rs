@@ -562,6 +562,13 @@ impl Engine {
         crate::chain::parse_single_hop(kind, opts)
     }
 
+    /// [`Engine::parse_single_hop`] against this engine's registry (see
+    /// `parse_single_hop_in`): shortcut resolution honors filtered
+    /// registries instead of the linked global set.
+    pub fn parse_single_hop_in(&self, kind: &str, opts: &str) -> Result<HopSpec, ChainError> {
+        crate::chain::parse_single_hop_in(kind, opts, &self.registry)
+    }
+
     /// Parse a full chain expression (`hop (, hop)*`, preset names, `@label`;
     /// contracts/cli.md grammar) with profile-dir presets.
     pub fn parse_chain(&self, expr: &str) -> Result<Vec<ExpandedHop>, ChainError> {

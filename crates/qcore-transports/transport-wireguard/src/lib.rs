@@ -101,7 +101,7 @@ impl qcore_transport_api::HopFactory for WireguardFactory {
         if let Some(ep) = cfg.get("endpoint") {
             if ep.parse::<SocketAddr>().is_err() {
                 let family = cfg.get("family").unwrap_or("dual").to_string();
-                let resolved = modes::resolve_endpoint(&ep, &family)
+                let resolved = modes::resolve_endpoint(ep, &family)
                     .await
                     .map_err(|e| HopError::new(HopErrorKind::Config, Some(hop_id.clone()), e))?;
                 cfg.fields

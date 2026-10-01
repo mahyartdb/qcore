@@ -160,11 +160,16 @@ pub fn parse_compositions_toml(s: &str) -> Result<Vec<CompositionPreset>, String
         .and_then(|p| p.as_array())
         .ok_or_else(|| "compositions.toml: missing `[[preset]]` entries".to_string())?;
     let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for p in presets {
         let name = p
             .get("name")
             .and_then(|n| n.as_str())
             .ok_or_else(|| "compositions.toml: preset without `name`".to_string())?;
+        // Duplicate preset names never last-win: fail closed naming the preset.
+        if !seen.insert(name.to_string()) {
+            return Err(format!("compositions.toml: duplicate preset `{name}`"));
+        }
         let hops = p
             .get("hop")
             .and_then(|h| h.as_array())
@@ -487,5 +492,26 @@ import = "home"
             HopConfig::Wireguard(c) => assert_eq!(c.import_ref.as_deref(), Some("home")),
             other => panic!("expected wireguard, got {}", other.kind()),
         }
+    }
+
+    #[test]
+    fn duplicate_preset_names_rejected() {
+        let toml = r#"
+[[preset]]
+name = "dup"
+[[preset.hop]]
+id = "d-0"
+kind = "mock"
+[[preset]]
+name = "dup"
+[[preset.hop]]
+id = "d-1"
+kind = "mock"
+"#;
+        let err = parse_compositions_toml(toml).expect_err("duplicate preset");
+        assert!(
+            err.contains("duplicate") && err.contains("dup"),
+            "names preset: {err}"
+        );
     }
 }

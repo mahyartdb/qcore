@@ -140,10 +140,20 @@ pub struct ObfApplication {
 }
 
 /// Load all profiles: profile-dir override when present, else shipped data.
+/// A present-but-unreadable override (permissions, directory, transient IO)
+/// fails closed — only `NotFound` (absent file) falls back to shipped data.
 pub fn load_profiles(dirs: &ProfileDirs) -> Result<BTreeMap<String, ObfuscationProfile>, String> {
     let path = dirs.profile_dir.join("obfuscation.toml");
-    let text =
-        std::fs::read_to_string(&path).unwrap_or_else(|_| SHIPPED_OBFUSCATION_TOML.to_string());
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => SHIPPED_OBFUSCATION_TOML.to_string(),
+        Err(e) => {
+            return Err(format!(
+                "obfuscation.toml: cannot read {}: {e}",
+                path.display()
+            ))
+        }
+    };
     parse_profiles_toml(&text)
 }
 
@@ -399,5 +409,29 @@ mod tests {
         let expected = (((i64::MAX - 1) as i128 + i64::MAX as i128) / 2).to_string();
         assert_eq!(r.scalar(), expected);
         assert_eq!(ParamVal::Range(4, 9).scalar(), "6");
+    }
+
+    #[test]
+    fn unreadable_override_fails_closed_only_not_found_falls_back() {
+        // Absent override falls back to shipped data.
+        let base = std::env::temp_dir().join(format!("qcore-obf-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dirs = ProfileDirs::resolve(None, Some(base.join("prof")));
+        let profiles = load_profiles(&dirs).expect("missing falls back");
+        assert!(profiles.contains_key("masque-balanced"));
+        // Present-but-unreadable (a directory at the file path: `IsADirectory`,
+        // not `NotFound`) fails closed instead of silently using shipped data.
+        let base2 = std::env::temp_dir().join(format!("qcore-obf-unread-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base2);
+        let prof = base2.join("prof");
+        std::fs::create_dir_all(prof.join("obfuscation.toml")).unwrap();
+        let dirs2 = ProfileDirs::resolve(None, Some(prof));
+        let err = load_profiles(&dirs2).unwrap_err();
+        assert!(
+            err.contains("cannot read") && err.contains("obfuscation.toml"),
+            "fail closed: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&base2);
     }
 }

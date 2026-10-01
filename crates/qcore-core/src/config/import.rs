@@ -168,6 +168,10 @@ impl ConfigImport {
         let mut peer_index = 0usize;
         let mut seen_iface = false;
         let mut raw_awg: BTreeMap<String, String> = BTreeMap::new();
+        // Duplicate INI keys fail closed (never last-wins): canonical keys
+        // seen per section instance.
+        let mut seen_iface_keys = std::collections::HashSet::new();
+        let mut seen_peer_keys: Vec<std::collections::HashSet<String>> = Vec::new();
         for (lineno, line) in raw.lines().enumerate() {
             let line = line.split(['#', ';']).next().unwrap_or("").trim();
             if line.is_empty() {
@@ -177,6 +181,7 @@ impl ConfigImport {
                 section = line[1..line.len() - 1].trim().to_lowercase();
                 if section == "peer" {
                     imp.peers.push(BTreeMap::new());
+                    seen_peer_keys.push(std::collections::HashSet::new());
                     peer_index = imp.peers.len() - 1;
                 } else if section == "interface" {
                     seen_iface = true;
@@ -199,6 +204,13 @@ impl ConfigImport {
             let key = canonical_key(&k.to_lowercase());
             match section.as_str() {
                 "interface" => {
+                    if !seen_iface_keys.insert(key.clone()) {
+                        imp.reject(format!(
+                            "line {}: duplicate field `{k}` in [Interface]",
+                            lineno + 1
+                        ));
+                        continue;
+                    }
                     if !IFACE_KEYS.contains(&key.as_str()) {
                         imp.unknown_fields.push(k.to_string());
                         imp.reject(format!("unknown field `{k}` in [Interface]"));
@@ -226,6 +238,13 @@ impl ConfigImport {
                 "peer" => {
                     if imp.peers.is_empty() {
                         imp.reject(format!("line {}: key outside any [Peer]", lineno + 1));
+                        continue;
+                    }
+                    if !seen_peer_keys[peer_index].insert(key.clone()) {
+                        imp.reject(format!(
+                            "line {}: duplicate field `{k}` in [Peer]",
+                            lineno + 1
+                        ));
                         continue;
                     }
                     if !PEER_KEYS.contains(&key.as_str()) {
@@ -262,6 +281,9 @@ impl ConfigImport {
         }
         if imp.peers.is_empty() && imp.verdict == ImportVerdict::Accepted {
             imp.reject("missing [Peer] section".to_string());
+        }
+        if imp.peers.len() > 1 {
+            imp.reject("multiple [Peer] sections (expected exactly one)".to_string());
         }
         if !imp.secrets.contains_key("interface.private_key")
             && imp.verdict == ImportVerdict::Accepted
@@ -406,15 +428,22 @@ pub fn imports_dir(dirs: &ProfileDirs) -> PathBuf {
 }
 
 /// Resolve `<ref>.toml` inside the imports dir, rejecting refs that escape
-/// it (empty, NUL, separators, `.`/`..` segments). Read paths trust
-/// caller-supplied refs — chain files, `--export`, FFI/JNI — while the
-/// write path sanitizes instead, so reads guard containment rather than
-/// rewriting the ref: dots, spaces, and unicode names (incl. hand-placed
-/// files) keep working. Deliberately NOT `starts_with` on the joined path:
-/// `Path::starts_with` is lexical and matches through `..` segments.
+/// it (empty, NUL, separators, `.`/`..` segments, Windows-forbidden
+/// `<>:\"|?*` plus `:`, and reserved device basenames `CON`/`PRN`/`AUX`/
+/// `NUL`/`COM1-9`/`LPT1-9`). Read paths trust caller-supplied refs —
+/// chain files, `--export`, FFI/JNI — while the write path sanitizes
+/// instead, so reads guard containment rather than rewriting the ref: dots,
+/// spaces, and unicode names (incl. hand-placed files) keep working.
+/// Deliberately NOT `starts_with` on the joined path: `Path::starts_with`
+/// is lexical and matches through `..` segments.
 pub(crate) fn import_path(dirs: &ProfileDirs, import_ref: &str) -> Result<PathBuf, String> {
+    let has_forbidden = import_ref
+        .chars()
+        .any(|c| matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*'));
     let escaped = import_ref.is_empty()
         || import_ref.contains('\0')
+        || has_forbidden
+        || is_reserved_import_ref(import_ref)
         || import_ref
             .split(['/', '\\'])
             .any(|seg| seg.is_empty() || seg == "." || seg == "..");
@@ -422,6 +451,39 @@ pub(crate) fn import_path(dirs: &ProfileDirs, import_ref: &str) -> Result<PathBu
         return Err(format!("invalid import ref `{import_ref}`"));
     }
     Ok(imports_dir(dirs).join(format!("{import_ref}.toml")))
+}
+
+/// Windows device basenames (`CON`, `PRN`, `AUX`, `NUL`, `COM1-9`,
+/// `LPT1-9`, case-insensitive, before the first `.`): `<ref>.toml` would
+/// collide with the device even with an extension, so reject fail-closed.
+fn is_reserved_import_ref(import_ref: &str) -> bool {
+    let base = import_ref.split('.').next().unwrap_or(import_ref);
+    let base = base.trim_end_matches([' ', '.']);
+    matches!(
+        base.to_ascii_uppercase().as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    )
 }
 
 /// Per-dir secret namespace (same FNV-1a scheme as the identity store in
@@ -468,6 +530,9 @@ pub fn store_import(dirs: &ProfileDirs, imp: &ConfigImport) -> Result<String, St
     }
     if imp.peers.is_empty() {
         return Err("import has no [Peer]".to_string());
+    }
+    if imp.peers.len() > 1 {
+        return Err("import has multiple [Peer] sections (expected exactly one)".to_string());
     }
     dirs.ensure_dirs().map_err(|e| e.to_string())?;
     let dir = imports_dir(dirs);
@@ -575,6 +640,16 @@ impl StoredImport {
 
     fn from_toml(text: &str) -> Result<Self, String> {
         let v: toml::Value = toml::from_str(text).map_err(|e| format!("import record: {e}"))?;
+        // Stored records are machine-written complete: any unknown field at
+        // any level is corruption, fail closed naming the field.
+        if let Some(t) = v.as_table() {
+            for k in t.keys() {
+                if !["ref_name", "source_format", "interface", "peers", "awg"].contains(&k.as_str())
+                {
+                    return Err(format!("import record: unknown field `{k}`"));
+                }
+            }
+        }
         let get = |k: &str| {
             v.get(k)
                 .and_then(|x| x.as_str())
@@ -595,6 +670,15 @@ impl StoredImport {
                 })
                 .collect::<Result<BTreeMap<_, _>, _>>()
         };
+        // Stored interface carries non-secret, non-AWG fields only
+        // (`address`/`dns`/`mtu`); anything else is corruption.
+        if let Some(t) = v.get("interface").and_then(|x| x.as_table()) {
+            for k in t.keys() {
+                if !["address", "dns", "mtu"].contains(&k.as_str()) {
+                    return Err(format!("import record: unknown field `interface.{k}`"));
+                }
+            }
+        }
         let interface = v
             .get("interface")
             .and_then(|x| x.as_table())
@@ -607,8 +691,26 @@ impl StoredImport {
                 let t = p
                     .as_table()
                     .ok_or_else(|| "import record: peer is not a table".to_string())?;
+                for k in t.keys() {
+                    if k != "index"
+                        && ![
+                            "public_key",
+                            "allowed_ips",
+                            "endpoint",
+                            "persistent_keepalive",
+                        ]
+                        .contains(&k.as_str())
+                    {
+                        return Err(format!("import record: unknown field `peers.{k}`"));
+                    }
+                }
                 peers.push(table_to_map(t)?);
             }
+        }
+        if peers.len() > 1 {
+            return Err(
+                "import record: multiple [Peer] sections (expected exactly one)".to_string(),
+            );
         }
         let awg = match v.get("awg") {
             None => None,
@@ -616,6 +718,16 @@ impl StoredImport {
                 let t = a
                     .as_table()
                     .ok_or_else(|| "import record: awg is not a table".to_string())?;
+                for k in t.keys() {
+                    if ![
+                        "jc", "jmin", "jmax", "s1", "s2", "s3", "s4", "h1", "h2", "h3", "h4", "i1",
+                        "i2", "i3", "i4", "i5",
+                    ]
+                    .contains(&k.as_str())
+                    {
+                        return Err(format!("import record: unknown field `awg.{k}`"));
+                    }
+                }
                 // Missing or mistyped numerics are corruption, not zeros:
                 // records are machine-written complete, so fail closed.
                 // Integer-typed values parse like their string forms:
@@ -779,6 +891,16 @@ pub fn materialize(
                 None,
                 Some(hop.id.clone()),
                 format!("import `{import_ref}` has no [Peer]"),
+                None,
+            ));
+        }
+        if stored.peers.len() > 1 {
+            return Err(ChainError::new(
+                None,
+                Some(hop.id.clone()),
+                format!(
+                    "import `{import_ref}` has multiple [Peer] sections (expected exactly one)"
+                ),
                 None,
             ));
         }
@@ -1006,7 +1128,8 @@ mod tests {
                 format!("{ok}.toml")
             );
         }
-        // Traversal, absolute, empty, and NUL refs fail closed.
+        // Traversal, absolute, empty, NUL, Windows-forbidden, and reserved
+        // device refs fail closed.
         for bad in [
             "",
             ".",
@@ -1018,8 +1141,136 @@ mod tests {
             "a//b",
             "nul\0byte",
             "a\\..\\b",
+            "a:b",
+            "a<b",
+            "a>b",
+            "a\"b",
+            "a|b",
+            "a?b",
+            "a*b",
+            "CON",
+            "con",
+            "PRN",
+            "aux",
+            "NUL",
+            "COM1",
+            "com9",
+            "LPT1",
+            "lpt9",
+            "CON.foo",
+            "com1.txt",
+            "aux ",
         ] {
             assert!(import_path(&dirs, bad).is_err(), "accepted: {bad:?}");
         }
+    }
+
+    #[test]
+    fn reserved_basename_check_is_first_dot_component() {
+        // Only the part before the first `.` decides: `my.vpn` keeps working
+        // while `CON.anything` is a device even with an extension.
+        assert!(is_reserved_import_ref("CON"));
+        assert!(is_reserved_import_ref("con"));
+        assert!(is_reserved_import_ref("CON.foo"));
+        assert!(!is_reserved_import_ref("my.vpn"));
+        assert!(!is_reserved_import_ref("a..b"));
+        assert!(!is_reserved_import_ref("..."));
+        assert!(!is_reserved_import_ref("wg-home"));
+    }
+
+    fn keys() -> (String, String) {
+        // 32-byte keys: deterministic vectors for INI duplicate tests.
+        let priv_b64 = b64_encode(&[7u8; 32]);
+        let pub_b64 = b64_encode(&[9u8; 32]);
+        (priv_b64, pub_b64)
+    }
+
+    #[test]
+    fn duplicate_interface_key_rejected() {
+        let (priv_b64, pub_b64) = keys();
+        let text = format!(
+            "[Interface]\nPrivateKey = {priv_b64}\nAddress = 10.0.0.2/32\nAddress = 10.0.0.3/32\n\n[Peer]\nPublicKey = {pub_b64}\nAllowedIPs = 0.0.0.0/0\nEndpoint = 203.0.113.10:51820\n"
+        );
+        let imp =
+            ConfigImport::parse_str(&text, std::path::Path::new("dup.conf")).expect("verdict");
+        assert_eq!(imp.verdict, ImportVerdict::Rejected);
+        assert!(
+            imp.reasons.join(" ").contains("duplicate"),
+            "duplicate: {:?}",
+            imp.reasons
+        );
+        assert!(
+            imp.reasons.join(" ").contains("Address"),
+            "names field: {:?}",
+            imp.reasons
+        );
+    }
+
+    #[test]
+    fn duplicate_peer_key_rejected_case_insensitive() {
+        let (priv_b64, pub_b64) = keys();
+        // `Endpoint` vs `endpoint` share the canonical key: last-wins would
+        // silently pick one, so duplicates fail closed.
+        let text = format!(
+            "[Interface]\nPrivateKey = {priv_b64}\n\n[Peer]\nPublicKey = {pub_b64}\nEndpoint = 203.0.113.10:51820\nendpoint = 203.0.113.11:51820\n"
+        );
+        let imp =
+            ConfigImport::parse_str(&text, std::path::Path::new("dup.conf")).expect("verdict");
+        assert_eq!(imp.verdict, ImportVerdict::Rejected);
+        assert!(imp.reasons.join(" ").contains("duplicate"));
+    }
+
+    #[test]
+    fn multi_peer_import_rejected() {
+        let (priv_b64, pub_b64) = keys();
+        let text = format!(
+            "[Interface]\nPrivateKey = {priv_b64}\n\n[Peer]\nPublicKey = {pub_b64}\nEndpoint = 203.0.113.10:51820\n\n[Peer]\nPublicKey = {pub_b64}\nEndpoint = 203.0.113.11:51820\n"
+        );
+        let imp =
+            ConfigImport::parse_str(&text, std::path::Path::new("multi.conf")).expect("verdict");
+        assert_eq!(imp.verdict, ImportVerdict::Rejected);
+        assert!(
+            imp.reasons.join(" ").contains("[Peer]"),
+            "names section: {:?}",
+            imp.reasons
+        );
+    }
+
+    #[test]
+    fn stored_record_unknown_fields_rejected() {
+        for (label, text) in [
+            (
+                "top",
+                "ref_name = \"r\"\nsource_format = \"wireguard\"\nbogus = \"1\"\n[interface]\n",
+            ),
+            (
+                "interface",
+                "ref_name = \"r\"\nsource_format = \"wireguard\"\n[interface]\nbogus = \"1\"\n",
+            ),
+            (
+                "peer",
+                "ref_name = \"r\"\nsource_format = \"wireguard\"\n[interface]\n[[peers]]\nindex = 0\nbogus = \"1\"\n",
+            ),
+            (
+                "awg",
+                "ref_name = \"r\"\nsource_format = \"amneziawg\"\n[interface]\n[awg]\njc = \"1\"\njmin = \"2\"\njmax = \"3\"\ns1 = \"0\"\ns2 = \"0\"\ns3 = \"0\"\ns4 = \"0\"\nh1 = \"0\"\nh2 = \"0\"\nh3 = \"0\"\nh4 = \"0\"\nbogus = \"1\"\n",
+            ),
+        ] {
+            let err = StoredImport::from_toml(text).unwrap_err();
+            assert!(
+                err.contains("unknown field") && err.contains("bogus"),
+                "{label}: got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn stored_multi_peer_record_rejected() {
+        let text = "ref_name = \"r\"\nsource_format = \"wireguard\"\n[interface]\n[[peers]]\nindex = 0\npublic_key = \"x\"\n[[peers]]\nindex = 1\npublic_key = \"y\"\n";
+        let err = StoredImport::from_toml(text).unwrap_err();
+        assert!(
+            err.contains("multiple") && err.contains("[Peer]"),
+            "got: {err}"
+        );
     }
 }

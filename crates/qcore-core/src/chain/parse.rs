@@ -225,6 +225,12 @@ fn parse_hop(
                 "value for `{k}` must be quoted (contains `=`, quote or space)"
             )));
         }
+        // Duplicate keys never last-win: fail closed naming the field.
+        if pairs.contains_key(k) {
+            return Err(err(format!(
+                "duplicate option `{k}` for transport `{name}`"
+            )));
+        }
         pairs.insert(k.to_string(), unquote(v));
     }
     // Plugin kinds (SC-002c): registered (checked above) but untyped —
@@ -359,5 +365,30 @@ mod tests {
         let presets = crate::chain::preset::builtin_presets();
         let err = parse_chain("   ", &reg, &presets).unwrap_err();
         assert!(err.reason.contains("empty"));
+    }
+
+    #[test]
+    fn duplicate_option_rejected_naming_field() {
+        // `registry-test` is the inventory plugin registered in
+        // `registry::tests` (same test binary): a plugin kind exercises the
+        // duplicate gate without needing an out-of-crate transport link.
+        let reg = crate::registry::TransportRegistry::global();
+        let presets = crate::chain::preset::builtin_presets();
+        let err = parse_chain("registry-test x=1 x=1", &reg, &presets).unwrap_err();
+        assert!(
+            err.reason.contains("duplicate") && err.reason.contains("x"),
+            "got: {}",
+            err.reason
+        );
+    }
+
+    #[test]
+    fn single_hop_duplicate_option_rejected() {
+        let err = crate::chain::parse_single_hop("mock", "family=ipv4 family=dual").unwrap_err();
+        assert!(
+            err.reason.contains("duplicate") && err.reason.contains("family"),
+            "got: {}",
+            err.reason
+        );
     }
 }

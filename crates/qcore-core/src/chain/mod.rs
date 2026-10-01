@@ -129,6 +129,15 @@ pub fn parse_single_hop(kind: &str, opts: &str) -> Result<HopSpec, ChainError> {
                 None,
             )
         })?;
+        // Duplicate keys never last-win: fail closed naming the field.
+        if pairs.contains_key(k) {
+            return Err(ChainError::new(
+                None,
+                None,
+                format!("duplicate option `{k}` for transport `{kind}`"),
+                None,
+            ));
+        }
         pairs.insert(k.to_string(), parse::unquote(v));
     }
     let get = |k: &str, default: &str| pairs.get(k).cloned().unwrap_or_else(|| default.to_string());

@@ -76,14 +76,19 @@ unsafe fn rust_to_j(env: JniEnv, s: &str) -> JString {
 }
 
 /// Reinterpret a handle integer as the engine pointer it came from.
-/// Only valid for values previously produced as `out as i64`; anything
-/// else is a caller bug with undefined results.
+/// Returns `None` for non-positive handles (0/negative are never valid
+/// engine addresses) so callers fail closed without dereferencing.
 ///
 /// # Safety
-/// `handle` must be a live engine pointer from `engineNew` (or 0, which
-/// the C functions reject as a null handle).
-unsafe fn with_engine<T>(handle: i64, f: impl FnOnce(*mut crate::QcoreEngine) -> T) -> T {
-    f(handle as *mut crate::QcoreEngine)
+/// A positive `handle` must be a live engine pointer previously produced
+/// as `out as i64` by `engineNew`; non-positive values are rejected
+/// before any pointer use.
+unsafe fn with_engine<T>(handle: i64, f: impl FnOnce(*mut crate::QcoreEngine) -> T) -> Option<T> {
+    if handle <= 0 {
+        return None;
+    }
+    // SAFETY: positive `handle` restores the live pointer per the contract above.
+    Some(f(handle as *mut crate::QcoreEngine))
 }
 
 fn take_string(ptr: *mut c_char) -> String {
@@ -220,7 +225,8 @@ pub unsafe extern "system" fn Java_com_qcore_Qcore_engineStart(
             let mut err: *mut crate::QcoreError = std::ptr::null_mut();
             let code = with_engine(handle, |e| {
                 crate::qcore_engine_start(e, args[0], &mut out, &mut err)
-            });
+            })
+            .unwrap_or(6);
             (code, out, err)
         })
     });
@@ -244,7 +250,8 @@ pub unsafe extern "system" fn Java_com_qcore_Qcore_engineStatusJson(
             let mut err: *mut crate::QcoreError = std::ptr::null_mut();
             let code = with_engine(handle, |e| {
                 crate::qcore_engine_status_json(e, args[0], &mut out, &mut err)
-            });
+            })
+            .unwrap_or(6);
             (code, out, err)
         })
     });
@@ -263,12 +270,26 @@ pub unsafe extern "system" fn Java_com_qcore_Qcore_engineStop(
     session_id: JString,
 ) -> i32 {
     let result = std::panic::catch_unwind(|| unsafe {
-        let id = j_to_rust(env, session_id).unwrap_or_default();
-        let id_c = CString::new(id).unwrap_or_else(|_| CString::new("").unwrap());
+        // Fail closed on undecodable JVM input: null/pin-failure/non-UTF-8
+        // never becomes empty input, and interior NULs never rewrite.
+        let id = match j_to_rust(env, session_id) {
+            Some(s) => s,
+            None => return -1,
+        };
+        let id_c = match CString::new(id) {
+            Ok(c) => c,
+            Err(_) => return -1,
+        };
         let mut err: *mut crate::QcoreError = std::ptr::null_mut();
-        let code = with_engine(handle, |e| {
+        let code = match with_engine(handle, |e| {
             crate::qcore_engine_stop(e, id_c.as_ptr(), &mut err)
-        });
+        }) {
+            Some(c) => c,
+            None => {
+                take_error(err);
+                return -1;
+            }
+        };
         take_error(err);
         code
     });
@@ -287,9 +308,10 @@ pub unsafe extern "system" fn Java_com_qcore_Qcore_engineFree(
 ) {
     let _ = std::panic::catch_unwind(|| {
         // SAFETY: `handle` came from the JVM side holding a live engine;
-        // `with_engine` documents the handle-validity contract.
+        // `with_engine` documents the handle-validity contract and rejects
+        // non-positive handles before any pointer use.
         unsafe {
-            with_engine(handle, |e| crate::qcore_engine_free(e));
+            let _ = with_engine(handle, |e| crate::qcore_engine_free(e));
         }
     });
 }
@@ -313,7 +335,8 @@ pub unsafe extern "system" fn Java_com_qcore_Qcore_scanJson(
             let mut err: *mut crate::QcoreError = std::ptr::null_mut();
             let code = with_engine(handle, |e| {
                 crate::qcore_scan(e, args[0], args[1], args[2], &mut out, &mut err)
-            });
+            })
+            .unwrap_or(6);
             (code, out, err)
         })
     });
@@ -337,7 +360,8 @@ pub unsafe extern "system" fn Java_com_qcore_Qcore_importConfig(
             let mut err: *mut crate::QcoreError = std::ptr::null_mut();
             let code = with_engine(handle, |e| {
                 crate::qcore_import_config(e, args[0], &mut out, &mut err)
-            });
+            })
+            .unwrap_or(6);
             (code, out, err)
         })
     });
@@ -361,7 +385,8 @@ pub unsafe extern "system" fn Java_com_qcore_Qcore_exportConfig(
             let mut err: *mut crate::QcoreError = std::ptr::null_mut();
             let code = with_engine(handle, |e| {
                 crate::qcore_export_config(e, args[0], &mut out, &mut err)
-            });
+            })
+            .unwrap_or(6);
             (code, out, err)
         })
     });
@@ -411,5 +436,28 @@ mod tests {
             handle, 0,
             "undecodable config must fail closed, not default"
         );
+    }
+
+    #[test]
+    fn with_engine_rejects_non_positive_handles() {
+        // SAFETY: non-positive probes never dereference; the closure is
+        // unreachable for these inputs.
+        assert!(unsafe { with_engine(0, |_| 1) }.is_none());
+        assert!(unsafe { with_engine(-1, |_| 1) }.is_none());
+        assert!(unsafe { with_engine(i64::MIN, |_| 1) }.is_none());
+    }
+
+    #[test]
+    fn engine_stop_fails_closed_on_undecodable_session() {
+        // Pin failure => `j_to_rust` None => -1, never empty-string dispatch.
+        let table = failing_table();
+        let mut slot: *const JniTable = &table;
+        let env: JniEnv = &mut slot as *mut *const JniTable;
+        let bogus: JString = std::ptr::dangling_mut::<c_void>();
+        let rc = unsafe { Java_com_qcore_Qcore_engineStop(env, std::ptr::null_mut(), 1, bogus) };
+        assert_eq!(rc, -1, "undecodable session must fail closed");
+        // Non-positive handle also fails closed without touching the engine.
+        let rc2 = unsafe { Java_com_qcore_Qcore_engineStop(env, std::ptr::null_mut(), 0, bogus) };
+        assert_eq!(rc2, -1, "non-positive handle must fail closed");
     }
 }

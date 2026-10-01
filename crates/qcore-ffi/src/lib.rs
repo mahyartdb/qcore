@@ -39,16 +39,21 @@ pub unsafe extern "C" fn qcore_abi_version() -> u32 {
 }
 
 fn ok_string(out: *mut *mut c_char, s: String) -> c_int {
-    if !out.is_null() {
-        match CString::new(s) {
-            Ok(c) => *unsafe { &mut *out } = c.into_raw(),
-            Err(_) => {
-                // Interior NUL cannot occur (JSON/ids are NUL-free); fail loud.
-                return -1;
-            }
+    if out.is_null() {
+        return 6;
+    }
+    match CString::new(s) {
+        Ok(c) => {
+            // SAFETY: `out` is non-null (checked above) and points to a
+            // writable caller pointer per the out-param contract.
+            *unsafe { &mut *out } = c.into_raw();
+            0
+        }
+        Err(_) => {
+            // Interior NUL cannot occur (JSON/ids are NUL-free); fail loud.
+            -1
         }
     }
-    0
 }
 
 fn fail(err_out: *mut *mut QcoreError, code: c_int, message: String) -> c_int {
@@ -93,21 +98,35 @@ fn ffi_worker_threads(v: &serde_json::Value) -> usize {
         .unwrap_or(2)
 }
 
-fn c_str(ptr: *const c_char) -> Result<String, String> {
+/// Read a NUL-terminated UTF-8 argument.
+///
+/// # Safety
+/// `ptr` must be null-checked by the caller contract: null yields a usage
+/// error, otherwise it must point to a valid NUL-terminated C string that
+/// remains alive for this call.
+unsafe fn c_str(ptr: *const c_char) -> Result<String, String> {
     if ptr.is_null() {
         return Err("null string argument".to_string());
     }
+    // SAFETY: `ptr` is non-null (checked above) and points to a valid
+    // NUL-terminated string per the caller's Safety contract.
     unsafe { CStr::from_ptr(ptr) }
         .to_str()
         .map(str::to_string)
         .map_err(|_| "argument is not valid UTF-8".to_string())
 }
 
-fn opt_c_str(ptr: *const c_char) -> Result<Option<String>, String> {
+/// Read an optional NUL-terminated UTF-8 argument (null selects default).
+///
+/// # Safety
+/// Same contract as [`c_str`]: null is `None`, otherwise `ptr` must point
+/// to a valid NUL-terminated C string alive for this call.
+unsafe fn opt_c_str(ptr: *const c_char) -> Result<Option<String>, String> {
     if ptr.is_null() {
         Ok(None)
     } else {
-        c_str(ptr).map(Some)
+        // SAFETY: non-null `ptr` satisfies `c_str`'s validity contract.
+        unsafe { c_str(ptr) }.map(Some)
     }
 }
 
@@ -136,7 +155,8 @@ pub unsafe extern "C" fn qcore_engine_new(
         if out.is_null() {
             return fail(err_out, 6, "null out-param".to_string());
         }
-        let v: serde_json::Value = match opt_c_str(config_json) {
+        // SAFETY: `config_json` validity is the caller's Safety contract for this entry point.
+        let v: serde_json::Value = match unsafe { opt_c_str(config_json) } {
             Err(e) => return fail(err_out, 6, e),
             Ok(None) => serde_json::Value::Null,
             Ok(Some(s)) => match serde_json::from_str(&s) {
@@ -226,7 +246,8 @@ pub unsafe extern "C" fn qcore_engine_start(
         if handle.is_null() {
             return fail(err_out, 6, "null engine handle".to_string());
         }
-        let expr = match c_str(chain_expr) {
+        // SAFETY: `chain_expr` validity is the caller's Safety contract for this entry point.
+        let expr = match unsafe { c_str(chain_expr) } {
             Err(e) => return fail(err_out, 6, e),
             Ok(s) => s,
         };
@@ -259,7 +280,8 @@ pub unsafe extern "C" fn qcore_engine_status_json(
         if handle.is_null() {
             return fail(err_out, 6, "null engine handle".to_string());
         }
-        let id = match c_str(session_id) {
+        // SAFETY: `session_id` validity is the caller's Safety contract for this entry point.
+        let id = match unsafe { c_str(session_id) } {
             Err(e) => return fail(err_out, 6, e),
             Ok(s) => s,
         };
@@ -285,7 +307,8 @@ pub unsafe extern "C" fn qcore_engine_stop(
         if handle.is_null() {
             return fail(err_out, 6, "null engine handle".to_string());
         }
-        let id = match c_str(session_id) {
+        // SAFETY: `session_id` validity is the caller's Safety contract for this entry point.
+        let id = match unsafe { c_str(session_id) } {
             Err(e) => return fail(err_out, 6, e),
             Ok(s) => s,
         };
@@ -316,8 +339,9 @@ pub unsafe extern "C" fn qcore_scan(
         if handle.is_null() {
             return fail(err_out, 6, "null engine handle".to_string());
         }
+        // SAFETY: scan string args' validity is the caller's Safety contract for this entry point.
         let (transport, profile_name, family) =
-            match (c_str(transport), c_str(profile), c_str(family)) {
+            match unsafe { (c_str(transport), c_str(profile), c_str(family)) } {
                 (Ok(t), Ok(p), Ok(f)) => (t, p, f),
                 _ => return fail(err_out, 6, "scan arguments must be UTF-8".to_string()),
             };
@@ -368,7 +392,8 @@ pub unsafe extern "C" fn qcore_import_config(
         if handle.is_null() {
             return fail(err_out, 6, "null engine handle".to_string());
         }
-        let path = match c_str(path) {
+        // SAFETY: `path` validity is the caller's Safety contract for this entry point.
+        let path = match unsafe { c_str(path) } {
             Err(e) => return fail(err_out, 6, e),
             Ok(s) => s,
         };
@@ -414,7 +439,8 @@ pub unsafe extern "C" fn qcore_export_config(
         if handle.is_null() {
             return fail(err_out, 6, "null engine handle".to_string());
         }
-        let import_ref = match c_str(import_ref) {
+        // SAFETY: `import_ref` validity is the caller's Safety contract for this entry point.
+        let import_ref = match unsafe { c_str(import_ref) } {
             Err(e) => return fail(err_out, 6, e),
             Ok(s) => s,
         };
@@ -540,6 +566,27 @@ mod tests {
             2,
             "non-integer → default"
         );
+    }
+
+    #[test]
+    fn ok_string_null_out_is_usage_not_success() {
+        // Null out-param must not masquerade as success: out-params are
+        // null-checked per the FFI contract (usage error 6).
+        assert_eq!(ok_string(std::ptr::null_mut(), "x".to_string()), 6);
+        let mut out: *mut c_char = std::ptr::null_mut();
+        assert_eq!(ok_string(&mut out as *mut _, "ok".to_string()), 0);
+        assert!(!out.is_null());
+        // SAFETY: `out` was just written by `ok_string` per its contract.
+        let s = unsafe { CStr::from_ptr(out) }.to_str().unwrap().to_string();
+        assert_eq!(s, "ok");
+        assert_eq!(unsafe { qcore_string_free(out) }, 0);
+    }
+
+    #[test]
+    fn c_str_helpers_reject_null() {
+        // SAFETY: null is the documented no-deref probe for both helpers.
+        assert!(unsafe { c_str(std::ptr::null()) }.is_err());
+        assert!(unsafe { opt_c_str(std::ptr::null()) }.unwrap().is_none());
     }
 
     #[test]

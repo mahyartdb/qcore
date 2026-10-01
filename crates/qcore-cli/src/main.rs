@@ -321,6 +321,12 @@ async fn async_main(cli: Cli) -> i32 {
         Commands::Status => run_status(cli.json, &dirs),
         Commands::Stop => run_stop(cli.json, &dirs),
         Commands::Ls => {
+            // `ls` is human-readable only: `--json` would silently violate
+            // the one-document stdout contract, so fail closed (exit 6).
+            if cli.json {
+                eprintln!("qcore: ls --json not supported (exit 6)");
+                return exit::USAGE;
+            }
             let engine = cmd::preflight::default_engine(dirs.clone());
             cmd::profiles::run(&engine, &dirs)
         }
@@ -553,10 +559,11 @@ async fn run_connect(o: ConnectOpts) -> i32 {
         Err(code) => return code,
     };
     let dirs = o.globals_dirs.clone();
-    // Fail fast on family/prefer before touching the network (exit 2).
+    // Fail fast on family/prefer before touching the network (exit 6:
+    // unknown families are usage errors, matching `scan --family`).
     if let Err(e) = qcore_core::session::net::FamilyPolicy::parse(&o.family, &o.prefer) {
-        eprintln!("qcore: invalid chain (exit 2)\n  family: {e}");
-        return exit::INVALID;
+        eprintln!("qcore: {e} (exit 6)");
+        return exit::USAGE;
     }
     let bind_addr: Option<std::net::SocketAddr> = match o.bind {
         Some(ref b) => match b.parse() {
@@ -1054,4 +1061,55 @@ fn now_ms() -> u64 {
         .duration_since(std::time::SystemTime::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_cli(command: Commands, json: bool) -> Cli {
+        Cli {
+            json,
+            config: Some(std::env::temp_dir().join(format!("qcore-main-{}", std::process::id()))),
+            profile_dir: None,
+            max_depth: None,
+            timeout: None,
+            no_color: true,
+            quiet: true,
+            verbose: 0,
+            non_interactive: true,
+            yes: false,
+            command,
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_bad_family_is_usage() {
+        let cli = test_cli(
+            Commands::Connect {
+                chain: None,
+                chain_file: None,
+                hop: vec![],
+                file: None,
+                family: "bogus".to_string(),
+                prefer: "ipv4".to_string(),
+                report_out: None,
+                log_level: "info".to_string(),
+                detach: false,
+                bind: None,
+                child: false,
+                scan: false,
+                no_scan: true,
+                obfuscation: None,
+            },
+            false,
+        );
+        assert_eq!(async_main(cli).await, exit::USAGE);
+    }
+
+    #[tokio::test]
+    async fn ls_with_json_is_usage() {
+        let cli = test_cli(Commands::Ls, true);
+        assert_eq!(async_main(cli).await, exit::USAGE);
+    }
 }

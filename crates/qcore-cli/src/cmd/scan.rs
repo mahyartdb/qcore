@@ -120,11 +120,24 @@ pub async fn run(
     dirs: &ProfileDirs,
 ) -> i32 {
     // Global --json selects the JSON document unless --output says otherwise.
+    // `--json` guarantees exactly one JSON document on stdout: an explicit
+    // `--output ndjson` with `--json` is a conflict (usage error), never
+    // multi-document output.
     let output = if json && output == "table" {
         "json"
     } else {
         output
     };
+    if !["table", "json", "ndjson"].contains(&output) {
+        eprintln!("qcore: --output must be table|json|ndjson (exit 6)");
+        return exit::USAGE;
+    }
+    if json && output == "ndjson" {
+        eprintln!(
+            "qcore: --json with --output ndjson conflicts (single document required) (exit 6)"
+        );
+        return exit::USAGE;
+    }
     let profile = match profile_named(dirs, profile) {
         Ok(p) => p,
         Err(e) => {
@@ -267,6 +280,36 @@ mod tests {
         assert!(
             qcore_core::session::reconnect::last_known_good(&d).is_none(),
             "uncertain must not become LKG"
+        );
+        let _ = std::fs::remove_dir_all(&d.config_dir);
+    }
+
+    #[tokio::test]
+    async fn bogus_output_is_usage() {
+        let d = test_dirs("bogus-output");
+        assert_eq!(
+            run("warp", "balanced", "dual", "yaml", false, &d).await,
+            exit::USAGE
+        );
+        let _ = std::fs::remove_dir_all(&d.config_dir);
+    }
+
+    #[tokio::test]
+    async fn json_plus_ndjson_is_usage_single_document() {
+        let d = test_dirs("json-ndjson");
+        assert_eq!(
+            run("warp", "balanced", "dual", "ndjson", true, &d).await,
+            exit::USAGE
+        );
+        let _ = std::fs::remove_dir_all(&d.config_dir);
+    }
+
+    #[tokio::test]
+    async fn bad_family_is_usage() {
+        let d = test_dirs("bad-family");
+        assert_eq!(
+            run("warp", "balanced", "bogus", "table", false, &d).await,
+            exit::USAGE
         );
         let _ = std::fs::remove_dir_all(&d.config_dir);
     }

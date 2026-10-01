@@ -13,7 +13,7 @@ use qcore_core::config::profile_dir::ProfileDirs;
 
 use crate::exit;
 
-pub fn run_import(path: &str, json: bool, dirs: &ProfileDirs, quiet: bool) -> i32 {
+pub fn run_import(path: &str, json: bool, dirs: &ProfileDirs, _quiet: bool) -> i32 {
     let imp = match ConfigImport::parse(std::path::Path::new(path)) {
         Ok(imp) => imp,
         Err(e) => {
@@ -55,8 +55,10 @@ pub fn run_import(path: &str, json: bool, dirs: &ProfileDirs, quiet: bool) -> i3
                         },
                     })
                 );
-            } else if !quiet {
-                eprintln!("imported `{stored_ref}`");
+            } else {
+                // Results on stdout (stderr is diagnostics): the ref is the
+                // result, printed even when quiet suppresses diagnostics.
+                println!("{stored_ref}");
             }
             exit::SUCCESS
         }
@@ -94,4 +96,33 @@ pub fn run_export(import_ref: &str, json: bool, dirs: &ProfileDirs) -> i32 {
         print!("{text}");
     }
     exit::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_mode_import_succeeds_even_when_quiet() {
+        // The ref is a result (stdout), not a diagnostic: `quiet` (stderr
+        // suppression) must not turn success into failure or skip storage.
+        let base = std::env::temp_dir().join(format!("qcore-cli-import-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dirs = ProfileDirs::resolve(Some(base.join("cfg")), Some(base.join("prof")));
+        dirs.ensure_dirs().unwrap();
+        for quiet in [false, true] {
+            let rc = run_import("../../tests/fixtures/standard-wg.conf", false, &dirs, quiet);
+            // When run from the crate dir the relative fixture resolves;
+            // fall back to the workspace-root path when needed.
+            let rc = if rc == exit::USAGE
+                && !std::path::Path::new("../../tests/fixtures/standard-wg.conf").exists()
+            {
+                run_import("tests/fixtures/standard-wg.conf", false, &dirs, quiet)
+            } else {
+                rc
+            };
+            assert_eq!(rc, exit::SUCCESS, "quiet={quiet}");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

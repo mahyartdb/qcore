@@ -823,10 +823,15 @@ async fn run_connect(o: ConnectOpts) -> i32 {
             "qcore: proxy listening on {bound} (exit {})",
             handle.exit_hop_id
         );
-        tokio::spawn(qcore_core::session::proxy::serve_socks_via_dialer(
-            listener,
-            handle.dialer(),
-        ));
+        tokio::spawn(
+            qcore_core::session::proxy::serve_socks_via_dialer_with_policy(
+                listener,
+                handle.dialer(),
+                // The session policy (not dual-default): `--family ipv4` refuses
+                // IPv6 CONNECT with 0x08 at the SOCKS layer instead of dialing.
+                session.family_policy.clone(),
+            ),
+        );
     }
 
     // Serve control until STOP or Ctrl-C, then tear down closed.

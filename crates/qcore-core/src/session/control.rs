@@ -52,9 +52,14 @@ pub fn remove_control_file(dirs: &ProfileDirs) {
     let _ = std::fs::remove_file(control_file(dirs));
 }
 
-/// Bearer token: process id + nanos + counter, hex-encoded. Unpredictable
-/// enough for a loopback channel whose file is the real boundary.
+/// Bearer token: 128 bits from OS-seeded `RandomState` keys plus process id,
+/// nanos, and a counter, hex-encoded. The file's directory permissions are
+/// the primary secrecy boundary; the token must still not be enumerable by
+/// a loopback peer (the old pid+nanos+counter shape differed only in the
+/// low counter nibble within one nanosecond).
 pub fn new_token() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(1);
     let n = NEXT.fetch_add(1, Ordering::SeqCst);
@@ -62,7 +67,15 @@ pub fn new_token() -> String {
         .duration_since(std::time::SystemTime::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    format!("{:x}-{}-{:x}", std::process::id(), ns, n)
+    let pid = std::process::id();
+    let mut h1 = RandomState::new().build_hasher();
+    h1.write_u32(pid);
+    h1.write_u128(ns);
+    h1.write_u64(n);
+    let mut h2 = RandomState::new().build_hasher();
+    h2.write_u64(n.wrapping_mul(0x9E3779B97F4A7C15));
+    h2.write_u128(ns ^ ((pid as u128) << 64));
+    format!("{:016x}{:016x}", h1.finish(), h2.finish())
 }
 
 /// Serve the control channel until a valid STOP arrives. STATUS replies with
@@ -112,6 +125,26 @@ pub async fn serve_control_shared(
     }
 }
 
+/// Maximum inbound control line: commands are `STATUS <token>` / `STOP
+/// <token>` (short). A peer sending megabytes without a newline holds a task
+/// and buffer forever; cap and drop instead.
+const MAX_CONTROL_LINE: u64 = 4096;
+
+/// Length-prefixed fold comparison: no early exit on content, and the length
+/// difference folds into the accumulator (loopback-only channel; this raises
+/// the bar over byte-compare without a crypto dependency).
+fn tokens_equal(a: &str, b: &str) -> bool {
+    let (ab, bb) = (a.as_bytes(), b.as_bytes());
+    let n = ab.len().max(bb.len());
+    let mut diff = ab.len() ^ bb.len();
+    for i in 0..n {
+        let x = if i < ab.len() { ab[i] } else { 0 };
+        let y = if i < bb.len() { bb[i] } else { 0 };
+        diff |= (x ^ y) as usize;
+    }
+    diff == 0
+}
+
 async fn handle_shared(
     stream: tokio::net::TcpStream,
     token: &str,
@@ -120,14 +153,16 @@ async fn handle_shared(
     shutdown: &tokio::sync::Notify,
 ) {
     let (r, mut w) = stream.into_split();
-    let mut lines = tokio::io::BufReader::new(r).lines();
+    // Bound the inbound line before buffering it.
+    use tokio::io::AsyncReadExt as _;
+    let mut lines = tokio::io::BufReader::new(r.take(MAX_CONTROL_LINE)).lines();
     let Ok(Some(line)) = lines.next_line().await else {
         return;
     };
     let mut parts = line.splitn(2, ' ');
     let cmd = parts.next().unwrap_or("");
     let presented = parts.next().unwrap_or("");
-    let reply = if presented != token {
+    let reply = if !tokens_equal(presented, token) {
         "ERR bad token\n".to_string()
     } else if cmd == "STATUS" {
         let report = report.read().await;

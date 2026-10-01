@@ -12,6 +12,23 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+/// Per-read handshake budget: a stalled peer must not hold a task forever.
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Ceiling on concurrent proxied connections (Slowloris backstop).
+const MAX_CONNECTIONS: usize = 128;
+
+async fn read_exact_timeout(
+    socket: &mut tokio::net::TcpStream,
+    buf: &mut [u8],
+) -> std::io::Result<()> {
+    tokio::time::timeout(HANDSHAKE_TIMEOUT, socket.read_exact(buf))
+        .await
+        .map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "socks handshake timed out")
+        })??;
+    Ok(())
+}
+
 /// Serve forever (spawn this): one task per accepted connection.
 ///
 /// Default policy (`dual`) when the caller has no family preference: IPv6
@@ -32,11 +49,25 @@ pub async fn serve_socks_via_dialer_with_policy(
     dialer: Arc<dyn Dialer>,
     policy: FamilyPolicy,
 ) -> std::io::Result<()> {
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     loop {
-        let (socket, _) = listener.accept().await?;
+        // A transient accept error must not kill the proxy while the session
+        // is still Up (contrast: the old `?` returned and left the session
+        // reporting Up with a dead proxy and no log).
+        let (socket, _) = match listener.accept().await {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
         let dialer = dialer.clone();
         let policy = policy.clone();
+        // Unbounded spawn is a task-exhaustion primitive: shed load by
+        // closing the socket when every slot is busy.
+        let Ok(permit) = slots.clone().try_acquire_owned() else {
+            drop(socket);
+            continue;
+        };
         tokio::spawn(async move {
+            let _permit = permit;
             handle_connect(socket, &*dialer, &policy).await.ok();
         });
     }
@@ -48,7 +79,7 @@ async fn handle_connect(
     policy: &FamilyPolicy,
 ) -> std::io::Result<()> {
     let mut hdr = [0u8; 2];
-    socket.read_exact(&mut hdr).await?;
+    read_exact_timeout(&mut socket, &mut hdr).await?;
     if hdr[0] != 0x05 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -56,7 +87,7 @@ async fn handle_connect(
         ));
     }
     let mut methods = vec![0u8; hdr[1] as usize];
-    socket.read_exact(&mut methods).await?;
+    read_exact_timeout(&mut socket, &mut methods).await?;
     if !methods.contains(&0x00) {
         socket.write_all(&[0x05, 0xFF]).await?;
         return Err(std::io::Error::new(
@@ -67,7 +98,7 @@ async fn handle_connect(
     socket.write_all(&[0x05, 0x00]).await?;
 
     let mut req = [0u8; 4];
-    socket.read_exact(&mut req).await?;
+    read_exact_timeout(&mut socket, &mut req).await?;
     if req[0] != 0x05 || req[1] != 0x01 {
         write_reply(&mut socket, 0x07).await?;
         return Err(std::io::Error::new(
@@ -82,10 +113,18 @@ async fn handle_connect(
             return Err(e);
         }
     };
-    let mut upstream = dialer
-        .dial_tcp(target)
-        .await
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::ConnectionRefused, e.message))?;
+    // A dial failure must still answer (RFC 1928): the client cannot tell a
+    // bare FIN from a refused/unreachable target.
+    let mut upstream = match dialer.dial_tcp(target).await {
+        Ok(s) => s,
+        Err(e) => {
+            write_reply(&mut socket, 0x05).await.ok();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                e.message,
+            ));
+        }
+    };
     write_reply(&mut socket, 0x00).await?;
     tokio::io::copy_bidirectional(&mut socket, &mut upstream).await?;
     Ok(())
@@ -99,7 +138,13 @@ async fn read_addr(
     match atyp {
         0x01 => {
             let mut b = [0u8; 6];
-            socket.read_exact(&mut b).await?;
+            read_exact_timeout(socket, &mut b).await?;
+            if policy.mode == FamilyMode::Ipv6 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "IPv4 CONNECT targets refused by family policy (mode=ipv6)",
+                ));
+            }
             Ok(SocketAddr::new(
                 IpAddr::V4(Ipv4Addr::new(b[0], b[1], b[2], b[3])),
                 u16::from_be_bytes([b[4], b[5]]),
@@ -107,7 +152,7 @@ async fn read_addr(
         }
         0x04 => {
             let mut b = [0u8; 18];
-            socket.read_exact(&mut b).await?;
+            read_exact_timeout(socket, &mut b).await?;
             if policy.mode == FamilyMode::Ipv4 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -125,9 +170,9 @@ async fn read_addr(
         // via the OS here would leak DNS around the tunnel.
         0x03 => {
             let mut len = [0u8; 1];
-            socket.read_exact(&mut len).await?;
+            read_exact_timeout(socket, &mut len).await?;
             let mut rest = vec![0u8; len[0] as usize + 2];
-            socket.read_exact(&mut rest).await?;
+            read_exact_timeout(socket, &mut rest).await?;
             Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "domain CONNECT targets refused (no tunnel resolver; use a literal IP)",
@@ -252,5 +297,107 @@ mod tests {
         let mut back = [0u8; 8];
         c.read_exact(&mut back).await.unwrap();
         assert_eq!(&back, b"via-bind");
+    }
+
+    /// Failing dialer: every dial refuses.
+    struct RefusingDialer;
+
+    #[async_trait::async_trait]
+    impl Dialer for RefusingDialer {
+        async fn dial_tcp(&self, _dst: SocketAddr) -> Result<Box<dyn ByteStream>, HopError> {
+            Err(HopError::transport("test", "closed port"))
+        }
+
+        async fn dial_udp(&self, _dst: SocketAddr) -> Result<Box<dyn UdpFlow>, HopError> {
+            Err(HopError::transport("test", "tcp only"))
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                accepts_tcp_carrier: true,
+                accepts_udp_carrier: true,
+                dials_tcp: true,
+                dials_udp: false,
+            }
+        }
+    }
+
+    async fn socks_greet(c: &mut tokio::net::TcpStream) {
+        c.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut resp = [0u8; 2];
+        c.read_exact(&mut resp).await.unwrap();
+        assert_eq!(resp, [0x05, 0x00]);
+    }
+
+    #[tokio::test]
+    async fn dial_failure_sends_refused_reply() {
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        tokio::spawn(serve_socks_via_dialer(proxy, Arc::new(RefusingDialer)));
+
+        let mut c = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        socks_greet(&mut c).await;
+        // Closed loopback port: dial fails, client must get 0x05, not a FIN.
+        c.write_all(&[0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1, 0, 1])
+            .await
+            .unwrap();
+        let mut hdr = [0u8; 10];
+        c.read_exact(&mut hdr).await.unwrap();
+        assert_eq!(hdr[0], 0x05);
+        assert_eq!(hdr[1], 0x05, "refused reply, not silent FIN");
+    }
+
+    #[tokio::test]
+    async fn ipv6_mode_refuses_ipv4_with_08() {
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let policy = FamilyPolicy {
+            mode: FamilyMode::Ipv6,
+            ..FamilyPolicy::default()
+        };
+        tokio::spawn(serve_socks_via_dialer_with_policy(
+            proxy,
+            Arc::new(DirectDialer),
+            policy,
+        ));
+
+        let mut c = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        socks_greet(&mut c).await;
+        c.write_all(&[0x05, 0x01, 0x00, 0x01, 192, 0, 2, 1, 1, 0xBB])
+            .await
+            .unwrap();
+        let mut hdr = [0u8; 10];
+        c.read_exact(&mut hdr).await.unwrap();
+        assert_eq!(
+            hdr[1], 0x08,
+            "ipv6-only refuses IPv4 like ipv4-only refuses IPv6"
+        );
+    }
+
+    #[tokio::test]
+    async fn ipv4_mode_refuses_ipv6_with_08() {
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let policy = FamilyPolicy {
+            mode: FamilyMode::Ipv4,
+            ..FamilyPolicy::default()
+        };
+        tokio::spawn(serve_socks_via_dialer_with_policy(
+            proxy,
+            Arc::new(DirectDialer),
+            policy,
+        ));
+
+        let mut c = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        socks_greet(&mut c).await;
+        // ::1 port 443, must be refused before dialing.
+        let mut req = vec![0x05u8, 0x01, 0x00, 0x04];
+        req.extend_from_slice(&[0u8; 15]);
+        req.push(1);
+        req.extend_from_slice(&443u16.to_be_bytes());
+        c.write_all(&req).await.unwrap();
+        let mut hdr = [0u8; 10];
+        c.read_exact(&mut hdr).await.unwrap();
+        assert_eq!(hdr[1], 0x08, "ipv4-only refuses IPv6 at the SOCKS layer");
     }
 }

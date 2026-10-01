@@ -113,8 +113,9 @@ async fn timeout_keeps_identity_for_rescan() {
     let old_id = first.identity.clone().unwrap();
     let before = settings_snapshot(&dirs);
 
-    // Timeout carries no refusal signal: the identity MUST be kept, and the
-    // report must say rescan — never renew — is the next step.
+    // Timeout carries no refusal signal: the identity MUST be kept, but the
+    // report must be Blocked (exit 2) — never Reused/exit 0 masquerading a
+    // network failure as healthy. Rescan/retry is the next step.
     let slow = Fixture::start(FixtureMode::Timeout).await;
     let slow_opts = ProviderOptions {
         provider_base: slow.base_url().to_string(),
@@ -122,7 +123,12 @@ async fn timeout_keeps_identity_for_rescan() {
         family: "dual".to_string(),
     };
     let report = renew_role(&dirs, IdentityRole::Outer, &slow_opts, None, false).await;
-    assert_eq!(report.action, ReportAction::Reused, "kept, not renewed");
+    assert_eq!(
+        report.action,
+        ReportAction::Blocked,
+        "failed refresh is blocked"
+    );
+    assert_eq!(report.exit_code(), 2, "blocked renewal fails closed");
     assert!(
         report.cause.contains("rescan"),
         "names the next step: {}",

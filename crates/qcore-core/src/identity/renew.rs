@@ -73,6 +73,7 @@ pub async fn renew_role(
         Ok(r) => {
             id.interface_v4 = r.interface_v4;
             id.interface_v6 = r.interface_v6;
+            id.peer_key_b64 = r.peer_key_b64;
             let mut license_applied = false;
             let mut extra = String::new();
             if let Some(key) = license {
@@ -123,7 +124,7 @@ pub async fn renew_role(
                 reregister(dirs, role, opts, license, Some(&id.device_id)).await
             }
             RenewalClass::Keep => RegistrationReport {
-                action: ReportAction::Reused,
+                action: ReportAction::Blocked,
                 identity: Some(id.device_id.clone()),
                 endpoint: None,
                 cause: format!(
@@ -273,6 +274,7 @@ async fn renew_masque_only(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::identity::report::ReportAction;
 
     #[test]
     fn classifier_is_refusal_only() {
@@ -289,5 +291,167 @@ mod tests {
         ] {
             assert_eq!(classify(&e), RenewalClass::Keep, "{e}");
         }
+    }
+
+    fn b64_fill(byte: u8) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode([byte; 32])
+    }
+
+    fn test_dirs(tag: &str) -> ProfileDirs {
+        let dir = std::env::temp_dir().join(format!(
+            "qcore-renew-{tag}-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        ProfileDirs::resolve(Some(dir.join("config")), Some(dir.join("profiles")))
+    }
+
+    fn seed_identity(dirs: &ProfileDirs, peer_key_b64: &str) {
+        let id = ProviderIdentity {
+            device_id: "dev-keep-1".into(),
+            access_token: SecretString::new("tok-keep-1"),
+            private_key_b64: SecretString::new("cHJpdmF0ZTE="),
+            peer_key_b64: peer_key_b64.to_string(),
+            interface_v4: "172.16.0.2".into(),
+            interface_v6: "2606:4700:110::2".into(),
+            masque: None,
+            refused: false,
+            license_upgraded: false,
+        };
+        save(dirs, IdentityRole::Outer, &id).expect("seed identity");
+    }
+
+    fn refresh_body(device_id: &str, peer_key_b64: &str) -> String {
+        format!(
+            concat!(
+                "{{\"id\":\"{id}\",\"token\":\"tok-keep-1\",",
+                "\"config\":{{\"peers\":[{{\"public_key\":\"{peer}\",",
+                "\"endpoint\":{{\"v4\":\"162.159.192.1:2408\"}}}}],",
+                "\"interface\":{{\"addresses\":{{\"v4\":\"172.16.0.2/32\",",
+                "\"v6\":\"2606:4700:110::2/128\"}}}}}},",
+                "\"account\":{{\"type\":\"free\"}}}}"
+            ),
+            id = device_id,
+            peer = peer_key_b64
+        )
+    }
+
+    async fn read_head(s: &mut tokio::net::TcpStream) -> Vec<u8> {
+        use tokio::io::AsyncReadExt as _;
+        let mut raw = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = s.read(&mut buf).await.unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            raw.extend_from_slice(&buf[..n]);
+            if raw.windows(4).any(|w| w == b"\r\n\r\n") || raw.len() > 65536 {
+                break;
+            }
+        }
+        raw
+    }
+
+    async fn write_json(s: &mut tokio::net::TcpStream, body: &str) {
+        use tokio::io::AsyncWriteExt as _;
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = s.write_all(resp.as_bytes()).await;
+    }
+
+    #[tokio::test]
+    async fn peer_key_rotation_marks_changed_and_persists() {
+        let old_peer = b64_fill(0x42);
+        let new_peer = b64_fill(0x43);
+        assert_ne!(old_peer, new_peer);
+        let dirs = test_dirs("peer-rot");
+        seed_identity(&dirs, &old_peer);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("addr");
+        let body = refresh_body("dev-keep-1", &new_peer);
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = listener.accept().await else {
+                    break;
+                };
+                let b = body.clone();
+                tokio::spawn(async move {
+                    read_head(&mut s).await;
+                    write_json(&mut s, &b).await;
+                });
+            }
+        });
+
+        let opts = ProviderOptions {
+            provider_base: format!("http://{addr}/v0test"),
+            timeout_secs: 5,
+            family: "dual".to_string(),
+        };
+        let report = renew_role(&dirs, IdentityRole::Outer, &opts, None, false).await;
+        server.abort();
+        assert_eq!(
+            report.action,
+            ReportAction::Refreshed,
+            "peer-only rotation must count as changed: {}",
+            report.cause
+        );
+        assert_eq!(report.exit_code(), 0);
+        let stored = load(&dirs, IdentityRole::Outer).expect("stored");
+        assert_eq!(
+            stored.peer_key_b64, new_peer,
+            "rotated peer key must persist"
+        );
+        assert_eq!(stored.interface_v4, "172.16.0.2");
+        let _ = std::fs::remove_dir_all(&dirs.config_dir);
+    }
+
+    #[tokio::test]
+    async fn refresh_timeout_is_blocked_not_reused() {
+        let dirs = test_dirs("timeout-blocked");
+        seed_identity(&dirs, &b64_fill(0x42));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::AsyncReadExt as _;
+                    let mut buf = [0u8; 4096];
+                    let _ = s.read(&mut buf).await;
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                });
+            }
+        });
+
+        let opts = ProviderOptions {
+            provider_base: format!("http://{addr}/v0test"),
+            timeout_secs: 1,
+            family: "dual".to_string(),
+        };
+        let report = renew_role(&dirs, IdentityRole::Outer, &opts, None, false).await;
+        server.abort();
+        assert_eq!(
+            report.action,
+            ReportAction::Blocked,
+            "failed refresh must not masquerade as healthy: {}",
+            report.cause
+        );
+        assert_ne!(report.exit_code(), 0, "blocked renewal must fail closed");
+        assert_eq!(report.exit_code(), 2);
+        let stored = load(&dirs, IdentityRole::Outer).expect("kept");
+        assert_eq!(stored.device_id, "dev-keep-1");
+        let _ = std::fs::remove_dir_all(&dirs.config_dir);
     }
 }

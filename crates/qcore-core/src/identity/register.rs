@@ -161,9 +161,11 @@ pub async fn refresh_stored(
     Ok(Refreshed {
         interface_v4: parsed.interface_v4.clone(),
         interface_v6: parsed.interface_v6.clone(),
+        peer_key_b64: parsed.peer_key_b64.clone(),
         changed: parsed.interface_v4 != id.interface_v4
             || parsed.interface_v6 != id.interface_v6
-            || parsed.device_id != id.device_id,
+            || parsed.device_id != id.device_id
+            || parsed.peer_key_b64 != id.peer_key_b64,
         family,
     })
 }
@@ -172,6 +174,8 @@ pub async fn refresh_stored(
 pub struct Refreshed {
     pub interface_v4: String,
     pub interface_v6: String,
+    /// Provider peer public key after refresh (public; rotation detection).
+    pub peer_key_b64: String,
     pub changed: bool,
     /// Address family the refresh exchange used (FR-013).
     pub family: String,

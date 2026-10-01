@@ -227,6 +227,51 @@ pub fn run(_args: Vec<String>) -> super::anyhow::Result<()> {
             return Err(fail(format!("release blocked: gate failed: {gate}")));
         }
     }
+    // Release-matrix honesty (targets.toml is the 9-target contract): the CI
+    // tag matrix builds only the 3 Windows legs, so a local `release` can
+    // prove exactly one native package. Printing "package complete" without
+    // naming the 6 unproven targets was a silent contract breach — fail
+    // closed unless the operator acknowledges the partial matrix
+    // explicitly. Full expansion needs runner capacity + a constitution
+    // amendment (see AGENTS.md release row); do not tag `v*` until then.
+    const COVERED: &[&str] = &[
+        "i686-pc-windows-msvc",
+        "x86_64-pc-windows-msvc",
+        "aarch64-pc-windows-msvc",
+    ];
+    const CONTRACT: &[&str] = &[
+        "i686-pc-windows-msvc",
+        "x86_64-pc-windows-msvc",
+        "aarch64-pc-windows-msvc",
+        "x86_64-unknown-linux-gnu",
+        "i686-unknown-linux-gnu",
+        "aarch64-unknown-linux-gnu",
+        "armv7-unknown-linux-gnueabihf",
+        "aarch64-linux-android",
+        "armv7-linux-androideabi",
+    ];
+    let uncovered: Vec<_> = CONTRACT.iter().filter(|t| !COVERED.contains(t)).collect();
+    if !_args.iter().any(|a| a == "--allow-partial-matrix") {
+        return Err(fail(format!(
+            "release blocked: tag matrix covers {}/{} targets ({}); unproven: {}. Re-run with --allow-partial-matrix to acknowledge, or expand the matrix (constitution amendment required).",
+            COVERED.len(),
+            CONTRACT.len(),
+            COVERED.join(", "),
+            uncovered
+                .iter()
+                .map(|t| t.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+    println!(
+        "release: partial-matrix acknowledged; unproven targets: {}",
+        uncovered
+            .iter()
+            .map(|t| t.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     package(_args)?;
     println!(
         "release: package complete; publish only from a tag build with cosign + SLSA attestation"

@@ -33,6 +33,7 @@ fn ci() -> anyhow::Result<()> {
     shell("cargo nextest run --workspace --all-features --exclude tests-conformance")?;
     shell("cargo nextest run -p tests-conformance")?;
     shell("cargo run -q -p xtask -- abi-diff")?;
+    shell("cargo run -q -p xtask -- smoke --target native")?;
     Ok(())
 }
 

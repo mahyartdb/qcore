@@ -26,7 +26,9 @@ fn is_transport_layer(layer: &FailureLayer) -> bool {
 async fn unreachable_hop_reports_layer_and_cause() {
     let work = std::env::temp_dir().join(format!("qcore-failrep-{}", std::process::id()));
     let engine = engine_in(&work);
-    // H2 to a closed loopback port refuses immediately (no 15 s QUIC wait).
+    // H2 to a closed loopback port fails fast (refusal) or via the 15 s
+    // QUIC/connect timeouts (filtered hangs) — either way the transport is
+    // unreachable and start fails closed without waiting out the session.
     let spec = Engine::parse_single_hop("masque", "alpn=h2 endpoint=127.0.0.1:1")
         .expect("unreachable spec parses");
     let report: FailureReport = engine

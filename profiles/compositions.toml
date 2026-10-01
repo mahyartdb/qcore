@@ -3,7 +3,11 @@
 # tor,relay,wireguard peer=warp. Presets expand exactly one level; depth is
 # plain hop counting after expansion. Presets MUST NOT embed secrets.
 # `qcore-core` parses this file for profile-dir overrides and gates
-# data/code parity (this file MUST equal `builtin_presets()`).
+# data/code parity (this SHIPPED file MUST equal `builtin_presets()` — the
+# unit test pins it). A profile-dir override REPLACES builtins by design
+# (operator customization); it is validated for shape, not compared to
+# builtins, so a renamed preset there changes production behavior without
+# failing any gate. Override with care.
 
 [[preset]]
 name = "gool"

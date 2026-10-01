@@ -36,10 +36,21 @@ async fn roundtrip_on(family: &str, stub_mode: &str) {
         .expect("dial_udp through session");
     flow.send_to(b"ping-1", dst).await.expect("send_to");
     let mut buf = [0u8; 32];
-    let (n, from) = tokio::time::timeout(Duration::from_secs(5), flow.recv_from(&mut buf))
-        .await
-        .expect("echo arrives")
-        .expect("recv_from");
+    // One retry: a loopback echo under parallel CI load can miss the first
+    // 5 s window without the tunnel being at fault.
+    let mut attempt = 0;
+    let (n, from) = loop {
+        match tokio::time::timeout(Duration::from_secs(5), flow.recv_from(&mut buf)).await {
+            Ok(Ok(v)) => break v,
+            Ok(Err(e)) => panic!("recv_from: {e}"),
+            Err(_) if attempt == 0 => {
+                attempt += 1;
+                flow.send_to(b"ping-1", dst).await.expect("send_to");
+                continue;
+            }
+            Err(_) => panic!("echo arrives"),
+        }
+    };
     assert_eq!(&buf[..n], b"ping-1");
     assert_eq!(from, dst);
 

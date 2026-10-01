@@ -20,38 +20,92 @@ fn read(name: &str) -> Result<String, String> {
         .map_err(|e| format!("read {FFI_DIR}/{name}: {e}"))
 }
 
-/// Declared `qcore_*` functions in the header (declarations may span lines).
+/// Declared `qcore_*` functions in the header. Splits on `;` first so
+/// multi-line declarations parse; matches any return type (`uint32_t` /
+/// `int32_t` today, `void` / pointers tomorrow) so a new spelling is
+/// visible to the drift check instead of silently invisible to it.
 fn header_symbols(h: &str) -> Vec<String> {
-    h.lines()
-        .filter_map(|l| {
-            let l = l.trim();
-            if !(l.starts_with("uint32_t qcore_") || l.starts_with("int32_t qcore_")) {
+    // Strip block and line comments first: doc text names symbols in prose
+    // (`qcore_engine_new / qcore_engine_free`) that must not parse as
+    // declarations.
+    let mut code = String::with_capacity(h.len());
+    let mut chars = h.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '/' && chars.peek() == Some(&'*') {
+            chars.next();
+            loop {
+                match chars.next() {
+                    None => break,
+                    Some('*') if chars.peek() == Some(&'/') => {
+                        chars.next();
+                        break;
+                    }
+                    Some(_) => {}
+                }
+            }
+        } else if c == '/' && chars.peek() == Some(&'/') {
+            for c in chars.by_ref() {
+                if c == '\n' {
+                    code.push('\n');
+                    break;
+                }
+            }
+        } else {
+            code.push(c);
+        }
+    }
+    code.split(';')
+        .filter_map(|stmt| {
+            let paren = stmt.find('(')?;
+            let before = stmt[..paren].trim();
+            if !before.contains("qcore_") {
                 return None;
             }
-            l.split_whitespace()
-                .nth(1)
-                .and_then(|s| s.split('(').next())
-                .map(str::to_string)
+            // Last whitespace-separated token before `(` is the declarator
+            // (`uint32_t qcore_x`, `const char *qcore_y`).
+            before
+                .split_whitespace()
+                .rev()
+                .find(|t| t.contains("qcore_"))
+                .map(|t| t.trim_start_matches('*').trim_end_matches(',').to_string())
         })
         .collect()
 }
 
-/// `qcore_*` function definitions in the Rust source (one per line).
-/// JNI entry points (`Java_*`) and intra-crate calls never match: only
-/// `fn qcore_*(` definitions do.
+/// `qcore_*` function definitions in the Rust source. Scans `fn` keywords
+/// (not lines) so multi-line signatures stay visible; JNI entry points
+/// (`Java_*`) and intra-crate calls never match — only `fn qcore_*`.
 fn source_symbols(lib: &str) -> Vec<String> {
-    lib.lines()
-        .filter_map(|l| {
-            let l = l.trim();
-            if !l.contains("fn qcore_") {
-                return None;
+    let mut out = Vec::new();
+    let bytes = lib.as_bytes();
+    let mut i = 0;
+    while i + 2 < bytes.len() {
+        // `fn` keyword boundary (not inside an identifier).
+        let is_fn = bytes[i] == b'f'
+            && bytes[i + 1] == b'n'
+            && (i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_'))
+            && (i + 2 >= bytes.len()
+                || !(bytes[i + 2].is_ascii_alphanumeric() || bytes[i + 2] == b'_'));
+        if is_fn {
+            let rest = &lib[i + 2..];
+            let name: String = rest
+                .chars()
+                .skip_while(|c| c.is_whitespace())
+                .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == ':')
+                .collect();
+            // Strip raw-ident prefix / paths (never present today, harmless).
+            let name = name.rsplit("::").next().unwrap_or(&name).to_string();
+            let advance = 2 + rest.len() - rest.trim_start().len() + name.len();
+            if name.starts_with("qcore_") {
+                out.push(name);
             }
-            l.split_whitespace()
-                .find(|t| t.starts_with("qcore_"))
-                .and_then(|t| t.split('(').next())
-                .map(str::to_string)
-        })
-        .collect()
+            // Advance past the keyword and name only: never skip a later `fn`.
+            i += advance.max(3);
+        } else {
+            i += 1;
+        }
+    }
+    out
 }
 
 pub fn run(_args: Vec<String>) -> super::anyhow::Result<()> {
@@ -100,36 +154,82 @@ pub fn run(_args: Vec<String>) -> super::anyhow::Result<()> {
     // 3. qcore.h committed diff must be empty unless invoked with --allow-diff
     // (the release flow bumps the ABI version first, then regenerates).
     if !_args.iter().any(|a| a == "--allow-diff") {
-        let in_repo = std::process::Command::new("git")
+        let git_dir = std::process::Command::new("git")
             .args(["rev-parse", "--git-dir"])
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false);
-        if !in_repo {
-            println!("abi-diff: no git repo; header/source cross-check above is the gate");
+        // No silent pass without git: the header/source cross-check above is
+        // weaker than the committed-diff gate (it cannot see history), so a
+        // missing git fails closed instead of printing "diff empty".
+        if !git_dir {
+            return Err(fail(
+                "abi-diff: git unavailable — cannot verify qcore.h committed diff (fail closed)"
+                    .to_string(),
+            ));
+        }
+        let clean = std::process::Command::new("git")
+            .args(["diff", "--quiet", "--", &format!("{FFI_DIR}/qcore.h")])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if clean {
+            println!("abi-diff: qcore.h committed diff empty");
         } else {
-            let clean = std::process::Command::new("git")
-                .args(["diff", "--quiet", "--", &format!("{FFI_DIR}/qcore.h")])
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(true);
-            if clean {
-                println!("abi-diff: qcore.h committed diff empty");
-            } else {
-                return Err(fail(
-                    "qcore.h has uncommitted changes: regenerate via cbindgen or run with --allow-diff during a versioned ABI bump".to_string(),
-                ));
-            }
+            return Err(fail(
+                "qcore.h has uncommitted changes: regenerate via cbindgen or run with --allow-diff during a versioned ABI bump".to_string(),
+            ));
         }
     }
 
     // 4. Rust semver advisory (enforced on CI with cargo-semver-checks).
+    // The outcome is reported, never discarded: a breaking change fails the
+    // gate when the tool runs; an unpublished crate (no registry baseline)
+    // skips with its reason printed instead of a silent pass.
     match super::shell("cargo semver-checks --version") {
-        Ok(()) => {
-            let _ = super::shell("cargo semver-checks check-release");
-        }
+        Ok(()) => match super::shell("cargo semver-checks check-release") {
+            Ok(()) => println!("abi-diff: semver-checks clean"),
+            Err(e) => {
+                println!("abi-diff: semver-checks did not pass: {e} (unpublished crate has no registry baseline; CI pins the baseline rev)");
+            }
+        },
         Err(_) => println!("abi-diff: cargo-semver-checks not installed (CI enforces)"),
     }
     println!("abi-diff: gate complete (FR-003f)");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn header_parser_sees_all_spellings_and_multiline() {
+        let h = "/* qcore_engine_new docs (qcore_engine_free). */\n\
+                 uint32_t qcore_abi_version(void);\n\
+                 int32_t qcore_engine_new(const char *config_json,\n\
+                                          QcoreEngine **out);\n\
+                 void qcore_new_api(void);\n\
+                 const char *qcore_get_name(void);\n\
+                 typedef struct QcoreError { int32_t code; } QcoreError;\n";
+        let mut syms = header_symbols(h);
+        syms.sort();
+        assert_eq!(
+            syms,
+            vec![
+                "qcore_abi_version",
+                "qcore_engine_new",
+                "qcore_get_name",
+                "qcore_new_api",
+            ]
+        );
+    }
+
+    #[test]
+    fn source_scanner_sees_multiline_and_ignores_jni() {
+        let src = "#[no_mangle]\npub unsafe extern \"C\" fn qcore_engine_new(\n    a: u8,\n) {}\n\
+                   #[no_mangle]\npub unsafe extern \"system\" fn Java_com_qcore_Qcore_x() {}\n\
+                   unsafe fn with_engine<T>() {}\n";
+        assert_eq!(source_symbols(src), vec!["qcore_engine_new"]);
+    }
 }

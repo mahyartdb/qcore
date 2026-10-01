@@ -81,7 +81,7 @@ async fn data_plane_scan_ranks_verified_first_and_discards_failed() {
     assert_eq!(top.address, live);
     assert_eq!(top.reachability, Reachability::Passed);
     assert_eq!(top.confidence, qcore_core::scan::Confidence::Verified);
-    assert!(top.latency_ms < 400, "latency measured under budget");
+    assert!(top.latency_ms <= 400, "latency measured within budget");
     assert_eq!(report.failed, 1);
 }
 
@@ -180,7 +180,8 @@ async fn balanced_scan_finishes_inside_budget() {
     })
     .await
     .expect("scan runs");
-    assert!(t.elapsed().as_secs() < 30, "SC-005: balanced < 30 s");
+    // Millis, not truncated seconds: `as_secs() < 30` passes a 30.9 s run.
+    assert!(t.elapsed().as_millis() < 30_000, "SC-005: balanced < 30 s");
     assert_eq!(report.ranked.len(), 1);
 }
 

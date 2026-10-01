@@ -81,7 +81,9 @@ fn native_matrix() -> Result<(), String> {
         "preflight mock,relay",
     )?;
     for family in ["ipv4", "ipv6", "dual"] {
-        // Empty discovery per family: exit 4, no silent fallback.
+        // Empty discovery per family: exit 4 with a shaped empty document
+        // (`--output json` prints `{"ok":false,...,"candidates":[]}`), never
+        // a silent fallback and never an unshaped stdout.
         expect(
             &[
                 "scan",
@@ -91,9 +93,11 @@ fn native_matrix() -> Result<(), String> {
                 "balanced",
                 "--family",
                 family,
+                "--output",
+                "json",
             ],
             4,
-            "",
+            "\"candidates\":[]",
             &format!("empty scan {family} exit 4"),
         )?;
     }
@@ -118,8 +122,28 @@ fn native_matrix() -> Result<(), String> {
 }
 
 /// Byte-scan a cdylib/dll/so for the required `qcore_*` exports (std-only;
-/// no binutils needed). Missing symbols fail the gate.
+/// no binutils needed). Missing symbols fail the gate. The static list is
+/// itself cross-checked against `qcore.h` so list rot fails loudly instead
+/// of silently checking a stale set (binary scanning is inherently fuzzy:
+/// debug strings can false-positive, stripped ordinals can false-negative —
+/// the header/source cross-check in `abi-diff` is the precise gate, this is
+/// the artifact-presence backstop).
 pub fn check_cdylib_exports(path: &std::path::Path) -> Result<(), String> {
+    let header = std::fs::read_to_string("crates/qcore-ffi/qcore.h")
+        .map_err(|e| format!("read crates/qcore-ffi/qcore.h: {e}"))?;
+    for sym in QCORE_SYMBOLS {
+        if !header.contains(sym) {
+            return Err(format!(
+                "smoke symbol list drift: `{sym}` not declared in qcore.h"
+            ));
+        }
+    }
+    if QCORE_SYMBOLS.len() != 11 {
+        return Err(format!(
+            "smoke symbol list drift: {} symbols, want 11",
+            QCORE_SYMBOLS.len()
+        ));
+    }
     let bytes = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let text = String::from_utf8_lossy(&bytes);
     let mut missing = Vec::new();
@@ -143,6 +167,16 @@ pub fn check_cdylib_exports(path: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
+fn cdylib_name() -> &'static str {
+    if cfg!(windows) {
+        "qcore_ffi.dll"
+    } else if cfg!(target_os = "macos") {
+        "libqcore_ffi.dylib"
+    } else {
+        "libqcore_ffi.so"
+    }
+}
+
 pub fn run(args: Vec<String>) -> super::anyhow::Result<()> {
     let target = args
         .iter()
@@ -157,28 +191,40 @@ pub fn run(args: Vec<String>) -> super::anyhow::Result<()> {
     }
     native_matrix().map_err(super::anyhow::Error::msg)?;
     if target == "native" {
-        // Native cdylib export check on the debug artifact when present.
-        let dll = if cfg!(windows) {
-            "target/debug/qcore_ffi.dll"
-        } else if cfg!(target_os = "macos") {
-            "target/debug/libqcore_ffi.dylib"
-        } else {
-            "target/debug/libqcore_ffi.so"
-        };
-        let path = std::path::Path::new(dll);
-        if path.exists() {
-            check_cdylib_exports(path).map_err(super::anyhow::Error::msg)?;
-        } else {
-            println!("smoke: no local cdylib artifact; run `cargo build -p qcore-ffi` first for the export check");
+        // Native cdylib export check: build first so a fresh checkout (or
+        // cache miss) cannot silently skip the gate, then fail closed when
+        // the artifact is still absent.
+        super::shell("cargo build -q -p qcore-ffi")?;
+        let path = std::path::Path::new("target/debug").join(cdylib_name());
+        if !path.exists() {
+            return Err(super::anyhow::Error::msg(format!(
+                "cdylib artifact missing after build: {}",
+                path.display()
+            )));
         }
+        check_cdylib_exports(&path).map_err(super::anyhow::Error::msg)?;
         println!("smoke native: ipv4/ipv6/dual OK");
         return Ok(());
     }
     // Cross target: build through the pinned backend, then check exports.
     super::shell(&format!("cargo run -q -p xtask -- build --target {target}"))?;
+    // The cross artifact cannot execute here, but its presence plus the
+    // export scan still gate packaging: a target that builds nothing (or
+    // drops symbols) fails instead of printing build-OK.
+    let artifact = std::path::Path::new("target")
+        .join(&target)
+        .join("debug")
+        .join(cdylib_name());
+    if !artifact.exists() {
+        return Err(super::anyhow::Error::msg(format!(
+            "cross artifact missing after build (expected {}); per-target smoke cannot validate an unbuilt target",
+            artifact.display()
+        )));
+    }
+    check_cdylib_exports(&artifact).map_err(super::anyhow::Error::msg)?;
     if target.contains("android") {
         println!("smoke {target}: Termux CLI + cdylib/JNI run under emulator execution on CI (ubuntu-22.04 runner)");
     }
-    println!("smoke {target}: build OK (execution on its runner)");
+    println!("smoke {target}: build + exports OK (execution on its runner)");
     Ok(())
 }

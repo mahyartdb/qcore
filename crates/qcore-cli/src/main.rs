@@ -661,10 +661,7 @@ async fn run_connect(o: ConnectOpts) -> i32 {
     // `obfuscation=` key inherit the profile; validation names mismatches.
     if let Some(profile) = o.obfuscation.as_deref() {
         if cmd::preflight::apply_obfuscation_default(&mut specs, profile) == 0 {
-            eprintln!(
-                "qcore: invalid chain (exit 2)\n  obfuscation profile `{profile}` applies to no hop in this chain"
-            );
-            return exit::INVALID;
+            return cmd::preflight::reject_obfuscation_without_target(profile, o.json);
         }
     }
 
@@ -741,7 +738,21 @@ async fn run_connect(o: ConnectOpts) -> i32 {
 
     let handle = match engine.start(specs).await {
         Ok(h) => h,
-        Err(r) => return report::emit_failure(&r),
+        Err(r) => {
+            if o.json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "ok": false,
+                        "layer": r.layer.to_string(),
+                        "hop_id": r.hop_id,
+                        "kind": r.kind,
+                        "cause": qcore_core::diag::masked_value("cause", &r.cause),
+                    })
+                );
+            }
+            return report::emit_failure(&r);
+        }
     };
     let mut report = ConnectionReport::new(handle.hop_reports(), handle.exit_hop_id.clone());
     // Active profiles in the report (T068 scan / T073 obfuscation): the exit
@@ -997,7 +1008,6 @@ fn run_status(json: bool, dirs: &ProfileDirs) -> i32 {
 }
 
 fn run_stop(json: bool, dirs: &ProfileDirs) -> i32 {
-    let _ = json;
     let dirs = dirs.clone();
     if let Some(info) = control::read_control_file(&dirs) {
         let addr = std::net::SocketAddr::new(
@@ -1006,7 +1016,11 @@ fn run_stop(json: bool, dirs: &ProfileDirs) -> i32 {
         );
         match control::send_stop(addr, &info.token) {
             Ok(()) => {
-                eprintln!("qcore: session stopping");
+                if json {
+                    println!("{}", serde_json::json!({"state": "stopping"}));
+                } else {
+                    eprintln!("qcore: session stopping");
+                }
                 return exit::SUCCESS;
             }
             Err(e)
@@ -1026,22 +1040,41 @@ fn run_stop(json: bool, dirs: &ProfileDirs) -> i32 {
     }
     match SessionStatus::read(&dirs) {
         SessionStatus::NotRunning => {
-            eprintln!("qcore: no session (exit 10)");
+            if json {
+                println!("{}", serde_json::json!({"state": "not_running"}));
+            } else {
+                eprintln!("qcore: no session (exit 10)");
+            }
             exit::NO_SESSION
         }
         SessionStatus::Dead { id } => {
-            eprintln!("qcore: session {id} already stopped");
+            if json {
+                println!("{}", serde_json::json!({"state": "dead", "id": id}));
+            } else {
+                eprintln!("qcore: session {id} already stopped");
+            }
             exit::SUCCESS
         }
         SessionStatus::Unverifiable { session } => {
-            eprintln!(
-                "qcore: session {} unverifiable — fail closed (exit 12)",
-                session.id
-            );
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({"state": "unverifiable", "id": session.id})
+                );
+            } else {
+                eprintln!(
+                    "qcore: session {} unverifiable — fail closed (exit 12)",
+                    session.id
+                );
+            }
             exit::UNVERIFIABLE
         }
         SessionStatus::Live { .. } => {
-            eprintln!("qcore: session live but control refused STOP — fail closed (exit 12)");
+            if json {
+                println!("{}", serde_json::json!({"state": "live"}));
+            } else {
+                eprintln!("qcore: session live but control refused STOP — fail closed (exit 12)");
+            }
             exit::UNVERIFIABLE
         }
     }

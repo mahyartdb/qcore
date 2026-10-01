@@ -568,6 +568,17 @@ impl Engine {
         let presets = crate::chain::preset::resolve_presets(&self.config.dirs)?;
         crate::chain::parse::parse_chain(expr, &self.registry, &presets)
     }
+
+    /// Same as [`Engine::parse_chain`] but sharing the auto-id counter `n`
+    /// across calls (repeatable `--hop` accumulates in argv order).
+    pub fn parse_chain_with_counter(
+        &self,
+        expr: &str,
+        n: &mut u32,
+    ) -> Result<Vec<ExpandedHop>, ChainError> {
+        let presets = crate::chain::preset::resolve_presets(&self.config.dirs)?;
+        crate::chain::parse::parse_chain_with_counter(expr, &self.registry, &presets, n)
+    }
 }
 
 fn new_session_id() -> String {

@@ -86,8 +86,13 @@ pub fn resolve_inputs(
     }
     if !hops.is_empty() {
         let mut specs = Vec::new();
+        // Shared auto-id counter across `--hop` repeats: each `parse_chain`
+        // call with a fresh n=0 would mint `mock-0` twice and trip the
+        // duplicate-id validator. Threading one counter yields
+        // `mock-0,mock-1` in argv order.
+        let mut n = 0u32;
         for h in hops {
-            match engine.parse_chain(h) {
+            match engine.parse_chain_with_counter(h, &mut n) {
                 Ok(mut s) => specs.append(&mut s),
                 Err(e) => return Err((exit::INVALID, e.to_string())),
             }
@@ -195,4 +200,60 @@ pub fn reject_obfuscation_without_target(profile: &str, json: bool) -> i32 {
         eprintln!("qcore: invalid chain (exit 2)\n  {reason}");
     }
     exit::INVALID
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn engine() -> Engine {
+        let _ = qcore_transports::linked_kinds();
+        Engine::new(EngineConfig::default())
+    }
+
+    fn hop_ids(specs: &[ExpandedHop]) -> Vec<String> {
+        specs
+            .iter()
+            .map(|s| match s {
+                ExpandedHop::Hop(h) => h.id.clone(),
+                ExpandedHop::Preset(p) => format!("preset:{p}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn repeatable_hop_yields_unique_ids() {
+        let e = engine();
+        let inputs = resolve_inputs(
+            &e,
+            None,
+            None,
+            None,
+            &["mock".to_string(), "mock".to_string()],
+        )
+        .expect("--hop mock --hop mock resolves");
+        assert_eq!(hop_ids(&inputs.specs), vec!["mock-0", "mock-1"]);
+        assert!(matches!(
+            e.preflight(inputs.specs),
+            qcore_core::api::engine::Preflight::Ok { .. }
+        ));
+    }
+
+    #[test]
+    fn labeled_hop_plus_auto_does_not_collide() {
+        let e = engine();
+        let inputs = resolve_inputs(
+            &e,
+            None,
+            None,
+            None,
+            &["mock @mock-0".to_string(), "mock".to_string()],
+        )
+        .expect("labeled + auto resolves");
+        assert_eq!(hop_ids(&inputs.specs), vec!["mock-0", "mock-1"]);
+        assert!(matches!(
+            e.preflight(inputs.specs),
+            qcore_core::api::engine::Preflight::Ok { .. }
+        ));
+    }
 }

@@ -140,6 +140,18 @@ pub fn parse_chain(
     registry: &TransportRegistry,
     presets: &[CompositionPreset],
 ) -> Result<Vec<ExpandedHop>, ChainError> {
+    let mut n = 0u32;
+    parse_chain_with_counter(expr, registry, presets, &mut n)
+}
+
+/// Same as [`parse_chain`] but sharing the auto-id counter across calls
+/// (repeatable `--hop` accumulates in argv order).
+pub fn parse_chain_with_counter(
+    expr: &str,
+    registry: &TransportRegistry,
+    presets: &[CompositionPreset],
+    n: &mut u32,
+) -> Result<Vec<ExpandedHop>, ChainError> {
     if expr.trim().is_empty() {
         return Err(ChainError::new(
             None,
@@ -149,9 +161,8 @@ pub fn parse_chain(
         ));
     }
     let mut out = Vec::new();
-    let mut n = 0u32;
     for (i, hop_str) in split_hops(expr)?.iter().enumerate() {
-        out.push(parse_hop(hop_str, i, &mut n, registry, presets)?);
+        out.push(parse_hop(hop_str, i, n, registry, presets)?);
     }
     Ok(out)
 }
@@ -237,11 +248,16 @@ fn parse_hop(
     // every pair rides opaquely; the factory validates at build time.
     let spec = build_hop(name, &pairs, index)?;
     let mut spec = spec;
-    spec.id = label.unwrap_or_else(|| {
+    // Labeled hops reserve their counter slot too: `mock @mock-0` followed
+    // by auto `mock` yields `mock-0,mock-1`, not a duplicate `mock-0`.
+    if let Some(l) = label {
+        *n += 1;
+        spec.id = l;
+    } else {
         let id = format!("{name}-{n}");
         *n += 1;
-        id
-    });
+        spec.id = id;
+    }
     Ok(ExpandedHop::Hop(spec))
 }
 

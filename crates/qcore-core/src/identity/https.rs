@@ -11,6 +11,7 @@
 //! else fails closed before a socket opens.
 
 use std::time::Duration;
+use zeroize::{Zeroize, Zeroizing};
 
 /// HTTP method for [`request`].
 #[derive(Debug, Clone, Copy)]
@@ -32,11 +33,18 @@ impl HttpMethod {
     }
 }
 
-/// A completed response: status plus raw body.
+/// A completed response: status plus raw body. The body is wiped on drop
+/// (registration answers carry tokens; callers parse then drop promptly).
 #[derive(Debug)]
 pub struct HttpResponse {
     pub status: u16,
     pub body: Vec<u8>,
+}
+
+impl Drop for HttpResponse {
+    fn drop(&mut self) {
+        self.body.zeroize();
+    }
 }
 
 impl HttpResponse {
@@ -158,9 +166,11 @@ pub async fn request_with_family(
     family: &str,
 ) -> Result<(HttpResponse, String), HttpError> {
     let u = parse_url(url)?;
-    let owned: Vec<(String, String)> = headers
+    // Header values may carry bearer tokens: owned `Zeroizing` so the copies
+    // wipe on drop instead of lingering as plain `String`s.
+    let owned: Vec<(String, Zeroizing<String>)> = headers
         .iter()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .map(|(k, v)| (k.to_string(), Zeroizing::new(v.to_string())))
         .collect();
     tokio::time::timeout(
         timeout,
@@ -173,7 +183,7 @@ pub async fn request_with_family(
 async fn exchange(
     method: HttpMethod,
     u: &Url,
-    headers: &[(String, String)],
+    headers: &[(String, Zeroizing<String>)],
     body: &[u8],
     family: &str,
 ) -> Result<(HttpResponse, String), HttpError> {
@@ -213,21 +223,24 @@ async fn exchange(
     } else {
         Box::new(tcp)
     };
-    let mut req = format!(
+    // The request head embeds authorization values: `Zeroizing` so the
+    // buffer wipes on drop; dropped right after the write (earliest point).
+    let mut req = Zeroizing::new(format!(
         "{} {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n",
         method.as_str(),
         u.path,
         u.host,
         body.len()
-    );
+    ));
     for (k, v) in headers {
-        req.push_str(&format!("{k}: {v}\r\n"));
+        req.push_str(&format!("{k}: {}\r\n", **v));
     }
     req.push_str("Connection: close\r\n\r\n");
     stream
         .write_all(req.as_bytes())
         .await
         .map_err(|e| HttpError::Blocked(format!("request write: {e}")))?;
+    drop(req);
     stream
         .write_all(body)
         .await
@@ -237,7 +250,8 @@ async fn exchange(
         .await
         .map_err(|e| HttpError::Blocked(format!("request flush: {e}")))?;
     // Close-delimited: read to EOF, capped (registration answers are small).
-    let mut raw = Vec::new();
+    // The buffer may hold tokens: `Zeroizing` wipes it after parsing.
+    let mut raw = Zeroizing::new(Vec::new());
     let mut buf = [0u8; 8192];
     loop {
         let n = stream
@@ -252,6 +266,7 @@ async fn exchange(
             return Err(HttpError::Blocked("response too large".to_string()));
         }
     }
+    buf.zeroize();
     let resp = parse_response(&raw)?;
     Ok((resp, used_family))
 }

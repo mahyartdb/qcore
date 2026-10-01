@@ -6,21 +6,38 @@
 //! SOCKS-over-abstract-egress server. UDP ASSOCIATE is refused in US1 (TCP
 //! proxy scope); chains with UDP egress use the exit dialer directly.
 
+use super::net::{FamilyMode, FamilyPolicy};
 use qcore_transport_api::Dialer;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Serve forever (spawn this): one task per accepted connection.
+///
+/// Default policy (`dual`) when the caller has no family preference: IPv6
+/// targets are accepted at the SOCKS layer and the exit dialer enforces the
+/// chain policy. Prefer [`serve_socks_via_dialer_with_policy`] when the
+/// session family policy is known so IPv4-only sessions refuse IPv6 with
+/// `0x08` before dialing.
 pub async fn serve_socks_via_dialer(
     listener: tokio::net::TcpListener,
     dialer: Arc<dyn Dialer>,
 ) -> std::io::Result<()> {
+    serve_socks_via_dialer_with_policy(listener, dialer, FamilyPolicy::default()).await
+}
+
+/// [`serve_socks_via_dialer`] with an explicit family policy for IPv6 gating.
+pub async fn serve_socks_via_dialer_with_policy(
+    listener: tokio::net::TcpListener,
+    dialer: Arc<dyn Dialer>,
+    policy: FamilyPolicy,
+) -> std::io::Result<()> {
     loop {
         let (socket, _) = listener.accept().await?;
         let dialer = dialer.clone();
+        let policy = policy.clone();
         tokio::spawn(async move {
-            handle_connect(socket, &*dialer).await.ok();
+            handle_connect(socket, &*dialer, &policy).await.ok();
         });
     }
 }
@@ -28,6 +45,7 @@ pub async fn serve_socks_via_dialer(
 async fn handle_connect(
     mut socket: tokio::net::TcpStream,
     dialer: &dyn Dialer,
+    policy: &FamilyPolicy,
 ) -> std::io::Result<()> {
     let mut hdr = [0u8; 2];
     socket.read_exact(&mut hdr).await?;
@@ -57,7 +75,13 @@ async fn handle_connect(
             "only CONNECT is supported",
         ));
     }
-    let target = read_addr(&mut socket, req[3]).await?;
+    let target = match read_addr(&mut socket, req[3], policy).await {
+        Ok(t) => t,
+        Err(e) => {
+            write_reply(&mut socket, 0x08).await.ok();
+            return Err(e);
+        }
+    };
     let mut upstream = dialer
         .dial_tcp(target)
         .await
@@ -67,7 +91,11 @@ async fn handle_connect(
     Ok(())
 }
 
-async fn read_addr(socket: &mut tokio::net::TcpStream, atyp: u8) -> std::io::Result<SocketAddr> {
+async fn read_addr(
+    socket: &mut tokio::net::TcpStream,
+    atyp: u8,
+    policy: &FamilyPolicy,
+) -> std::io::Result<SocketAddr> {
     match atyp {
         0x01 => {
             let mut b = [0u8; 6];
@@ -77,21 +105,37 @@ async fn read_addr(socket: &mut tokio::net::TcpStream, atyp: u8) -> std::io::Res
                 u16::from_be_bytes([b[4], b[5]]),
             ))
         }
+        0x04 => {
+            let mut b = [0u8; 18];
+            socket.read_exact(&mut b).await?;
+            if policy.mode == FamilyMode::Ipv4 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "IPv6 CONNECT targets refused by family policy (mode=ipv4)",
+                ));
+            }
+            let mut ip = [0u8; 16];
+            ip.copy_from_slice(&b[..16]);
+            Ok(SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::from(ip)),
+                u16::from_be_bytes([b[16], b[17]]),
+            ))
+        }
+        // Domain names stay refused until a tunnel resolver exists: resolving
+        // via the OS here would leak DNS around the tunnel.
         0x03 => {
             let mut len = [0u8; 1];
             socket.read_exact(&mut len).await?;
-            let mut host = vec![0u8; len[0] as usize + 2];
-            socket.read_exact(&mut host).await?;
-            let port = u16::from_be_bytes([host[len[0] as usize], host[len[0] as usize + 1]]);
-            let name = String::from_utf8_lossy(&host[..len[0] as usize]).into_owned();
-            let mut addrs = tokio::net::lookup_host((name.as_str(), port)).await?;
-            addrs.next().ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::NotFound, "dns resolved nothing")
-            })
+            let mut rest = vec![0u8; len[0] as usize + 2];
+            socket.read_exact(&mut rest).await?;
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "domain CONNECT targets refused (no tunnel resolver; use a literal IP)",
+            ))
         }
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "IPv6 CONNECT targets are refused in US1",
+            "unsupported address type",
         )),
     }
 }

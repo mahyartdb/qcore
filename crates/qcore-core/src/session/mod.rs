@@ -247,10 +247,33 @@ pub enum SessionStatus {
     Live { report: report::ConnectionReport },
 }
 
+/// Synthetic session for an unparseable record: the id is unknown (the file
+/// could not be read), so callers fail closed on the variant, not the id.
+fn corrupt_placeholder() -> Session {
+    Session {
+        id: "unknown".to_string(),
+        chain: ChainSer {
+            hops: Vec::new(),
+            max_depth: 0,
+        },
+        family_policy: FamilyPolicy::default(),
+        state: SessionState::Up,
+        started_at: 0,
+        failure: None,
+    }
+}
+
 impl SessionStatus {
     pub fn read(dirs: &ProfileDirs) -> SessionStatus {
         let session = match Session::load(dirs) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return SessionStatus::NotRunning,
+            // A present-but-unparseable record is not "no session": fail
+            // closed as unverifiable, never a false green or a false empty.
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                return SessionStatus::Unverifiable {
+                    session: corrupt_placeholder(),
+                }
+            }
             Err(_) => return SessionStatus::NotRunning,
             Ok(s) => s,
         };

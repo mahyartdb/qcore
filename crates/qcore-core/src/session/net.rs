@@ -78,7 +78,10 @@ impl FamilyPolicy {
         let preferred = |a: &SocketAddr| match self.prefer {
             FamilyMode::Ipv4 => a.is_ipv4(),
             FamilyMode::Ipv6 => a.is_ipv6(),
-            FamilyMode::Dual => true,
+            // `prefer` parses to ipv4|ipv6 only (contracts/cli.md); the
+            // wildcard keeps exhaustiveness and defaults an unreachable
+            // `dual` to the IPv4-first behavior.
+            _ => a.is_ipv4(),
         };
         v.sort_by_key(|a| !preferred(a));
         v

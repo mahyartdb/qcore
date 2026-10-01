@@ -127,13 +127,25 @@ fn looks_random(s: &str) -> bool {
         && s.bytes().any(|b| b.is_ascii_alphanumeric())
 }
 
+/// Long hex strings top out at 4 bits/char, below the entropy bar, so
+/// device IDs and license keys need an explicit rule.
+const MIN_HEX_LEN: usize = 32;
+
+fn is_hex_token(s: &str) -> bool {
+    s.len() >= MIN_HEX_LEN && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn looks_secret(s: &str) -> bool {
+    looks_random(s) || is_hex_token(s)
+}
+
 /// Record-drop predicate shared by [`redact_record`] and the NDJSON event
 /// stream: a secret-like value under an innocuous key with no typed anchor
 /// cannot be proven safe — the whole record is dropped fail-closed (FR-026b).
 pub fn drops_record(key: &str, value: &str) -> bool {
     !key_is_secret(key)
         && !value_matches_denylist(value)
-        && looks_random(value)
+        && looks_secret(value)
         && value.len() >= MIN_DROP_LEN
 }
 
@@ -187,10 +199,10 @@ pub fn redact_value(key: &str, value: &str) -> Redaction {
     }
     // Free-form high-entropy values are treated as secret (fail closed at the
     // value level); see redact_record for the record-level fail-closed path.
-    if looks_random(value) {
+    if looks_secret(value) {
         return Redaction::Redacted;
     }
-    if value.split(char::is_whitespace).any(looks_random) {
+    if value.split(char::is_whitespace).any(looks_secret) {
         return Redaction::Keep(mask_secret_tokens(value));
     }
     Redaction::Keep(value.to_string())
@@ -206,7 +218,7 @@ fn mask_secret_tokens(value: &str) -> String {
         // is one token. (Separator matching is the same char::is_whitespace
         // predicate as the split, so word + sep == span.)
         let (word, sep) = span.split_at(span.trim_end_matches(char::is_whitespace).len());
-        out.push_str(if looks_random(word) {
+        out.push_str(if looks_secret(word) {
             "<redacted>"
         } else {
             word
@@ -413,5 +425,22 @@ mod tests {
             Redaction::Keep("plus".into())
         );
         assert_eq!(redact_value("license", ECHO_44), Redaction::Redacted);
+    }
+
+    #[test]
+    fn long_hex_tokens_are_secret_despite_low_entropy() {
+        // Hex tops out at 4 bits/char, below the entropy bar: a 32-char hex
+        // token (device ID, license key) must still redact under an innocuous
+        // key, and mask in place inside prose.
+        const HEX_32: &str = "0123456789abcdef0123456789abcdef";
+        assert_eq!(redact_value("mystery", HEX_32), Redaction::Redacted);
+        assert_eq!(
+            redact_value("mystery", &HEX_32[..31]),
+            Redaction::Keep(HEX_32[..31].to_string())
+        );
+        let prose = format!("id {} ok", HEX_32);
+        let masked = masked_value("cause", &prose);
+        assert!(!masked.contains(HEX_32), "hex leaked: {masked}");
+        assert!(masked.contains("<redacted>"), "nothing masked: {masked}");
     }
 }

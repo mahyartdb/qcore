@@ -67,47 +67,57 @@ pub fn new_token() -> String {
 
 /// Serve the control channel until a valid STOP arrives. STATUS replies with
 /// the live report; STOP replies OK and resolves `stopped`.
+///
+/// The report lives behind a shared [`RwLock`] so the session process can
+/// publish fresh health without restarting the listener; each connection is
+/// handled on its own task so a slow reader never blocks STATUS/STOP, and
+/// transient accept errors continue instead of killing the channel.
 pub async fn serve_control(
     listener: tokio::net::TcpListener,
     token: String,
     report: ConnectionReport,
     stopped: tokio::sync::oneshot::Sender<()>,
 ) {
-    let report_json = crate::session::report::to_json(&report);
-    let mut stopped = Some(stopped);
+    let report = std::sync::Arc::new(tokio::sync::RwLock::new(report));
+    serve_control_shared(listener, token, report, stopped).await
+}
+
+/// [`serve_control`] with a shared live report. Prefer this when the report
+/// updates after bring-up; the compat wrapper above snapshots once.
+pub async fn serve_control_shared(
+    listener: tokio::net::TcpListener,
+    token: String,
+    report: std::sync::Arc<tokio::sync::RwLock<ConnectionReport>>,
+    stopped: tokio::sync::oneshot::Sender<()>,
+) {
+    let stopped = std::sync::Arc::new(tokio::sync::Mutex::new(Some(stopped)));
+    let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
     loop {
-        let Ok((stream, _)) = listener.accept().await else {
-            break;
-        };
-        let token = token.clone();
-        let report_json = report_json.clone();
-        // STOP consumes the sender exactly once; further STOPs get ERR.
-        let stop_slot = &mut stopped;
-        let mut done = false;
-        handle_one(stream, &token, |kind| {
-            if kind == "STOP" {
-                if let Some(tx) = stop_slot.take() {
-                    let _ = tx.send(());
-                    done = true;
-                    "OK STOPPED\n".to_string()
-                } else {
-                    "ERR already stopping\n".to_string()
-                }
-            } else {
-                format!("OK {report_json}\n")
+        tokio::select! {
+            res = listener.accept() => {
+                let (stream, _) = match res {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let token = token.clone();
+                let report = report.clone();
+                let stopped = stopped.clone();
+                let shutdown = shutdown.clone();
+                tokio::spawn(async move {
+                    handle_shared(stream, &token, &report, &stopped, &shutdown).await;
+                });
             }
-        })
-        .await;
-        if done {
-            break;
+            _ = shutdown.notified() => break,
         }
     }
 }
 
-async fn handle_one(
+async fn handle_shared(
     stream: tokio::net::TcpStream,
     token: &str,
-    mut respond: impl FnMut(&str) -> String,
+    report: &tokio::sync::RwLock<ConnectionReport>,
+    stopped: &tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    shutdown: &tokio::sync::Notify,
 ) {
     let (r, mut w) = stream.into_split();
     let mut lines = tokio::io::BufReader::new(r).lines();
@@ -119,8 +129,19 @@ async fn handle_one(
     let presented = parts.next().unwrap_or("");
     let reply = if presented != token {
         "ERR bad token\n".to_string()
-    } else if cmd == "STATUS" || cmd == "STOP" {
-        respond(cmd)
+    } else if cmd == "STATUS" {
+        let report = report.read().await;
+        format!("OK {}\n", crate::session::report::to_json(&report))
+    } else if cmd == "STOP" {
+        // STOP consumes the sender exactly once; further STOPs get ERR.
+        let mut slot = stopped.lock().await;
+        if let Some(tx) = slot.take() {
+            let _ = tx.send(());
+            shutdown.notify_one();
+            "OK STOPPED\n".to_string()
+        } else {
+            "ERR already stopping\n".to_string()
+        }
     } else {
         "ERR unknown command\n".to_string()
     };

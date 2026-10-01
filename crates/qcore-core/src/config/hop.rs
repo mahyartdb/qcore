@@ -352,17 +352,27 @@ impl<'de> Deserialize<'de> for HopConfig {
                 // Scalar coercion (deliberately more lenient than the TOML
                 // strict path, which rejects non-string fields): stored JSON
                 // round-trips must not fail on numbers/booleans serialized
-                // by older writers. Tables/arrays stringify; factories treat
-                // unexpected shapes as validation errors at build time.
-                let family = map
+                // by older writers. Tables/arrays are never valid field
+                // values — stringifying them would hand factories garbage
+                // that only fails at build time — so they fail here naming
+                // the field, like the TOML path does.
+                let mut fields = BTreeMap::new();
+                for (k, v) in map {
+                    if v.is_object() || v.is_array() {
+                        return Err(D::Error::custom(format!(
+                            "non-string field `{k}` for transport `{other}`"
+                        )));
+                    }
+                    let s = scalar_string(&v);
+                    if k == "family" {
+                        continue;
+                    }
+                    fields.insert(k, s);
+                }
+                let family = fields
                     .remove("family")
-                    .map(|v| scalar_string(&v))
                     .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| "dual".to_string());
-                let fields = map
-                    .into_iter()
-                    .map(|(k, v)| (k, scalar_string(&v)))
-                    .collect();
                 HopConfig::Plugin(PluginHopConfig {
                     kind: other.to_string(),
                     family,
@@ -427,6 +437,24 @@ bogus_key = "nope"
 "#;
         let err = super::parse_toml_strict(toml).unwrap_err();
         assert!(err.contains("bogus_key"), "got: {err}");
+    }
+
+    #[test]
+    fn plugin_json_tables_rejected_scalars_kept() {
+        // Old writers serialized numbers: those still coerce (compat).
+        let num: HopSpec =
+            serde_json::from_str(r#"{"id":"p-0","kind":"my-kind","count":123,"family":"dual"}"#)
+                .expect("scalar coerces");
+        assert!(matches!(num.config, HopConfig::Plugin(_)));
+        // Tables/arrays are never valid values: fail naming the field (like
+        // the TOML strict path) instead of stringifying factory garbage.
+        let err =
+            serde_json::from_str::<HopSpec>(r#"{"id":"p-0","kind":"my-kind","opts":{"a":1}}"#)
+                .unwrap_err();
+        assert!(err.to_string().contains("opts"), "names field: {err}");
+        let err2 = serde_json::from_str::<HopSpec>(r#"{"id":"p-0","kind":"my-kind","tags":[1,2]}"#)
+            .unwrap_err();
+        assert!(err2.to_string().contains("tags"), "names field: {err2}");
     }
 
     #[test]

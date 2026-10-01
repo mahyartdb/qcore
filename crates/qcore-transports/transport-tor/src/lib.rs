@@ -90,7 +90,7 @@ impl qcore_transport_api::HopFactory for TorFactory {
 /// Strict bootstrap budget parse: absent → 120 s default; anything else must
 /// be an integer in 1..=3600 (a silent 120 s default on typos, a 0 s instant
 /// timeout, or a 300-year hang are all worse than an error).
-fn parse_bootstrap_secs(v: Option<&String>) -> Result<u64, String> {
+fn parse_bootstrap_secs(v: Option<&str>) -> Result<u64, String> {
     let Some(s) = v else { return Ok(120) };
     let n: u64 = s
         .parse()
@@ -245,9 +245,9 @@ mod tests {
     #[test]
     fn bootstrap_budget_parses_strictly() {
         assert_eq!(parse_bootstrap_secs(None).unwrap(), 120);
-        assert_eq!(parse_bootstrap_secs(Some(&"45".to_string())).unwrap(), 45);
-        assert!(parse_bootstrap_secs(Some(&"abc".to_string())).is_err());
-        assert!(parse_bootstrap_secs(Some(&"0".to_string())).is_err());
-        assert!(parse_bootstrap_secs(Some(&"9999999999".to_string())).is_err());
+        assert_eq!(parse_bootstrap_secs(Some("45")).unwrap(), 45);
+        assert!(parse_bootstrap_secs(Some("abc")).is_err());
+        assert!(parse_bootstrap_secs(Some("0")).is_err());
+        assert!(parse_bootstrap_secs(Some("9999999999")).is_err());
     }
 }

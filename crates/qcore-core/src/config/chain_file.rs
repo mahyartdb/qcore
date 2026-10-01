@@ -28,6 +28,15 @@ pub struct ChainFile {
 
 /// Parse chain TOML text. Errors name the offending field.
 pub fn parse_chain_file_str(s: &str) -> Result<ChainFile, ChainError> {
+    parse_chain_file_str_in(s, &crate::registry::TransportRegistry::global())
+}
+
+/// [`parse_chain_file_str`] against an explicit registry (see
+/// [`load_chain_file_in`]).
+pub fn parse_chain_file_str_in(
+    s: &str,
+    registry: &crate::registry::TransportRegistry,
+) -> Result<ChainFile, ChainError> {
     let v: toml::Value = toml::from_str(s)
         .map_err(|e| ChainError::new(None, None, format!("chain file: invalid TOML: {e}"), None))?;
     let chain = v.get("chain").ok_or_else(|| {
@@ -80,7 +89,7 @@ pub fn parse_chain_file_str(s: &str) -> Result<ChainFile, ChainError> {
     })?;
     let mut out = Vec::new();
     for (i, h) in hops.iter().enumerate() {
-        out.push(ExpandedHop::Hop(parse_file_hop(i, h)?));
+        out.push(ExpandedHop::Hop(parse_file_hop(i, h, registry)?));
     }
     Ok(ChainFile {
         max_depth,
@@ -106,7 +115,11 @@ fn field(hop: &toml::Value, i: usize, id: &str, key: &str) -> Result<Option<Stri
     }
 }
 
-fn parse_file_hop(i: usize, hop: &toml::Value) -> Result<HopSpec, ChainError> {
+fn parse_file_hop(
+    i: usize,
+    hop: &toml::Value,
+    registry: &crate::registry::TransportRegistry,
+) -> Result<HopSpec, ChainError> {
     let err = |reason: String| ChainError::new(Some(i), None, reason, None);
     let t = hop
         .as_table()
@@ -121,12 +134,10 @@ fn parse_file_hop(i: usize, hop: &toml::Value) -> Result<HopSpec, ChainError> {
         None => format!("{kind}-{i}"),
     };
     // Plugin kinds (SC-002c) skip the per-kind field table: every string
-    // field rides opaquely; the factory validates at build time.
+    // field rides opaquely; the factory validates at build time. The
+    // caller's registry decides (see `load_chain_file_in`).
     if allowed_fields(kind).is_none() {
-        if crate::registry::TransportRegistry::global()
-            .get(kind)
-            .is_none()
-        {
+        if registry.get(kind).is_none() {
             return Err(err(format!("chain file: unknown transport `{kind}`")));
         }
         let mut pairs = std::collections::BTreeMap::new();
@@ -195,6 +206,15 @@ fn parse_file_hop(i: usize, hop: &toml::Value) -> Result<HopSpec, ChainError> {
 
 /// Load a chain file from disk.
 pub fn load_chain_file(path: &std::path::Path) -> Result<ChainFile, ChainError> {
+    load_chain_file_in(path, &crate::registry::TransportRegistry::global())
+}
+
+/// [`load_chain_file`] against an explicit registry: plugin kinds resolve
+/// via the caller's registry instead of the linked global set.
+pub fn load_chain_file_in(
+    path: &std::path::Path,
+    registry: &crate::registry::TransportRegistry,
+) -> Result<ChainFile, ChainError> {
     let raw = std::fs::read_to_string(path).map_err(|e| {
         ChainError::new(
             None,
@@ -203,7 +223,7 @@ pub fn load_chain_file(path: &std::path::Path) -> Result<ChainFile, ChainError> 
             None,
         )
     })?;
-    parse_chain_file_str(&raw)
+    parse_chain_file_str_in(&raw, registry)
 }
 
 #[cfg(test)]

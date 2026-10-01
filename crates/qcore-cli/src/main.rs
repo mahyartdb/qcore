@@ -370,7 +370,15 @@ async fn async_main(cli: Cli) -> i32 {
         Commands::Export { import_ref } => cmd::import::run_export(&import_ref, cli.json, &dirs),
         Commands::Legal => help::run(cli.json),
         Commands::External(args) => {
-            run_shortcut(args, cli.json, dirs, cli.config, cli.profile_dir).await
+            run_shortcut(
+                args,
+                cli.json,
+                dirs,
+                cli.config,
+                cli.profile_dir,
+                globals.max_depth,
+            )
+            .await
         }
         Commands::Connect {
             chain,
@@ -466,6 +474,7 @@ async fn run_shortcut(
     dirs: ProfileDirs,
     config: Option<std::path::PathBuf>,
     profile_dir: Option<std::path::PathBuf>,
+    max_depth: Option<u32>,
 ) -> i32 {
     let engine = cmd::preflight::default_engine(dirs.clone());
     let presets = match qcore_core::chain::preset::resolve_presets(&dirs) {
@@ -476,10 +485,13 @@ async fn run_shortcut(
         }
     };
     let name = args.join(" ");
+    // Shortcuts honor --max-depth like --chain does (validated 1..=5 in
+    // check_globals); default 3 matches the connect default.
+    let max_depth = max_depth.unwrap_or(3);
     match cmd::shortcuts::resolve(
         &engine,
         &presets,
-        3,
+        max_depth,
         args.first().map(|s| s.as_str()).unwrap_or(""),
     ) {
         Ok(specs) => {
@@ -502,7 +514,7 @@ async fn run_shortcut(
                 child: false,
                 scan: false,
                 obfuscation: None,
-                globals_max_depth: None,
+                globals_max_depth: Some(max_depth),
                 globals_timeout: 30,
                 globals_quiet: false,
                 globals_verbose: 0,

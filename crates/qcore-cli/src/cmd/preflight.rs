@@ -77,8 +77,11 @@ pub fn resolve_inputs(
         ));
     }
     if let Some(path) = file {
-        let cf = qcore_core::config::chain_file::load_chain_file(std::path::Path::new(path))
-            .map_err(|e| (exit::INVALID, e.to_string()))?;
+        let cf = qcore_core::config::chain_file::load_chain_file_in(
+            std::path::Path::new(path),
+            engine.registry(),
+        )
+        .map_err(|e| (exit::INVALID, e.to_string()))?;
         return Ok(ResolvedInputs {
             specs: cf.hops,
             max_depth: cf.max_depth,

@@ -23,10 +23,32 @@ pub(crate) fn unquote(v: &str) -> String {
     if v.len() >= 2
         && ((v.starts_with('"') && v.ends_with('"')) || (v.starts_with('\'') && v.ends_with('\'')))
     {
-        v[1..v.len() - 1].to_string()
+        unescape(&v[1..v.len() - 1])
     } else {
         v.to_string()
     }
+}
+
+/// Resolve `\"` → `"` and `\\` → `\` inside quoted spans (canonical-expr
+/// quoting emits these; a lone trailing `\` stays literal).
+fn unescape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some(n @ ('"' | '\\')) => out.push(n),
+                Some(n) => {
+                    out.push('\\');
+                    out.push(n);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Split on top-level commas (quote-aware). Empty segments are errors.
@@ -34,17 +56,23 @@ fn split_hops(expr: &str) -> Result<Vec<String>, ChainError> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut quote: Option<char> = None;
+    let mut escaped = false;
     for c in expr.chars() {
         match quote {
             Some(q) => {
                 cur.push(c);
-                if c == q {
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == q {
                     quote = None;
                 }
             }
             None => match c {
                 '"' | '\'' => {
                     quote = Some(c);
+                    escaped = false;
                     cur.push(c);
                 }
                 ',' => {
@@ -90,17 +118,23 @@ fn tokenize(hop: &str) -> Result<Vec<(String, bool)>, ChainError> {
     let mut quote: Option<char> = None;
     let mut token_quoted = false;
     let mut in_token = false;
+    let mut escaped = false;
     for c in hop.chars() {
         match quote {
             Some(q) => {
                 cur.push(c);
-                if c == q {
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == q {
                     quote = None;
                 }
             }
             None => match c {
                 '"' | '\'' => {
                     quote = Some(c);
+                    escaped = false;
                     token_quoted = true;
                     in_token = true;
                     cur.push(c);
@@ -201,7 +235,7 @@ fn parse_hop(
     // Bare token: registered kind wins, else preset reference.
     if rest.is_empty() && label.is_none() {
         if registry.get(name).is_some() {
-            let spec = bare_hop(name, &format!("{name}-{n}"))?;
+            let spec = bare_hop(name, &format!("{name}-{n}"), registry)?;
             *n += 1;
             return Ok(ExpandedHop::Hop(spec));
         }
@@ -246,7 +280,7 @@ fn parse_hop(
     }
     // Plugin kinds (SC-002c): registered (checked above) but untyped —
     // every pair rides opaquely; the factory validates at build time.
-    let spec = build_hop(name, &pairs, index)?;
+    let spec = build_hop(name, &pairs, index, registry)?;
     let mut spec = spec;
     // Labeled hops reserve their counter slot too: `mock @mock-0` followed
     // by auto `mock` yields `mock-0,mock-1`, not a duplicate `mock-0`.
@@ -262,8 +296,8 @@ fn parse_hop(
 }
 
 /// A bare kind with defaults (family dual; wireguard peer warp; masque h3).
-fn bare_hop(kind: &str, id: &str) -> Result<HopSpec, ChainError> {
-    build_hop(kind, &std::collections::BTreeMap::new(), 0).map(|mut spec| {
+fn bare_hop(kind: &str, id: &str, registry: &TransportRegistry) -> Result<HopSpec, ChainError> {
+    build_hop(kind, &std::collections::BTreeMap::new(), 0, registry).map(|mut spec| {
         spec.id = id.to_string();
         spec
     })
@@ -277,16 +311,16 @@ fn build_hop(
     kind: &str,
     pairs: &std::collections::BTreeMap<String, String>,
     index: usize,
+    registry: &TransportRegistry,
 ) -> Result<HopSpec, ChainError> {
     let err = |reason: String| ChainError::new(Some(index), None, reason, None);
     // Plugin kinds (SC-002c): registered but untyped — every pair rides
     // opaquely; the factory validates at build time. Unregistered kinds
-    // fail closed naming the kind.
+    // fail closed naming the kind. The CALLER's registry decides (never the
+    // global): a kind present in the passed registry but absent from the
+    // linked set parses here instead of dying one gate later.
     if crate::config::allowed_fields(kind).is_none() {
-        if crate::registry::TransportRegistry::global()
-            .get(kind)
-            .is_none()
-        {
+        if registry.get(kind).is_none() {
             return Err(err(format!("unknown transport `{kind}` (run `qcore ls`)")));
         }
         return Ok(HopSpec {
@@ -373,6 +407,23 @@ mod tests {
         assert_eq!(unquote("\"a b\""), "a b");
         assert_eq!(unquote("'a'"), "a");
         assert_eq!(unquote("plain"), "plain");
+    }
+
+    #[test]
+    fn quoted_escapes_round_trip() {
+        // Canonical-expr quoting emits \" and \\ inside double quotes.
+        assert_eq!(unquote("\"a\\\"b\""), "a\"b");
+        assert_eq!(unquote("\"a\\\\b\""), "a\\b");
+        assert_eq!(
+            unquote("\"C:\\\\Program Files\\\\app.exe\""),
+            "C:\\Program Files\\app.exe"
+        );
+        // An escaped quote does not close the span: the comma stays inside.
+        let hops = split_hops("mock note=\"a\\\",b\"").unwrap();
+        assert_eq!(hops.len(), 1);
+        // Unterminated escape-quote still errors.
+        assert!(split_hops("mock endpoint=\"abc").is_err());
+        assert!(tokenize("mock endpoint=\"abc").is_err());
     }
 
     #[test]

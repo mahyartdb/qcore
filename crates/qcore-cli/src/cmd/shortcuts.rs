@@ -148,7 +148,9 @@ pub fn resolve(
         match s {
             Segment::Preset(p) => specs.push(ExpandedHop::Preset(p.to_string())),
             Segment::Kind(k) => {
-                let mut spec = Engine::parse_single_hop(k, "").map_err(ResolveFailure::Invalid)?;
+                let mut spec = engine
+                    .parse_single_hop_in(k, "")
+                    .map_err(ResolveFailure::Invalid)?;
                 spec.id = format!("{k}-{n}");
                 n += 1;
                 specs.push(ExpandedHop::Hop(spec));
@@ -197,7 +199,9 @@ pub fn advertised(engine: &Engine, presets: &[CompositionPreset], max_depth: u32
 }
 
 /// Canonical `--chain` expression for authored specs (used to re-spawn the
-/// detach child faithfully): presets by name, hops as `kind k=v...`.
+/// detach child faithfully): presets by name, hops as `kind k=v...`. Values
+/// containing `,`, whitespace, `=`, or quotes are quoted (the grammar
+/// requires it); without quoting, reparse splits or misparses them.
 pub fn canonical_expr(specs: &[ExpandedHop]) -> String {
     specs
         .iter()
@@ -212,13 +216,39 @@ pub fn canonical_expr(specs: &[ExpandedHop]) -> String {
                     if k == "hop_id" {
                         continue;
                     }
-                    parts.push(format!("{k}={}", pairs.fields[k]));
+                    parts.push(format!("{k}={}", quote_value(&pairs.fields[k])));
                 }
                 parts.join(" ")
             }
         })
         .collect::<Vec<_>>()
         .join(",")
+}
+
+/// Quote a canonical value iff the grammar needs it (see `tokenize`); quote
+/// and backslash are escaped so reparse restores the exact string.
+fn quote_value(v: &str) -> String {
+    if v.chars()
+        .all(|c| !c.is_whitespace() && c != ',' && c != '=' && c != '"' && c != '\'')
+        && !v.is_empty()
+    {
+        return v.to_string();
+    }
+    // Escape only what the grammar needs: `"` always (it would close the
+    // span); `\` only when it would escape the next char or the closing
+    // quote (`C:\Program Files\app.exe` stays readable unescaped).
+    let chars: Vec<char> = v.chars().collect();
+    let mut out = String::with_capacity(v.len() + 2);
+    out.push('"');
+    for (i, c) in chars.iter().enumerate() {
+        let next = chars.get(i + 1);
+        if *c == '"' || (*c == '\\' && matches!(next, None | Some('"') | Some('\\'))) {
+            out.push('\\');
+        }
+        out.push(*c);
+    }
+    out.push('"');
+    out
 }
 
 /// Validate the six-rule generator itself (rule 5 regression net).
@@ -283,6 +313,20 @@ mod tests {
             resolve(&e, &presets, 3, "masque-h2"),
             Err(ResolveFailure::Unknown(_))
         ));
+    }
+
+    #[test]
+    fn canonical_quotes_values_needing_it() {
+        // Values with spaces/commas/equals must quote or reparse breaks
+        // (detach re-spawn and audit reparse consume this form).
+        assert_eq!(quote_value("plain"), "plain");
+        assert_eq!(quote_value(""), "\"\"");
+        assert_eq!(
+            quote_value("C:\\Program Files\\app.exe"),
+            "\"C:\\Program Files\\app.exe\""
+        );
+        assert_eq!(quote_value("a,b=c"), "\"a,b=c\"");
+        assert_eq!(quote_value("say \"hi\""), "\"say \\\"hi\\\"\"");
     }
 
     #[test]

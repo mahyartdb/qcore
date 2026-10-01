@@ -48,6 +48,20 @@ impl qcore_transport_api::HopFactory for MockFactory {
         cfg: HopConfig,
         carrier: Arc<dyn Dialer>,
     ) -> Result<Arc<dyn RunningHop>, HopError> {
+        // Strict like real factories: the grammar gates fields, but
+        // embedder-built configs bypass it — garbage must fail here, not
+        // silently ride a test double into a false-green chain.
+        if let Some(k) = cfg
+            .fields
+            .keys()
+            .find(|k| k.as_str() != "hop_id" && k.as_str() != "family")
+        {
+            return Err(HopError::new(
+                qcore_transport_api::HopErrorKind::Config,
+                Some(cfg.get("hop_id").unwrap_or("mock-0").to_string()),
+                format!("unknown mock field `{k}`"),
+            ));
+        }
         let hop_id = cfg.get("hop_id").unwrap_or("mock-0").to_string();
         let (tx, _) = tokio::sync::broadcast::channel(16);
         let _ = tx.send(HopEvent::Started {
@@ -76,7 +90,16 @@ impl Dialer for MockDialer {
     }
 
     fn capabilities(&self) -> Capabilities {
-        DESCRIPTOR.capabilities
+        // Runtime truth, not the static descriptor: mock delegates to its
+        // carrier, so UDP capability follows the carrier (a tor carrier is
+        // TCP-only even though the mock descriptor advertises UDP — the
+        // static descriptor is for registry listing; dial decisions see this).
+        let c = self.carrier.capabilities();
+        Capabilities {
+            dials_tcp: c.dials_tcp,
+            dials_udp: c.dials_udp,
+            ..DESCRIPTOR.capabilities
+        }
     }
 
     /// Transparent pass-through: nesting is the carrier's property.

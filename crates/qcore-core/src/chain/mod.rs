@@ -118,6 +118,16 @@ pub enum ExpandedHop {
 /// Input like `wireguard peer=warp family=dual`: first token is the kind or a
 /// preset name, rest are space-separated `key=value` pairs.
 pub fn parse_single_hop(kind: &str, opts: &str) -> Result<HopSpec, ChainError> {
+    parse_single_hop_in(kind, opts, &crate::registry::TransportRegistry::global())
+}
+
+/// [`parse_single_hop`] against an explicit registry: embedder-filtered
+/// registries are honored for plugin kinds instead of the linked global set.
+pub fn parse_single_hop_in(
+    kind: &str,
+    opts: &str,
+    registry: &crate::registry::TransportRegistry,
+) -> Result<HopSpec, ChainError> {
     use crate::config::*;
     let mut pairs = std::collections::BTreeMap::new();
     for tok in opts.split_whitespace() {
@@ -142,11 +152,9 @@ pub fn parse_single_hop(kind: &str, opts: &str) -> Result<HopSpec, ChainError> {
     }
     let get = |k: &str, default: &str| pairs.get(k).cloned().unwrap_or_else(|| default.to_string());
     // Plugin kinds (SC-002c): registered but untyped — carry opaquely.
+    // The caller's registry decides (see `parse_single_hop_in`).
     if crate::config::allowed_fields(kind).is_none() {
-        if crate::registry::TransportRegistry::global()
-            .get(kind)
-            .is_none()
-        {
+        if registry.get(kind).is_none() {
             return Err(ChainError::new(
                 None,
                 None,

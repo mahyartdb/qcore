@@ -141,6 +141,36 @@ fn evict_winner(dirs: &ProfileDirs, transport: &str) {
     }
 }
 
+/// Per-transport stale eviction (F1): drop only `transport`'s winner after an
+/// empty scan, preserving siblings. The legacy `last_known_good` follows a
+/// remaining winner when one exists (so reconnect keeps working); it is
+/// cleared only when no winners remain. Deletes the file when fully empty
+/// (legacy-only stale files included).
+pub fn evict_stale_transport(dirs: &ProfileDirs, transport: &str) -> Result<(), String> {
+    let _guard = lock_cache();
+    let mut file = read_file(dirs);
+    file.winners.remove(transport);
+    if file.winners.is_empty() {
+        file.last_known_good = None;
+    } else if !file
+        .winners
+        .values()
+        .any(|w| Some(&w.address) == file.last_known_good.as_ref())
+    {
+        if let Some((_, w)) = file.winners.first_key_value() {
+            file.last_known_good = Some(w.address.clone());
+        }
+    }
+    if file.winners.is_empty() && file.last_known_good.is_none() {
+        let path = dirs.endpoints_file();
+        if path.exists() {
+            std::fs::remove_file(&path).map_err(|e| e.to_string())?;
+        }
+        return Ok(());
+    }
+    write_file(dirs, &file)
+}
+
 fn touch_verified_at(dirs: &ProfileDirs, transport: &str) {
     let _guard = lock_cache();
     let mut file = read_file(dirs);

@@ -8,7 +8,7 @@ use qcore_core::config::profile_dir::ProfileDirs;
 use qcore_core::identity::model::now_ms;
 use qcore_core::scan::{
     cache, discovery_seeds, evict_stale_lkg, load_profile, persist_verified,
-    seeds::{candidates_for, load_warp_profiles},
+    seeds::{self, candidates_for, load_warp_profiles},
     ScanReport, ScanRequest, Scanner,
 };
 
@@ -81,6 +81,9 @@ pub async fn run_scan_request(
     candidates.extend(discovery_seeds(dirs, transport));
     candidates.sort();
     candidates.dedup();
+    // F4: scan-wide ceiling (reuses the seeded bound) — the scanner truncates
+    // again defensively, this keeps the pre-scan sort/dedup bounded too.
+    candidates.truncate(seeds::MAX_SEEDED_CANDIDATES);
     let report = Scanner::scan(ScanRequest {
         transport: transport.to_string(),
         profile,
@@ -89,7 +92,9 @@ pub async fn run_scan_request(
     })
     .await?;
     if report.ranked.is_empty() {
-        evict_stale_lkg(dirs, &report)?;
+        // F1: per-transport eviction — a dead transport must not wipe
+        // siblings' winners.
+        evict_stale_lkg(dirs, transport, &report)?;
     } else {
         persist_verified(dirs, &report)?;
         if let Some(top) = report.ranked.iter().find(|c| {

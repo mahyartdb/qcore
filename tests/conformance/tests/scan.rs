@@ -155,7 +155,7 @@ async fn empty_scan_exits_4_with_no_silent_reuse() {
     assert!(report.ranked.is_empty());
     assert_eq!(ScanError::for_report(&report), ScanError::Empty);
     assert_eq!(ScanError::Empty.exit_code(), 4);
-    evict_stale_lkg(&d, &report).expect("evict runs");
+    evict_stale_lkg(&d, "wireguard", &report).expect("evict runs");
     assert!(
         qcore_core::session::reconnect::last_known_good(&d).is_none(),
         "stale LKG evicted, not silently reused"

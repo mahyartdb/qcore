@@ -17,6 +17,10 @@ pub const MAX_CONCURRENCY: u32 = 512;
 /// 12x the CLI fast-path cap (5000 ms). A per-probe minute is the absurdity
 /// ceiling, not a tuning choice.
 pub const MAX_RTT_BUDGET_MS: u64 = 60_000;
+/// Overall scan deadline (SC-005): no scan outlives this, however many
+/// candidates or however small the concurrency. Per-probe budgets still apply
+/// inside; leftovers count as failed.
+pub const MAX_SCAN_OVERALL_MS: u64 = 30_000;
 
 /// Scan profile (data-model). Exactly `turbo`, `balanced` (default), `stealth`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -177,7 +181,9 @@ fn parse_scan_toml(text: &str, name: &str) -> Result<ScanProfile, String> {
 }
 
 /// Discovery seeds for a transport from `scan.toml [discovery.<transport>]`
-/// (data; empty by default — discovery providers plug in here).
+/// (data; empty by default — discovery providers plug in here). Capped at
+/// `seeds::MAX_SEEDED_CANDIDATES` (F4): an adversarial profile dir must not
+/// turn one scan into unbounded sockets.
 pub fn discovery_seeds(
     dirs: &crate::config::profile_dir::ProfileDirs,
     transport: &str,
@@ -195,6 +201,7 @@ pub fn discovery_seeds(
         .map(|arr| {
             arr.iter()
                 .filter_map(|x| x.as_str()?.parse::<SocketAddr>().ok())
+                .take(seeds::MAX_SEEDED_CANDIDATES)
                 .collect()
         })
         .unwrap_or_default()
@@ -275,13 +282,30 @@ impl Scanner {
                 .position(|f| *f == family_of(*a))
                 .unwrap_or(usize::MAX)
         });
-        let limit = req.profile.concurrency.max(1) as usize;
-        let budget = std::time::Duration::from_millis(req.profile.rtt_budget_ms.max(1));
+        // F4: cap candidates — 10k inputs must not become 10k spawns.
+        // Reuses the seeded-scan bound (512) as the scan-wide ceiling.
+        cands.truncate(seeds::MAX_SEEDED_CANDIDATES);
+        // F4: clamp defensively — ScanProfile fields are pub and directly
+        // constructible, bypassing the TOML gate (u32::MAX permits would
+        // otherwise mean unbounded in-flight sockets; 0 permits would hang).
+        let limit = req.profile.concurrency.clamp(1, MAX_CONCURRENCY) as usize;
+        let budget =
+            std::time::Duration::from_millis(req.profile.rtt_budget_ms.clamp(1, MAX_RTT_BUDGET_MS));
+        // F4: overall deadline — per-probe budgets bound each socket, this
+        // bounds the scan. Batches * budget + slack, floored so tiny scans
+        // are never starved, capped at SC-005's 30 s.
+        let batches = cands.len().div_ceil(limit.max(1)) as u64;
+        let overall_ms = (budget.as_millis() as u64)
+            .saturating_mul(batches)
+            .saturating_add(2_000)
+            .clamp(5_000, MAX_SCAN_OVERALL_MS);
+        let deadline = t0 + std::time::Duration::from_millis(overall_ms);
         let kind = req.profile.probe_kind;
         let stealth_gap = req.profile.stealth;
         let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(limit));
         // Pre-sized (#15): one join per candidate, at most one pass each —
         // no reason to grow these incrementally on large seeded scans.
+        // Post-truncate len <= 512, so spawns are bounded (F4).
         let mut joins = Vec::with_capacity(cands.len());
         for addr in cands {
             if stealth_gap {
@@ -297,12 +321,29 @@ impl Scanner {
                 probe(addr, kind, budget).await
             }));
         }
+        // Drain under the overall deadline: expired remainder aborts and
+        // counts as failed (never silently retried). `&mut` join keeps
+        // ownership so the timeout branch can abort instead of detaching.
         let mut passed = Vec::with_capacity(joins.len());
         let mut failed = 0usize;
-        for j in joins {
-            match j.await {
-                Ok(Some(c)) => passed.push(c),
-                _ => failed += 1,
+        for mut j in joins {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                j.abort();
+                failed += 1;
+                continue;
+            }
+            tokio::select! {
+                res = &mut j => {
+                    match res {
+                        Ok(Some(c)) => passed.push(c),
+                        _ => failed += 1,
+                    }
+                }
+                _ = tokio::time::sleep(remaining) => {
+                    j.abort();
+                    failed += 1;
+                }
             }
         }
         let ranked = rank(passed);
@@ -428,18 +469,18 @@ pub fn persist_verified(
 
 /// Drop a stale last-known-good after a scan that passed nothing (FR-016:
 /// failed endpoints are discarded and not reused — no silent reuse).
+/// Per-transport (F1): only `transport`'s winner is dropped; siblings survive.
+/// The legacy `last_known_good` follows a remaining winner, cleared only when
+/// no winners remain.
 pub fn evict_stale_lkg(
     dirs: &crate::config::profile_dir::ProfileDirs,
+    transport: &str,
     report: &ScanReport,
 ) -> Result<(), String> {
     if !report.ranked.is_empty() {
         return Ok(());
     }
-    let path = dirs.endpoints_file();
-    if path.exists() {
-        std::fs::remove_file(&path).map_err(|e| e.to_string())?;
-    }
-    Ok(())
+    cache::evict_stale_transport(dirs, transport)
 }
 
 #[cfg(test)]
@@ -519,5 +560,167 @@ mod tests {
         let ok = parse_scan_toml(&base("512", "60000"), "p").expect("bounds inclusive");
         assert_eq!(ok.concurrency, 512);
         assert_eq!(ok.rtt_budget_ms, 60_000);
+    }
+
+    fn evict_dirs(tag: &str) -> crate::config::profile_dir::ProfileDirs {
+        let dir = std::env::temp_dir().join(format!("qcore-evict-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let d = crate::config::profile_dir::ProfileDirs::resolve(
+            Some(dir.join("cfg")),
+            Some(dir.join("prof")),
+        );
+        d.ensure_dirs().unwrap();
+        d
+    }
+
+    fn evict_winner(addr: &str) -> cache::TransportWinner {
+        cache::TransportWinner {
+            address: addr.to_string(),
+            profile: "balanced".to_string(),
+            verified_at_ms: crate::identity::model::now_ms(),
+            family: "ipv4".to_string(),
+        }
+    }
+
+    fn empty_report(transport: &str) -> ScanReport {
+        ScanReport {
+            transport: transport.to_string(),
+            profile: "balanced".to_string(),
+            ranked: Vec::new(),
+            failed: 1,
+            elapsed_ms: 0,
+        }
+    }
+
+    /// F1: an empty warp scan evicts only warp — masque survives with a live
+    /// legacy LKG. Pre-fix this wiped the whole `endpoints.json`.
+    #[test]
+    fn evict_stale_lkg_is_per_transport() {
+        let d = evict_dirs("per-transport");
+        cache::record_winner(&d, "warp", evict_winner("127.0.0.1:2408")).unwrap();
+        cache::record_winner(&d, "masque", evict_winner("127.0.0.1:443")).unwrap();
+        evict_stale_lkg(&d, "warp", &empty_report("warp")).expect("evict runs");
+        let map = cache::read_winners(&d);
+        assert!(
+            !map.contains_key("warp"),
+            "empty transport evicted: {map:?}"
+        );
+        assert_eq!(
+            map.get("masque").map(|w| w.address.as_str()),
+            Some("127.0.0.1:443"),
+            "sibling winner preserved: {map:?}"
+        );
+        assert!(
+            d.endpoints_file().exists(),
+            "file survives while a sibling winner remains"
+        );
+        assert_eq!(
+            crate::session::reconnect::last_known_good(&d),
+            Some("127.0.0.1:443".parse().unwrap()),
+            "legacy LKG follows the surviving winner, never the dead one"
+        );
+        // Evicting the last transport clears the file (legacy-only stale
+        // files included — no silent reuse).
+        evict_stale_lkg(&d, "masque", &empty_report("masque")).expect("evict runs");
+        assert!(cache::read_winners(&d).is_empty());
+        assert_eq!(crate::session::reconnect::last_known_good(&d), None);
+        let _ = std::fs::remove_dir_all(&d.config_dir);
+    }
+
+    /// F1: a non-empty report never evicts, even for another transport.
+    #[test]
+    fn evict_stale_lkg_keeps_cache_on_success() {
+        let d = evict_dirs("keeps-on-success");
+        cache::record_winner(&d, "warp", evict_winner("127.0.0.1:2408")).unwrap();
+        let mut report = empty_report("warp");
+        report
+            .ranked
+            .push(cand(10, Confidence::Verified, Reachability::Passed));
+        evict_stale_lkg(&d, "warp", &report).expect("evict runs");
+        assert!(cache::read_winners(&d).contains_key("warp"));
+        let _ = std::fs::remove_dir_all(&d.config_dir);
+    }
+
+    /// F4: 10k candidates are capped at `MAX_SEEDED_CANDIDATES` (512) — not
+    /// 10k spawns. Closed ports fail fast, so this stays quick.
+    #[tokio::test]
+    async fn scan_caps_ten_k_candidates() {
+        let closed: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let profile = ScanProfile {
+            name: "balanced".to_string(),
+            concurrency: 32,
+            rtt_budget_ms: 50,
+            probe_kind: ProbeKind::Handshake,
+            family_order: vec!["ipv4".to_string()],
+            stealth: false,
+        };
+        let report = Scanner::scan(ScanRequest {
+            transport: "warp".into(),
+            profile,
+            family: "ipv4".into(),
+            candidates: vec![closed; 10_000],
+        })
+        .await
+        .expect("scan runs");
+        assert!(report.ranked.is_empty());
+        assert_eq!(
+            report.failed,
+            seeds::MAX_SEEDED_CANDIDATES,
+            "10k inputs capped to {} spawns, got {}",
+            seeds::MAX_SEEDED_CANDIDATES,
+            report.failed
+        );
+        assert!(
+            report.elapsed_ms < MAX_SCAN_OVERALL_MS,
+            "overall deadline holds: {} ms",
+            report.elapsed_ms
+        );
+    }
+
+    /// F4: a directly-constructed absurd concurrency (bypassing the TOML gate)
+    /// is clamped to `MAX_CONCURRENCY`, never unbounded permits.
+    #[tokio::test]
+    async fn scan_clamps_absurd_concurrency() {
+        let closed: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let profile = ScanProfile {
+            name: "balanced".to_string(),
+            concurrency: u32::MAX,
+            rtt_budget_ms: 50,
+            probe_kind: ProbeKind::Handshake,
+            family_order: vec!["ipv4".to_string()],
+            stealth: false,
+        };
+        let report = Scanner::scan(ScanRequest {
+            transport: "warp".into(),
+            profile,
+            family: "ipv4".into(),
+            candidates: vec![closed; 100],
+        })
+        .await
+        .expect("scan runs");
+        assert_eq!(report.failed, 100);
+    }
+
+    /// F4: `discovery_seeds` caps an adversarial `scan.toml` at the same bound.
+    #[test]
+    fn discovery_seeds_capped() {
+        let d = evict_dirs("seeds-cap");
+        let mut seeds = String::from("[discovery.warp]\nseeds = [");
+        for i in 0..2000 {
+            if i > 0 {
+                seeds.push_str(", ");
+            }
+            seeds.push_str(&format!("\"127.0.0.1:{}\"", 1000 + (i % 50000)));
+        }
+        seeds.push_str("]\n");
+        std::fs::write(d.profile_dir.join("scan.toml"), seeds).unwrap();
+        let got = discovery_seeds(&d, "warp");
+        assert!(
+            got.len() <= seeds::MAX_SEEDED_CANDIDATES,
+            "discovery capped to {}, got {}",
+            seeds::MAX_SEEDED_CANDIDATES,
+            got.len()
+        );
+        let _ = std::fs::remove_dir_all(&d.config_dir);
     }
 }

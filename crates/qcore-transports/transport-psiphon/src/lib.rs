@@ -60,6 +60,17 @@ impl qcore_transport_api::HopFactory for PsiphonFactory {
             )
         })?;
         let mut scfg = supervisor::SidecarConfig::new(PathBuf::from(exe));
+        if let Some(args) = cfg.get("sidecar_args") {
+            // Comma-separated passthrough (test doubles take flags like
+            // `--die-after-ms=100`; production sidecars take their ports and
+            // options here). Secrets never ride args (stdin only, FR-001b).
+            scfg.args = args
+                .split(',')
+                .map(str::trim)
+                .filter(|a| !a.is_empty())
+                .map(str::to_string)
+                .collect();
+        }
         if let Some(secs) = cfg.get("ready_timeout_secs") {
             scfg.ready_timeout = Duration::from_secs(secs.parse().map_err(|_| {
                 HopError::new(
@@ -85,41 +96,78 @@ impl qcore_transport_api::HopFactory for PsiphonFactory {
             hop_id: hop_id.clone(),
         });
         Ok(Arc::new(PsiphonHop {
-            hop_id,
-            running: tokio::sync::Mutex::new(running),
-            // Fixed at readiness. A restarted sidecar rebinds only if it
-            // binds :0 per process (test doubles do); production sidecars
-            // take a stable port from config, preserving this address.
-            socks: std::sync::RwLock::new(socks),
-            events,
-            alive: std::sync::atomic::AtomicBool::new(true),
+            shared: Arc::new(PsiphonShared {
+                hop_id,
+                supervisor,
+                running: tokio::sync::Mutex::new(running),
+                // Revived sidecars rebind: test doubles bind :0 per process
+                // (new address each revival, propagated on every dial);
+                // production sidecars take a stable port from config.
+                socks: std::sync::RwLock::new(socks),
+                events,
+                alive: std::sync::atomic::AtomicBool::new(true),
+            }),
         }))
     }
 }
 
-pub struct PsiphonHop {
+/// Shared hop state: the dialer holds it too, so every dial revives an
+/// exited sidecar within the restart budget and observes the fresh SOCKS
+/// address (previously `ensure_running` was only called in tests: the
+/// production path served a frozen address with a stale `Healthy`).
+struct PsiphonShared {
     hop_id: String,
+    supervisor: supervisor::SidecarSupervisor,
     running: tokio::sync::Mutex<supervisor::RunningSidecar>,
     socks: std::sync::RwLock<SocketAddr>,
     events: tokio::sync::broadcast::Sender<HopEvent>,
-    /// Last-known liveness: true from readiness until stop()/teardown.
-    /// Process exits between calls surface via events + fail-closed dial
-    /// errors, never a false green here beyond this flag's meaning.
     alive: std::sync::atomic::AtomicBool,
 }
 
+impl PsiphonShared {
+    /// Revive-if-needed within budget, returning the live SOCKS address.
+    /// Exhaustion fails closed (marks not-alive, emits `Failed`, names the
+    /// bound) instead of dialing a dead listener.
+    async fn ensure_live(&self) -> Result<SocketAddr, HopError> {
+        // A stopped hop stays stopped: dial-after-stop must fail, never
+        // silently resurrect a torn-down sidecar.
+        if !self.alive.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(HopError::transport(
+                self.hop_id.clone(),
+                "psiphon hop is stopped",
+            ));
+        }
+        let mut running = self.running.lock().await;
+        if let Err(e) = self.supervisor.ensure_running(&mut running).await {
+            self.alive.store(false, std::sync::atomic::Ordering::SeqCst);
+            let _ = self.events.send(HopEvent::Failed {
+                hop_id: self.hop_id.clone(),
+                cause: e.clone(),
+            });
+            return Err(HopError::transport(self.hop_id.clone(), e));
+        }
+        let addr = running.socks_addr();
+        *self.socks.write().unwrap() = addr;
+        Ok(addr)
+    }
+}
+
+pub struct PsiphonHop {
+    shared: Arc<PsiphonShared>,
+}
+
 struct PsiphonDialer {
-    hop_id: String,
-    socks: SocketAddr,
+    shared: Arc<PsiphonShared>,
 }
 
 #[async_trait::async_trait]
 impl Dialer for PsiphonDialer {
     async fn dial_tcp(&self, dst: SocketAddr) -> Result<Box<dyn ByteStream>, HopError> {
-        let stream = socks::socks_connect(self.socks, dst).await.map_err(|e| {
+        let socks = self.shared.ensure_live().await?;
+        let stream = socks::socks_connect(socks, dst).await.map_err(|e| {
             HopError::new(
                 HopErrorKind::Transport,
-                Some(self.hop_id.clone()),
+                Some(self.shared.hop_id.clone()),
                 format!("psiphon socks connect to {dst}: {e}"),
             )
         })?;
@@ -127,10 +175,11 @@ impl Dialer for PsiphonDialer {
     }
 
     async fn dial_udp(&self, dst: SocketAddr) -> Result<Box<dyn UdpFlow>, HopError> {
-        let (_control, relay) = socks::socks_udp_associate(self.socks).await.map_err(|e| {
+        let socks = self.shared.ensure_live().await?;
+        let (_control, relay) = socks::socks_udp_associate(socks).await.map_err(|e| {
             HopError::new(
                 HopErrorKind::Transport,
-                Some(self.hop_id.clone()),
+                Some(self.shared.hop_id.clone()),
                 format!("psiphon socks associate: {e}"),
             )
         })?;
@@ -139,7 +188,7 @@ impl Dialer for PsiphonDialer {
             .await
             .map_err(HopError::from)?;
         Ok(Box::new(PsiphonUdpFlow {
-            hop_id: self.hop_id.clone(),
+            hop_id: self.shared.hop_id.clone(),
             _control,
             socket,
             relay,
@@ -254,30 +303,45 @@ impl RunningHop for PsiphonHop {
     }
 
     fn dialer(&self) -> Arc<dyn Dialer> {
-        let socks = *self.socks.read().unwrap();
         Arc::new(PsiphonDialer {
-            hop_id: self.hop_id.clone(),
-            socks,
+            shared: self.shared.clone(),
         })
     }
 
     fn health(&self) -> HopHealth {
-        if self.alive.load(std::sync::atomic::Ordering::SeqCst) {
-            HopHealth::Healthy
-        } else {
-            HopHealth::Stopped
+        // Live check when uncontended; last-known flag while a dial holds
+        // the lock (a dial in flight implies recent liveness anyway). Never
+        // a stale-forever green: the flag clears on stop and on exhausted
+        // revival, and any live check observes the real child.
+        match self.shared.running.try_lock() {
+            Ok(mut r) => {
+                if r.is_running() {
+                    HopHealth::Healthy
+                } else {
+                    HopHealth::Stopped
+                }
+            }
+            Err(_) => {
+                if self.shared.alive.load(std::sync::atomic::Ordering::SeqCst) {
+                    HopHealth::Healthy
+                } else {
+                    HopHealth::Stopped
+                }
+            }
         }
     }
 
     fn events(&self) -> tokio::sync::broadcast::Receiver<HopEvent> {
-        self.events.subscribe()
+        self.shared.events.subscribe()
     }
 
     async fn stop(&self) -> Result<(), HopError> {
-        self.alive.store(false, std::sync::atomic::Ordering::SeqCst);
-        self.running.lock().await.shutdown().await;
-        let _ = self.events.send(HopEvent::Stopped {
-            hop_id: self.hop_id.clone(),
+        self.shared
+            .alive
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        self.shared.running.lock().await.shutdown().await;
+        let _ = self.shared.events.send(HopEvent::Stopped {
+            hop_id: self.shared.hop_id.clone(),
         });
         Ok(())
     }
@@ -286,6 +350,6 @@ impl RunningHop for PsiphonHop {
 impl PsiphonHop {
     /// Live SOCKS address for tests and diagnostics.
     pub async fn socks_addr(&self) -> SocketAddr {
-        *self.socks.read().unwrap()
+        *self.shared.socks.read().unwrap()
     }
 }

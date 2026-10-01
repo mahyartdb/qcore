@@ -25,15 +25,20 @@ async fn main() {
         .expect("bind");
     let addr: SocketAddr = server.local_addr().expect("addr");
     println!("QCORE_SIDECAR_READY socks5={addr}");
-    for arg in &args {
-        if let Some(ms) = arg.strip_prefix("--die-after-ms=") {
-            if let Ok(ms) = ms.parse::<u64>() {
-                // Become ready, then die: exercises supervisor restarts.
-                let _ = addr;
-                tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
-                std::process::exit(0);
-            }
-        }
+    // Die-after mode must serve until death (not sleep-then-exit without
+    // serving): restart tests dial the revived sidecar, which is only
+    // meaningful if the dying generation served traffic while alive.
+    let die_ms: Option<u64> = args
+        .iter()
+        .filter_map(|a| a.strip_prefix("--die-after-ms="))
+        .filter_map(|ms| ms.parse().ok())
+        .next();
+    if let Some(ms) = die_ms {
+        tokio::spawn(async move {
+            server.serve().await.ok();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+        std::process::exit(0);
     }
     // Read one secret line on stdin (never argv) concurrently with serving:
     // blocking serve on stdin would deadlock supervisor spawns that send no

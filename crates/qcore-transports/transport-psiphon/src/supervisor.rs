@@ -73,7 +73,8 @@ pub struct RunningSidecar {
     _stdin: Option<tokio::process::ChildStdin>,
 }
 
-/// Bounded supervisor.
+/// Bounded supervisor (cloneable so a running hop can retain it for revival).
+#[derive(Debug, Clone)]
 pub struct SidecarSupervisor {
     config: SidecarConfig,
 }
@@ -121,10 +122,12 @@ impl SidecarSupervisor {
             if let Some(mut stdin) = child.stdin.take() {
                 if let Err(e) = stdin.write_all(&secret.payload).await {
                     let _ = child.kill().await;
+                    let _ = child.wait().await;
                     return Err(format!("sidecar `{label}`: stdin secret delivery: {e}"));
                 }
                 if let Err(e) = stdin.write_all(b"\n").await {
                     let _ = child.kill().await;
+                    let _ = child.wait().await;
                     return Err(format!("sidecar `{label}`: stdin secret delivery: {e}"));
                 }
                 Some(stdin)
@@ -149,6 +152,7 @@ impl SidecarSupervisor {
             tokio::select! {
                 _ = &mut deadline => {
                     let _ = child.kill().await;
+                    let _ = child.wait().await;
                     return Err(format!(
                         "sidecar `{label}`: readiness handshake timed out after {:?}",
                         self.config.ready_timeout
@@ -158,6 +162,7 @@ impl SidecarSupervisor {
                     match line {
                         Err(e) => {
                             let _ = child.kill().await;
+                            let _ = child.wait().await;
                             return Err(format!("sidecar `{label}`: stdout: {e}"));
                         }
                         Ok(None) => {

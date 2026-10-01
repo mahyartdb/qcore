@@ -122,6 +122,43 @@ async fn revive_within_budget_gets_new_ready_sidecar() {
 }
 
 #[tokio::test]
+async fn revived_sidecar_serves_traffic() {
+    // The old revive test only checked `is_running`: a revived sidecar must
+    // actually serve (this caught a dead revival path). Generous death timer
+    // (5 s) with death awaited (not slept) so the post-revive dial always
+    // lands inside a fresh window, even with slow spawns under load.
+    let stub = StubPeer::bind("dual").await.unwrap();
+    let tcp_dst = stub.tcp_addr(false).unwrap();
+    let mut cfg = base_config();
+    cfg.args = vec!["--die-after-ms=5000".into()];
+    cfg.max_restarts = 2;
+    let sup = SidecarSupervisor::new(cfg);
+    let mut running = sup.spawn().await.expect("initial ready");
+    let t0 = std::time::Instant::now();
+    while running.is_running() {
+        if t0.elapsed() > Duration::from_secs(15) {
+            panic!("sidecar never died");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    sup.ensure_running(&mut running)
+        .await
+        .expect("revive within budget");
+    let addr = running.socks_addr();
+    let mut stream = qcore_transport_psiphon::socks::socks_connect(addr, tcp_dst)
+        .await
+        .expect("revived sidecar serves");
+    stream.write_all(b"ping-rev").await.expect("write");
+    let mut back = [0u8; 8];
+    tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut back))
+        .await
+        .expect("echo arrives")
+        .expect("read");
+    assert_eq!(&back, b"ping-rev");
+    running.teardown().await;
+}
+
+#[tokio::test]
 async fn psiphon_hop_dials_through_sidecar() {
     let _ = qcore_transports::linked_kinds();
     let stub = StubPeer::bind("dual").await.unwrap();
@@ -166,6 +203,100 @@ async fn psiphon_hop_dials_through_sidecar() {
     hop.stop().await.expect("clean stop");
     // Teardown killed the sidecar: dialing now fails (connection refused).
     assert!(hop.dialer().dial_tcp(tcp_dst).await.is_err());
+}
+
+/// Poll health until the sidecar reads Stopped (death observed) or the
+/// timeout elapses. Death timers run from process start, so fixed sleeps
+/// race slow spawns under load; polling dials within milliseconds of death
+/// and leaves the full fresh window for the revived sidecar.
+async fn wait_until_stopped(hop: &std::sync::Arc<dyn qcore_transport_api::RunningHop>) {
+    let t0 = std::time::Instant::now();
+    while t0.elapsed() < Duration::from_secs(15) {
+        if hop.health() == qcore_transport_api::HopHealth::Stopped {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("sidecar never read Stopped");
+}
+
+#[tokio::test]
+async fn hop_revives_dying_sidecar_within_budget() {
+    let _ = qcore_transports::linked_kinds();
+    let stub = StubPeer::bind("dual").await.unwrap();
+    let tcp_dst = stub.tcp_addr(false).unwrap();
+
+    let mut cfg = HopConfig::new("psiphon");
+    cfg.fields
+        .insert("hop_id".into(), "psiphon-revive-0".into());
+    cfg.fields
+        .insert("sidecar_path".into(), fake_bin().display().to_string());
+    cfg.fields
+        .insert("sidecar_args".into(), "--die-after-ms=3000".into());
+    let carrier = qcore_core::session::net::root_dialer(
+        qcore_core::session::net::FamilyPolicy::default(),
+        Duration::from_secs(5),
+    );
+    let hop = qcore_transport_psiphon::PsiphonFactory
+        .build(cfg, carrier)
+        .await
+        .expect("sidecar hop builds");
+    // Death observed via health (not stale Healthy), polled so the dial
+    // lands within milliseconds of death: death timers run from process
+    // start, and fixed sleeps race slow spawns under load.
+    wait_until_stopped(&hop).await;
+    // The next dial revives transparently within the restart budget.
+    let mut stream = hop.dialer().dial_tcp(tcp_dst).await.expect("revived dial");
+    stream.write_all(b"ping-revive").await.expect("write");
+    let mut back = [0u8; 11];
+    tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut back))
+        .await
+        .expect("echo arrives")
+        .expect("read");
+    assert_eq!(&back, b"ping-revive");
+    assert_eq!(hop.health(), qcore_transport_api::HopHealth::Healthy);
+    hop.stop().await.expect("clean stop");
+}
+
+#[tokio::test]
+async fn hop_fails_closed_after_restart_cap() {
+    let _ = qcore_transports::linked_kinds();
+    let stub = StubPeer::bind("dual").await.unwrap();
+    let tcp_dst = stub.tcp_addr(false).unwrap();
+
+    let mut cfg = HopConfig::new("psiphon");
+    cfg.fields.insert("hop_id".into(), "psiphon-cap-0".into());
+    cfg.fields
+        .insert("sidecar_path".into(), fake_bin().display().to_string());
+    cfg.fields
+        .insert("sidecar_args".into(), "--die-after-ms=100".into());
+    let carrier = qcore_core::session::net::root_dialer(
+        qcore_core::session::net::FamilyPolicy::default(),
+        Duration::from_secs(5),
+    );
+    let hop = qcore_transport_psiphon::PsiphonFactory
+        .build(cfg, carrier)
+        .await
+        .expect("sidecar hop builds");
+    // Each dial finds a fresh corpse and burns one restart (budget 3):
+    // the 4th dial must fail naming the cap, and health stays Stopped.
+    // Deaths are awaited (not fixed-slept) so slow spawns cannot eat the
+    // post-revive window and flake the dials.
+    let mut saw_cap = false;
+    for _ in 0..5 {
+        wait_until_stopped(&hop).await;
+        match hop.dialer().dial_tcp(tcp_dst).await {
+            Ok(_) => {}
+            Err(e) if e.message.contains("restart cap") => {
+                saw_cap = true;
+                break;
+            }
+            Err(e) => panic!("unexpected dial failure: {e:?}"),
+        }
+    }
+    assert!(saw_cap, "exhaustion names the restart cap");
+    assert_eq!(hop.health(), qcore_transport_api::HopHealth::Stopped);
+    hop.stop().await.expect("idempotent stop");
 }
 
 #[test]

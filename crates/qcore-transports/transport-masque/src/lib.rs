@@ -758,39 +758,28 @@ impl tokio::io::AsyncRead for H2Stream {
 impl tokio::io::AsyncWrite for H2Stream {
     fn poll_write(
         mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
+        _cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
-        use std::task::Poll;
-        // Honor H2 flow-control windows: park on `Pending`/zero capacity so
-        // a stalled peer applies backpressure instead of unbounded buffering
-        // (or a misreported `BrokenPipe` that tears down a healthy stream).
-        // Closed/reset streams still fail fast below.
-        match self.send.poll_capacity(cx) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(None) => Poll::Ready(Err(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "h2 stream closed",
-            ))),
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Err(std::io::Error::new(
+        // Direct `send_data` (no `reserve_capacity` prelude): h2 documents
+        // this as valid — data is buffered and flushed as window opens, and
+        // errors mean closed/reset streams, NOT window exhaustion. Gating on
+        // `poll_capacity` here would hang forever: capacity is only assigned
+        // in response to `reserve_capacity`, which we never call (a prior
+        // revision did exactly this and deadlocked the H2 conformance
+        // suite). Chunks stay ≤16384 so no single write can balloon the
+        // documented-unbounded internal buffer.
+        // Noize fragmentation (US5 T070): chunk writes at the profile size.
+        let n = obfuscate::chunk_for_send(buf.len().min(16384), self.fragment);
+        match self
+            .send
+            .send_data(Bytes::copy_from_slice(&buf[..n]), false)
+        {
+            Ok(()) => std::task::Poll::Ready(Ok(n)),
+            Err(e) => std::task::Poll::Ready(Err(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
                 e.to_string(),
             ))),
-            Poll::Ready(Some(Ok(0))) => Poll::Pending,
-            Poll::Ready(Some(Ok(_))) => {
-                // Noize fragmentation (US5 T070): chunk writes at the profile size.
-                let n = obfuscate::chunk_for_send(buf.len().min(16384), self.fragment);
-                match self
-                    .send
-                    .send_data(Bytes::copy_from_slice(&buf[..n]), false)
-                {
-                    Ok(()) => Poll::Ready(Ok(n)),
-                    Err(e) => Poll::Ready(Err(std::io::Error::new(
-                        std::io::ErrorKind::BrokenPipe,
-                        e.to_string(),
-                    ))),
-                }
-            }
         }
     }
 

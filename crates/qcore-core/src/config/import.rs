@@ -347,6 +347,13 @@ impl ConfigImport {
                 }
             }
         }
+        // Any AWG key flips the format; ABSENT numerics read as 0/disabled
+        // (deliberately lenient, unlike stored records which are strict —
+        // see below). Generator-written configs are routinely partial, and
+        // every consumer treats 0 as absent, so completeness here would be
+        // interop friction, not safety. Stored records are machine-written
+        // complete, so a truncated `[awg]` table there IS corruption
+        // (`truncated_awg_record_fails_closed` pins that side).
         if !raw_awg.is_empty() {
             imp.source_format = SourceFormat::Amneziawg;
             match parse_awg(&raw_awg, &imp.interface) {
@@ -421,23 +428,10 @@ fn check_endpoint(ep: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// AWG numeric keys that must ALL be present when any AWG key is: a lone
-/// `Jc = 6` previously flipped to Amneziawg with every other param
-/// zero-filled (while a hand-truncated stored record fails closed), so live
-/// imports and stored records disagreed. `I1..I5` stay optional free-form.
-const REQUIRED_AWG_NUMERICS: &[&str] = &[
-    "jc", "jmin", "jmax", "s1", "s2", "s3", "s4", "h1", "h2", "h3", "h4",
-];
-
 fn parse_awg(
     raw: &BTreeMap<String, String>,
     iface: &BTreeMap<String, String>,
 ) -> Result<AwgParams, String> {
-    for k in REQUIRED_AWG_NUMERICS {
-        if !raw.contains_key(*k) {
-            return Err(format!("awg `{k}` missing"));
-        }
-    }
     let num = |k: &str| -> Result<u32, String> {
         raw.get(k)
             .map(|v| {
@@ -1405,17 +1399,19 @@ mod tests {
     }
 
     #[test]
-    fn partial_awg_keys_rejected_like_stored() {
+    fn partial_awg_keys_accepted_with_zeros() {
+        // Live imports are lenient by design (generator-written partial
+        // configs interop): absent numerics read as 0/disabled. Stored
+        // records stay strict (machine-written complete); see
+        // `truncated_awg_record_fails_closed` for that side.
         let (priv_b64, pub_b64) = keys();
         let text = format!("[Interface]\nPrivateKey = {priv_b64}\nAddress = 10.0.0.2/32\nJc = 6\n[Peer]\nPublicKey = {pub_b64}\nAllowedIPs = 0.0.0.0/0\nEndpoint = 203.0.113.20:51820\n");
         let imp = ConfigImport::parse_str(&text, std::path::Path::new("partial-awg.conf"))
             .expect("verdict");
-        assert_eq!(imp.verdict, ImportVerdict::Rejected);
-        assert!(
-            imp.reasons.join(" ").contains("awg `"),
-            "names missing key: {:?}",
-            imp.reasons
-        );
+        assert_eq!(imp.verdict, ImportVerdict::Accepted, "{:?}", imp.reasons);
+        assert_eq!(imp.source_format, SourceFormat::Amneziawg);
+        let awg = imp.awg.expect("awg detected");
+        assert_eq!((awg.jc, awg.jmin, awg.jmax), (6, 0, 0));
     }
 
     #[test]

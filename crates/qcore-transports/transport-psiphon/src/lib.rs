@@ -113,8 +113,8 @@ impl qcore_transport_api::HopFactory for PsiphonFactory {
 
 /// Shared hop state: the dialer holds it too, so every dial revives an
 /// exited sidecar within the restart budget and observes the fresh SOCKS
-/// address (previously `ensure_running` was only called in tests: the
-/// production path served a frozen address with a stale `Healthy`).
+/// address. Revival must live on the dial path: a frozen address with a
+/// stale `Healthy` would serve dead listeners.
 struct PsiphonShared {
     hop_id: String,
     supervisor: supervisor::SidecarSupervisor,

@@ -227,10 +227,10 @@ mod tests {
     }
 
     /// Failing-first (#15): concurrent same-process writers for different
-    /// transports must not lose updates. Pre-fix this failed: read-modify-
-    /// write without serialization meant the last writer clobbered the first
-    /// (lost winners). Rounds raise the race window; the lock makes every
-    /// round pass deterministically.
+    /// transports must not lose updates. Read-modify-write without
+    /// serialization lets the last writer clobber the first (lost winners);
+    /// rounds raise the race window, and the lock makes every round pass
+    /// deterministically.
     #[test]
     fn concurrent_writers_keep_all_transports() {
         let d = dirs("conc");

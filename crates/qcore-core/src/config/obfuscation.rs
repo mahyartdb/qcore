@@ -168,9 +168,9 @@ fn parse_profiles_toml(text: &str) -> Result<BTreeMap<String, ObfuscationProfile
         let pt = prof
             .as_table()
             .ok_or_else(|| format!("profile `{name}` must be a table"))?;
-        // Profile-level typos (`familiy = …`) previously loaded silently
-        // while the operator believed tuning applied (params ride opaquely
-        // to factories, so a typo becomes a no-op field). Fail closed naming
+        // Profile-level typos (`familiy = …`) load silently while the
+        // operator believes tuning applies (params ride opaquely to
+        // factories, so a typo becomes a no-op field). Fail closed naming
         // the key, same standard as mode keys below. `params` contents stay
         // opaque by design (plugin extensibility lives there).
         for k in pt.keys() {

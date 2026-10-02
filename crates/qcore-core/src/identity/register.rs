@@ -285,8 +285,8 @@ fn parse_registration(body: &str) -> Result<ParsedRegistration, RegisterError> {
         "config.interface.addresses.v6",
     )?);
     // Interface addresses are injected verbatim into tunnel configs: they
-    // must be IP literals, not provider typos (`999.999.999.999` previously
-    // stored and injected as-is).
+    // must be IP literals, since anything else (e.g. `999.999.999.999`)
+    // would store and inject as-is.
     for (name, addr) in [("v4", &interface_v4), ("v6", &interface_v6)] {
         if addr.parse::<std::net::IpAddr>().is_err() {
             return Err(RegisterError::Protocol(format!(

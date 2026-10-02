@@ -593,7 +593,7 @@ mod tests {
     }
 
     /// F1: an empty warp scan evicts only warp — masque survives with a live
-    /// legacy LKG. Pre-fix this wiped the whole `endpoints.json`.
+    /// legacy LKG, and the file is deleted only when fully empty.
     #[test]
     fn evict_stale_lkg_is_per_transport() {
         let d = evict_dirs("per-transport");

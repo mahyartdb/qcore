@@ -24,9 +24,10 @@ pub fn generate_credential() -> Result<(String, SecretString), String> {
 
 /// Enroll (or rotate) the credential: PATCH the current certificate under
 /// the identity. Any 2xx accepts only when the provider does not report an
-/// enrollment error in the body (a bare 2xx with `{"error": ...}` previously
-/// counted rotation as done while the tunnel later failed with an
-/// un-enrolled cert). Returns the exchange family (FR-013).
+/// enrollment error in the body (a bare 2xx carrying `{"error": ...}` is
+/// still a failed enrollment: rotation must not count as done while the
+/// tunnel would fail with an un-enrolled cert). Returns the exchange
+/// family (FR-013).
 pub async fn enroll_credential(
     opts: &ProviderOptions,
     identity: &ProviderIdentity,

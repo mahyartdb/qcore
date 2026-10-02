@@ -13,9 +13,9 @@ pub struct TransportRegistry {
     kinds: BTreeMap<&'static str, &'static TransportDescriptor>,
     factories: BTreeMap<&'static str, &'static dyn qcore_transport_api::HopFactory>,
     /// Kinds submitted more than once (copy-paste `register_plugin!`): kept
-    /// visible instead of silently diverging (the old code last-won in
-    /// `get` but first-matched in `factory`, so validation and build could
-    /// disagree on the same kind).
+    /// visible instead of silently diverging. `get` and `factory` must agree:
+    /// last-wins in one but first-match in the other would let validation
+    /// and build disagree on the same kind.
     duplicates: Vec<&'static str>,
 }
 

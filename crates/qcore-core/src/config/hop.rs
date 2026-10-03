@@ -364,9 +364,6 @@ impl<'de> Deserialize<'de> for HopConfig {
                         )));
                     }
                     let s = scalar_string(&v);
-                    if k == "family" {
-                        continue;
-                    }
                     fields.insert(k, s);
                 }
                 let family = fields
@@ -437,6 +434,22 @@ bogus_key = "nope"
 "#;
         let err = super::parse_toml_strict(toml).unwrap_err();
         assert!(err.contains("bogus_key"), "got: {err}");
+    }
+
+    #[test]
+    fn plugin_family_survives_json_round_trip() {
+        let spec = HopSpec {
+            id: "p-0".into(),
+            config: HopConfig::Plugin(PluginHopConfig {
+                kind: "my-kind".into(),
+                family: "v4".into(),
+                fields: BTreeMap::from([("count".to_string(), "123".to_string())]),
+            }),
+        };
+        let json = serde_json::to_string(&spec).expect("serializes");
+        let back: HopSpec = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(spec, back);
+        assert_eq!(back.config.family(), "v4");
     }
 
     #[test]

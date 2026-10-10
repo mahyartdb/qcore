@@ -146,4 +146,4 @@ jobs:
       - name: run Go C-ABI consumer (mock transport, offline)
         run: |
           cd examples/c-abi-consumer
-          CGO_CFLAGS=-I../../crates/qcore-ffi CGO_LDFLAGS="-L../../target/release -lqcore_ffi -ldl -lm -lpthread" go run .
+          LD_LIBRARY_PATH=../../target/release CGO_CFLAGS=-I../../crates/qcore-ffi CGO_LDFLAGS="-L../../target/release -lqcore_ffi -ldl -lm -lpthread" go run .

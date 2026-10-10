@@ -217,7 +217,7 @@ impl SecretStore {
         let _ =
             std::fs::set_permissions(&self.fallback_dir, std::fs::Permissions::from_mode(0o700));
         let path = self.account_path(account);
-        let file = std::fs::OpenOptions::new()
+        std::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
@@ -232,7 +232,6 @@ impl SecretStore {
                 f.write_all(value.as_bytes())
             })
             .map_err(|e| e.to_string())?;
-        drop(file);
         Ok(())
     }
 

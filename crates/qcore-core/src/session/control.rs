@@ -35,12 +35,60 @@ pub fn control_file(dirs: &ProfileDirs) -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from("control.json"))
 }
 
+/// Atomically persist the rendezvous file: serialize first, write a
+/// uniquely-named temp file in the same directory, harden its permissions,
+/// then rename over `control.json` so readers never see a half-written
+/// document.
+///
+/// On Unix the temp file is chmodded to `0600` (owner-only) before the
+/// rename; the renamed file keeps those permissions. On Windows there is no
+/// POSIX mode bit: hardening is best-effort (the file inherits the parent
+/// directory ACL, which remains the secrecy boundary, same as
+/// `identity.toml`). Rust's std has no stable API for setting Windows file
+/// ACLs owner-only, so no `cfg(windows)` permission call is attempted.
 pub fn write_control_file(dirs: &ProfileDirs, info: &ControlInfo) -> std::io::Result<()> {
     dirs.ensure_dirs()?;
-    std::fs::write(
-        control_file(dirs),
-        serde_json::to_string(info).expect("ControlInfo is a plain serializable struct"),
-    )
+    let dest = control_file(dirs);
+    let raw = serde_json::to_string(info).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("control info not serializable: {e}"),
+        )
+    })?;
+    let tmp = temp_sibling(&dest);
+    let write_res = (|| {
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp)?;
+            f.write_all(raw.as_bytes())?;
+            f.flush()?;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        }
+        std::fs::rename(&tmp, &dest)?;
+        Ok::<(), std::io::Error>(())
+    })();
+    if write_res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    write_res
+}
+
+/// Unique temp sibling for atomic rename: same directory (same filesystem),
+/// never a fixed name (parallel writers/tests must not collide).
+fn temp_sibling(dest: &std::path::Path) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(1);
+    let n = TMP_SEQ.fetch_add(1, Ordering::SeqCst);
+    let mut name = dest.as_os_str().to_owned();
+    name.push(format!(".tmp.{}-{n}", std::process::id()));
+    std::path::PathBuf::from(name)
 }
 
 pub fn read_control_file(dirs: &ProfileDirs) -> Option<ControlInfo> {
@@ -52,30 +100,22 @@ pub fn remove_control_file(dirs: &ProfileDirs) {
     let _ = std::fs::remove_file(control_file(dirs));
 }
 
-/// Bearer token: 128 bits from OS-seeded `RandomState` keys plus process id,
-/// nanos, and a counter, hex-encoded. The file's directory permissions are
-/// the primary secrecy boundary; the token must still not be enumerable by
-/// a loopback peer (the old pid+nanos+counter shape differed only in the
-/// low counter nibble within one nanosecond).
+/// Bearer token: 128 bits from the OS RNG, lowercase hex-encoded (32
+/// chars, same length as before). The file's directory permissions are the
+/// primary secrecy boundary; the token must still not be enumerable by a
+/// loopback peer. OS randomness fails closed (`expect` with reason) rather
+/// than falling back to pid/time/counter material, which a loopback peer
+/// could enumerate.
 pub fn new_token() -> String {
-    use std::collections::hash_map::RandomState;
-    use std::hash::{BuildHasher, Hasher};
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(1);
-    let n = NEXT.fetch_add(1, Ordering::SeqCst);
-    let ns = std::time::SystemTime::now()
-        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let pid = std::process::id();
-    let mut h1 = RandomState::new().build_hasher();
-    h1.write_u32(pid);
-    h1.write_u128(ns);
-    h1.write_u64(n);
-    let mut h2 = RandomState::new().build_hasher();
-    h2.write_u64(n.wrapping_mul(0x9E3779B97F4A7C15));
-    h2.write_u128(ns ^ ((pid as u128) << 64));
-    format!("{:016x}{:016x}", h1.finish(), h2.finish())
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).expect("OS randomness for control token");
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(32);
+    for b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
 }
 
 /// Serve the control channel until a valid STOP arrives. STATUS replies with
@@ -216,5 +256,110 @@ pub fn send_stop(addr: std::net::SocketAddr, token: &str) -> std::io::Result<()>
             std::io::ErrorKind::PermissionDenied,
             line.trim().to_string(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn is_hex32(s: &str) -> bool {
+        s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit())
+    }
+
+    #[test]
+    fn tokens_are_128bit_hex_and_unique_over_large_sample() {
+        // Tight loop: same pid, likely same-nanosecond clock. The old
+        // pid+nanos+counter shape differed only in counter bits here; OS
+        // randomness must still yield all-unique tokens.
+        let n = 1024;
+        let mut seen = std::collections::HashSet::with_capacity(n);
+        for _ in 0..n {
+            let t = new_token();
+            assert!(is_hex32(&t), "token must be 32 lowercase hex chars");
+            assert_eq!(t, t.to_ascii_lowercase(), "token hex must be lowercase");
+            assert!(seen.insert(t), "duplicate token in {n} samples");
+        }
+    }
+
+    #[test]
+    fn control_file_round_trips_and_leaves_no_temp() {
+        let root = std::env::temp_dir().join(format!(
+            "qcore-ctl-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let dirs = ProfileDirs {
+            config_dir: root.join("config"),
+            profile_dir: root.join("profiles"),
+        };
+        let info = ControlInfo {
+            port: 12731,
+            token: new_token(),
+            pid: std::process::id(),
+        };
+        write_control_file(&dirs, &info).expect("write control file");
+        let back = read_control_file(&dirs).expect("control file reads back");
+        assert_eq!(back.port, info.port);
+        assert_eq!(back.pid, info.pid);
+        assert!(tokens_equal(&back.token, &info.token));
+        // Atomicity residue: no temp siblings left behind.
+        let parent = control_file(&dirs)
+            .parent()
+            .expect("control file has a parent")
+            .to_path_buf();
+        let mut leftover = Vec::new();
+        for entry in std::fs::read_dir(&parent).expect("list control dir") {
+            let entry = entry.expect("dir entry");
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with("control.json.tmp.") {
+                leftover.push(name);
+            }
+        }
+        assert!(leftover.is_empty(), "temp residue: {leftover:?}");
+        // Overwrite path renames cleanly too.
+        let info2 = ControlInfo {
+            port: 12732,
+            token: new_token(),
+            pid: std::process::id(),
+        };
+        write_control_file(&dirs, &info2).expect("rewrite control file");
+        let back2 = read_control_file(&dirs).expect("rewritten file reads back");
+        assert_eq!(back2.port, 12732);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_file_is_owner_only_on_unix() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = std::env::temp_dir().join(format!(
+            "qcore-ctl-perm-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let dirs = ProfileDirs {
+            config_dir: root.join("config"),
+            profile_dir: root.join("profiles"),
+        };
+        let info = ControlInfo {
+            port: 12733,
+            token: new_token(),
+            pid: std::process::id(),
+        };
+        write_control_file(&dirs, &info).expect("write control file");
+        let mode = std::fs::metadata(control_file(&dirs))
+            .expect("stat control file")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "control.json must be owner-only");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

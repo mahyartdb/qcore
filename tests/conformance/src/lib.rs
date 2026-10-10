@@ -2,3 +2,4 @@
 
 pub mod fixture;
 pub mod matrix;
+pub mod testutil;

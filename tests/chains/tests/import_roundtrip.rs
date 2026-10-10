@@ -12,7 +12,11 @@ fn fixture(name: &str) -> PathBuf {
 }
 
 fn write_temp(name: &str, body: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("qcore-import-test-{}", std::process::id()));
+    // Unique per call: parallel tests share one process id, so a pid-only
+    // dir collides across threads of the same nextest binary (T7 story 22).
+    static CTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = CTR.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("qcore-import-test-{}-{n}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(name);
     std::fs::write(&path, body).unwrap();
@@ -156,6 +160,94 @@ fn overlapping_h_headers_rejected() {
     assert!(
         imp.reasons.join(" ").contains("H1"),
         "names field: {:?}",
+        imp.reasons
+    );
+}
+
+// --- T7 story 21: expanded import corpus -----------------------------------
+// Multi-peer, IPv6-only, CRLF/BOM/empty, and a second unknown-field variant
+// pin import strictness file-for-file over tests/fixtures.
+
+#[test]
+fn multi_peer_sections_rejected_naming_count() {
+    let imp = ConfigImport::parse(&fixture("multi-peer.conf")).expect("parses to a verdict");
+    assert_eq!(imp.verdict, ImportVerdict::Rejected);
+    assert!(
+        imp.reasons.join(" ").contains("multiple [Peer]"),
+        "names count rule: {:?}",
+        imp.reasons
+    );
+}
+
+#[test]
+fn ipv6_only_imports_with_bracketed_endpoint() {
+    let imp = ConfigImport::parse(&fixture("ipv6-only.conf")).expect("parses");
+    assert_eq!(imp.verdict, ImportVerdict::Accepted, "{:?}", imp.reasons);
+    assert_eq!(imp.source_format, SourceFormat::Wireguard);
+    assert_eq!(
+        imp.interface.get("address").map(String::as_str),
+        Some("fd00::2/128")
+    );
+    assert_eq!(imp.peers.len(), 1);
+    assert_eq!(
+        imp.peers[0].get("endpoint").map(String::as_str),
+        Some("[2001:db8::1]:51820")
+    );
+    assert_eq!(
+        imp.peers[0].get("allowed_ips").map(String::as_str),
+        Some("::/0")
+    );
+}
+
+#[test]
+fn crlf_line_endings_import_cleanly() {
+    let imp = ConfigImport::parse(&fixture("crlf.conf")).expect("parses");
+    assert_eq!(imp.verdict, ImportVerdict::Accepted, "{:?}", imp.reasons);
+    assert_eq!(imp.peers.len(), 1);
+    assert_eq!(
+        imp.peers[0].get("endpoint").map(String::as_str),
+        Some("203.0.113.10:51820")
+    );
+}
+
+#[test]
+fn bom_prefix_is_rejected_fail_closed() {
+    // Strictness pin: a leading U+FEFF is not stripped, so the section
+    // header never matches and the file rejects (no silent half-parse).
+    let imp = ConfigImport::parse(&fixture("bom.conf")).expect("parses to a verdict");
+    assert_eq!(imp.verdict, ImportVerdict::Rejected);
+    assert!(
+        imp.reasons.join(" ").contains("[Interface]"),
+        "names section: {:?}",
+        imp.reasons
+    );
+}
+
+#[test]
+fn empty_file_rejected_naming_section() {
+    let imp = ConfigImport::parse(&fixture("empty.conf")).expect("parses to a verdict");
+    assert_eq!(imp.verdict, ImportVerdict::Rejected);
+    assert!(
+        imp.reasons.join(" ").contains("[Interface]"),
+        "names section: {:?}",
+        imp.reasons
+    );
+}
+
+#[test]
+fn peer_unknown_field_rejected_by_name() {
+    // Second bad-field variant: bogus.conf covers [Interface]; this pins
+    // the [Peer] side naming the field too.
+    let imp = ConfigImport::parse(&fixture("bogus-peer.conf")).expect("parses to a verdict");
+    assert_eq!(imp.verdict, ImportVerdict::Rejected);
+    assert!(
+        imp.unknown_fields.iter().any(|f| f == "BogusPeer"),
+        "names field: {:?}",
+        imp.unknown_fields
+    );
+    assert!(
+        imp.reasons.join(" ").contains("BogusPeer"),
+        "reason names field: {:?}",
         imp.reasons
     );
 }

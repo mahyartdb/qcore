@@ -68,6 +68,16 @@ pub struct Engine {
 }
 
 impl Engine {
+    /// Poison-tolerant guard for the live-session map. A poisoned mutex is
+    /// restored (contents preserved) and the restore is logged so restores
+    /// stay visible instead of silently masking bugs.
+    fn lock_live(&self) -> std::sync::MutexGuard<'_, HashMap<String, SessionHandle>> {
+        self.live.lock().unwrap_or_else(|e| {
+            eprintln!("qcore: live session map lock poisoned; restoring");
+            e.into_inner()
+        })
+    }
+
     pub fn new(config: EngineConfig) -> Self {
         let (events, _) = tokio::sync::broadcast::channel(256);
         Engine {
@@ -207,10 +217,7 @@ impl Engine {
             started,
             events: self.events.clone(),
         };
-        self.live
-            .lock()
-            .expect("live map")
-            .insert(handle.id.clone(), handle.clone());
+        self.lock_live().insert(handle.id.clone(), handle.clone());
         Ok(handle)
     }
 
@@ -228,22 +235,24 @@ impl Engine {
 
     /// Connection report for one live session (`None` when unknown).
     /// Powers the C ABI / embedders' per-session status (FR-003c).
+    /// Poison-tolerant: a poisoned map restores and reports `None` for
+    /// unknown ids, never panics. The handle is cloned out from under the
+    /// lock before building the report so report construction never holds
+    /// the map lock.
     pub fn session_report(&self, id: &str) -> Option<crate::session::report::ConnectionReport> {
-        self.live.lock().expect("live map").get(id).map(|h| {
+        let handle = { self.lock_live().get(id).cloned() };
+        handle.map(|h| {
             crate::session::report::ConnectionReport::new(h.hop_reports(), h.exit_hop_id.clone())
         })
     }
 
     /// Tear down one live session by id.
     pub async fn stop_session(&self, id: &str) -> Result<(), FailureReport> {
-        let handle = self
-            .live
-            .lock()
-            .expect("live map")
-            .remove(id)
-            .ok_or_else(|| {
+        let handle = {
+            self.lock_live().remove(id).ok_or_else(|| {
                 FailureReport::new(FailureLayer::Chain, "-", "no such live session", "chain")
-            })?;
+            })?
+        };
         handle.stop_all().await.map_err(|e| {
             FailureReport::new(
                 FailureLayer::Chain,
@@ -256,13 +265,7 @@ impl Engine {
 
     /// Tear down all live sessions (exit-first per session).
     pub async fn stop(&self) -> Result<(), FailureReport> {
-        let ids: Vec<String> = self
-            .live
-            .lock()
-            .expect("live map")
-            .keys()
-            .cloned()
-            .collect();
+        let ids: Vec<String> = { self.lock_live().keys().cloned().collect() };
         for id in ids {
             self.stop_session(&id).await?;
         }
@@ -596,4 +599,128 @@ fn new_session_id() -> String {
         .map(|d| d.as_millis())
         .unwrap_or(0);
     format!("sess-{ms}-{n}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::{ChainSer, SessionHandle};
+
+    fn test_engine() -> Engine {
+        Engine::new(EngineConfig::default())
+    }
+
+    fn dummy_handle(id: &str) -> SessionHandle {
+        let (events, _) = tokio::sync::broadcast::channel(8);
+        SessionHandle {
+            id: id.to_string(),
+            exit_hop_id: "exit-0".to_string(),
+            chain: ChainSer {
+                hops: Vec::new(),
+                max_depth: 3,
+            },
+            started: Vec::new(),
+            events,
+        }
+    }
+
+    /// Poison `engine.live` by panicking while holding the guard. The guard
+    /// is dropped during unwind, so the next `lock()` observes poisoning.
+    fn poison_live(engine: &Engine) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = engine.live.lock().expect("test setup lock holds");
+            panic!("intentional test poison");
+        }));
+        assert!(
+            engine.live.is_poisoned(),
+            "test setup must leave the live map poisoned"
+        );
+    }
+
+    #[test]
+    fn session_report_survives_poison_and_preserves_entries() {
+        let engine = test_engine();
+        engine
+            .lock_live()
+            .insert("s1".to_string(), dummy_handle("s1"));
+        poison_live(&engine);
+        // Restore-and-continue: the pre-poison entry is still reported.
+        let report = engine.session_report("s1");
+        assert!(report.is_some(), "poisoned map must not panic; s1 survives");
+        assert_eq!(
+            report.expect("checked above").exit_hop_id,
+            "exit-0",
+            "restored entry keeps its exit hop"
+        );
+        // Unknown ids report None, never panic.
+        assert!(
+            engine.session_report("missing").is_none(),
+            "unknown id on a poisoned map is None"
+        );
+    }
+
+    #[test]
+    fn session_report_unknown_on_poisoned_empty_map_is_none() {
+        let engine = test_engine();
+        poison_live(&engine);
+        assert!(
+            engine.session_report("anything").is_none(),
+            "poisoned empty map reports None, never panics"
+        );
+        // The map is usable after restore: inserts still land.
+        engine
+            .lock_live()
+            .insert("s2".to_string(), dummy_handle("s2"));
+        assert!(
+            engine.session_report("s2").is_some(),
+            "map usable after poison restore"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_session_survives_poison() {
+        let engine = test_engine();
+        engine
+            .lock_live()
+            .insert("s1".to_string(), dummy_handle("s1"));
+        poison_live(&engine);
+        // Empty `started` vec stops cleanly; the point is no panic and the
+        // entry is reaped from the restored map.
+        engine
+            .stop_session("s1")
+            .await
+            .expect("stop on poisoned map succeeds");
+        assert!(
+            engine.session_report("s1").is_none(),
+            "stopped session is gone"
+        );
+        // Unknown id on a (previously) poisoned map is a typed failure, not
+        // a panic.
+        let err = engine
+            .stop_session("missing")
+            .await
+            .expect_err("unknown session fails closed");
+        assert!(
+            err.to_string().contains("no such live session"),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_all_survives_poison() {
+        let engine = test_engine();
+        engine
+            .lock_live()
+            .insert("s1".to_string(), dummy_handle("s1"));
+        engine
+            .lock_live()
+            .insert("s2".to_string(), dummy_handle("s2"));
+        poison_live(&engine);
+        engine
+            .stop()
+            .await
+            .expect("stop-all on poisoned map succeeds");
+        assert!(engine.session_report("s1").is_none());
+        assert!(engine.session_report("s2").is_none());
+    }
 }

@@ -4,6 +4,7 @@
 use qcore_transport_api::{Dialer, HopConfig, HopFactory};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
+use tests_conformance::testutil::closed_port;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use transport_masque::test_support::{H2Responder, QuinnResponder};
 
@@ -136,11 +137,9 @@ async fn masque_h2_ipv6() {
 #[tokio::test]
 async fn unreachable_masque_names_transport_and_cause() {
     let _ = qcore_transports::linked_kinds();
+    let dead = closed_port();
     let hop = transport_masque::MasqueFactory
-        .build(
-            cfg_for("h3", "127.0.0.1:1".parse().unwrap()),
-            root_carrier(),
-        )
+        .build(cfg_for("h3", dead), root_carrier())
         .await;
     let err = match hop {
         Ok(_) => panic!("closed port must fail"),

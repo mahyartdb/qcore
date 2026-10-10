@@ -15,9 +15,10 @@ use qcore_core::scan::seeds::{candidates_for, load_warp_profiles};
 use qcore_core::scan::{ProbeKind, ScanProfile, ScanRequest, Scanner};
 use std::net::SocketAddr;
 use tests_conformance::fixture::{Fixture, FixtureMode};
+use tests_conformance::testutil::unique_dir;
 
 fn work(name: &str) -> ProfileDirs {
-    let dir = std::env::temp_dir().join(format!("qcore-masque-{name}-{}", std::process::id()));
+    let dir = unique_dir(&format!("qcore-masque-{name}"));
     let _ = std::fs::remove_dir_all(&dir);
     ProfileDirs::resolve(Some(dir.join("config")), Some(dir.join("profiles")))
 }

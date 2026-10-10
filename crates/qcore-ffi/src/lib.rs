@@ -12,17 +12,21 @@
 
 use qcore_core::api::{Engine, EngineConfig};
 use qcore_core::config::profile_dir::ProfileDirs;
+use qcore_transport_api::FailureLayer;
 use std::ffi::{c_char, c_int, CStr, CString};
+use std::time::Duration;
 
 /// Opaque engine handle (see [`qcore_engine_new`]).
 pub struct QcoreEngine {
     engine: Engine,
     rt: tokio::runtime::Runtime,
+    timeout: Duration,
 }
 
 /// Out-param error record. `code` mirrors the CLI exit-code contract
-/// (2 invalid, 3 hop failure, 4 empty scan, 5 import rejected, 6 usage,
-/// -1 internal panic); `message` is an owned NUL-terminated string.
+/// (0 ok, 1 dead session, 2 invalid, 3 hop failure, 4 empty scan,
+/// 5 import rejected, 6 usage, 10 no session, 12 unverifiable,
+/// -1 internal); `message` is an owned NUL-terminated string.
 #[repr(C)]
 pub struct QcoreError {
     pub code: c_int,
@@ -38,9 +42,9 @@ pub unsafe extern "C" fn qcore_abi_version() -> u32 {
     qcore_core::api::version::ABI_VERSION
 }
 
-fn ok_string(out: *mut *mut c_char, s: String) -> c_int {
+fn ok_string(out: *mut *mut c_char, s: String, err_out: *mut *mut QcoreError) -> c_int {
     if out.is_null() {
-        return 6;
+        return fail(err_out, 6, "null out-param".to_string());
     }
     match CString::new(s) {
         Ok(c) => {
@@ -50,8 +54,13 @@ fn ok_string(out: *mut *mut c_char, s: String) -> c_int {
             0
         }
         Err(_) => {
-            // Interior NUL cannot occur (JSON/ids are NUL-free); fail loud.
-            -1
+            // Interior NUL in JSON/ids is unexpected but must never yield a
+            // code with no message: populate the error out-param.
+            fail(
+                err_out,
+                -1,
+                "response contains an interior NUL byte".to_string(),
+            )
         }
     }
 }
@@ -70,14 +79,32 @@ fn fail(err_out: *mut *mut QcoreError, code: c_int, message: String) -> c_int {
     code
 }
 
+/// Map a typed failure to its exit-code class. Single source with core
+/// `exit_code_for_failure`: the typed [`FailureLayer`] drives the mapping
+/// (validation 2, scan-empty 4, everything else hop-failure 3); the free-form
+/// `kind` string is only a fallback for classes with no layer variant
+/// (a `usage` kind), so message rewording cannot silently remap classes.
+fn failure_code(r: &qcore_transport_api::FailureReport) -> c_int {
+    match r.layer {
+        FailureLayer::Validation => 2,
+        FailureLayer::Scan => 4,
+        FailureLayer::Transport
+        | FailureLayer::Chain
+        | FailureLayer::Config
+        | FailureLayer::Sidecar => {
+            if r.kind == "usage" {
+                6
+            } else {
+                3
+            }
+        }
+    }
+}
+
 fn fail_report(err_out: *mut *mut QcoreError, r: &qcore_transport_api::FailureReport) -> c_int {
-    // Failure kinds map onto the CLI exit-code contract for stability.
-    let code = match r.kind.as_str() {
-        "usage" => 6,
-        "validation" => 2,
-        "unreachable" | "timeout" | "shutdown" => 3,
-        _ => 3,
-    };
+    // Typed-layer mapping; the kind string is fallback-only (see
+    // `failure_code`).
+    let code = failure_code(r);
     // Shared masked rendering: this message crosses into caller-owned
     // buffers, which promise (module docs, FR-026) to never carry secrets.
     let message = qcore_core::diag::masked_failure_line(r);
@@ -95,10 +122,18 @@ fn live_handles() -> &'static std::sync::Mutex<std::collections::HashSet<usize>>
     LIVE_HANDLES.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
 }
 
+/// Poison-tolerant guard for the live-handle set: a poisoned mutex is
+/// restored (contents preserved) and the restore is logged, so a poisoned
+/// set never silently drops a track/lookup/remove into a false answer.
+fn lock_live_handles() -> std::sync::MutexGuard<'static, std::collections::HashSet<usize>> {
+    live_handles().lock().unwrap_or_else(|e| {
+        eprintln!("qcore: live handle set lock poisoned; restoring");
+        e.into_inner()
+    })
+}
+
 fn track_handle(ptr: *mut QcoreEngine) {
-    if let Ok(mut set) = live_handles().lock() {
-        set.insert(ptr as usize);
-    }
+    lock_live_handles().insert(ptr as usize);
 }
 
 /// Returns true only for a live handle from [`qcore_engine_new`] not yet freed.
@@ -106,18 +141,12 @@ pub(crate) fn handle_is_live(ptr: *mut QcoreEngine) -> bool {
     if ptr.is_null() {
         return false;
     }
-    live_handles()
-        .lock()
-        .map(|set| set.contains(&(ptr as usize)))
-        .unwrap_or(false)
+    lock_live_handles().contains(&(ptr as usize))
 }
 
 /// Removes from the live set; returns true if it was live.
 fn untrack_handle(ptr: *mut QcoreEngine) -> bool {
-    live_handles()
-        .lock()
-        .map(|mut set| set.remove(&(ptr as usize)))
-        .unwrap_or(false)
+    lock_live_handles().remove(&(ptr as usize))
 }
 
 fn check_handle(handle: *mut QcoreEngine, err_out: *mut *mut QcoreError) -> Result<(), c_int> {
@@ -179,7 +208,8 @@ unsafe fn opt_c_str(ptr: *const c_char) -> Result<Option<String>, String> {
 /// Optional JSON engine config:
 /// `{"config_dir","profile_dir","family","prefer","max_depth","timeout_secs","worker_threads"}`.
 /// Null selects defaults. Transports linked are the FFI defaults (same set
-/// the CLI links minus tor; see `qcore-transports` features).
+/// the CLI links, including tor; `qcore-transports` is built with the `tor`
+/// feature for both surfaces).
 ///
 /// `worker_threads` sizes the private FFI runtime (#15 perf batch: the fixed
 /// `worker_threads(2)` ignored host width — embedders driving parallel scans
@@ -232,6 +262,9 @@ pub unsafe extern "C" fn qcore_engine_new(
         // #10 profiled `block_on` dispatch at ~67 ns/op — sizing is not the
         // binding constraint, so this buys embedder control, not speed.
         let worker_threads = ffi_worker_threads(&v);
+        // Engine budget for teardown paths: free/stop never block longer
+        // than this (T5 bounded teardown).
+        let timeout = Duration::from_secs(timeout_secs.max(1));
         // Host links the transports it embeds (FR-003g scoping lives here).
         let _ = qcore_transports::linked_kinds();
         let engine = Engine::new(EngineConfig {
@@ -251,14 +284,19 @@ pub unsafe extern "C" fn qcore_engine_new(
             Ok(rt) => rt,
             Err(e) => return fail(err_out, 3, format!("runtime unavailable: {e}")),
         };
-        *unsafe { &mut *out } = Box::into_raw(Box::new(QcoreEngine { engine, rt }));
+        *unsafe { &mut *out } = Box::into_raw(Box::new(QcoreEngine {
+            engine,
+            rt,
+            timeout,
+        }));
         track_handle(*unsafe { &mut *out });
         0
     })
 }
 
 /// Destroy an engine (also stops all live sessions, bounded by the engine
-/// timeout). Null is a no-op success.
+/// `timeout_secs` budget — never blocks indefinitely). Null is a no-op
+/// success. Forged/double-free handles are a usage error (6).
 ///
 /// # Safety
 /// `handle` must be null or a live handle from [`qcore_engine_new`]; it must
@@ -272,9 +310,19 @@ pub unsafe extern "C" fn qcore_engine_free(handle: *mut QcoreEngine) -> c_int {
         if !untrack_handle(handle) {
             return 6;
         }
+        // SAFETY: `handle` was live (checked above), so reclaiming it here
+        // is sound; teardown below is bounded by the engine budget.
         let engine = unsafe { Box::from_raw(handle) };
-        let _ = engine.rt.block_on(engine.engine.stop());
-        0
+        let budget = engine.timeout;
+        let stopped = engine
+            .rt
+            .block_on(async { tokio::time::timeout(budget, engine.engine.stop()).await });
+        match stopped {
+            Ok(Ok(())) => 0,
+            // No `err_out` channel on free: surface the mapped class only.
+            Ok(Err(r)) => failure_code(&r),
+            Err(_) => 3,
+        }
     })
 }
 
@@ -309,7 +357,7 @@ pub unsafe extern "C" fn qcore_engine_start(
         let rt = unsafe { &(*handle).rt };
         match rt.block_on(engine.start(specs)) {
             Err(r) => fail_report(err_out, &r),
-            Ok(h) => ok_string(out_session_id, h.id.clone()),
+            Ok(h) => ok_string(out_session_id, h.id.clone(), err_out),
         }
     })
 }
@@ -338,12 +386,17 @@ pub unsafe extern "C" fn qcore_engine_status_json(
         let engine = unsafe { &(*handle).engine };
         match engine.session_report(&id) {
             None => fail(err_out, 3, format!("no such live session `{id}`")),
-            Some(report) => ok_string(out_json, qcore_core::session::report::to_json(&report)),
+            Some(report) => ok_string(
+                out_json,
+                qcore_core::session::report::to_json(&report),
+                err_out,
+            ),
         }
     })
 }
 
-/// Stop one live session (bounded). Unknown id is an error.
+/// Stop one live session (bounded by the engine `timeout_secs` budget —
+/// never blocks indefinitely). Unknown id is an error.
 ///
 /// # Safety
 /// Same pointer contract as [`qcore_engine_start`].
@@ -364,9 +417,18 @@ pub unsafe extern "C" fn qcore_engine_stop(
         };
         // SAFETY: `handle` is live (checked above).
         let e = unsafe { &*handle };
-        match e.rt.block_on(e.engine.stop_session(&id)) {
-            Err(r) => fail_report(err_out, &r),
-            Ok(()) => 0,
+        let budget = e.timeout;
+        match e
+            .rt
+            .block_on(async { tokio::time::timeout(budget, e.engine.stop_session(&id)).await })
+        {
+            Ok(Ok(())) => 0,
+            Ok(Err(r)) => fail_report(err_out, &r),
+            Err(_) => fail(
+                err_out,
+                3,
+                format!("stop timed out after {}s", budget.as_secs()),
+            ),
         }
     })
 }
@@ -406,13 +468,11 @@ pub unsafe extern "C" fn qcore_scan(
             Err(msg) => return fail(err_out, 6, msg),
             Ok(p) => p,
         };
-        let req = qcore_core::scan::ScanRequest {
-            transport: transport.clone(),
-            profile,
-            family,
-            candidates: qcore_core::scan::discovery_seeds(&dirs, &transport),
-        };
-        let report = match e.rt.block_on(qcore_core::scan::Scanner::scan(req)) {
+        // T6: shared core pipeline — same winner fast-path, warp-seed
+        // expansion, verify, and persist/evict as CLI scan.
+        let report = match e.rt.block_on(qcore_core::scan::run_scan_request(
+            &dirs, &transport, profile, &family,
+        )) {
             Err(msg) => return fail(err_out, 3, msg),
             Ok(r) => r,
         };
@@ -424,10 +484,10 @@ pub unsafe extern "C" fn qcore_scan(
         })
         .to_string();
         if report.ranked.is_empty() {
-            let _ = ok_string(out_json, body);
+            let _ = ok_string(out_json, body, err_out);
             return fail(err_out, 4, "scan found nothing reachable".to_string());
         }
-        ok_string(out_json, body)
+        ok_string(out_json, body, err_out)
     })
 }
 
@@ -474,6 +534,7 @@ pub unsafe extern "C" fn qcore_import_config(
                     },
                 })
                 .to_string(),
+                err_out,
             ),
         }
     })
@@ -511,7 +572,11 @@ pub unsafe extern "C" fn qcore_export_config(
             secrets,
             std::path::Path::new(&import_ref),
         );
-        ok_string(out_text, qcore_core::config::export::export_redacted(&imp))
+        ok_string(
+            out_text,
+            qcore_core::config::export::export_redacted(&imp),
+            err_out,
+        )
     })
 }
 
@@ -625,17 +690,128 @@ mod tests {
     }
 
     #[test]
+    fn fail_report_maps_from_layer_with_string_fallback_only() {
+        // Layer drives the class even when the kind string disagrees, so
+        // message rewording cannot silently remap exit classes.
+        let mismatched = qcore_transport_api::FailureReport::new(
+            qcore_transport_api::FailureLayer::Validation,
+            "h",
+            "boom",
+            "transport",
+        );
+        let mut err: *mut QcoreError = std::ptr::null_mut();
+        assert_eq!(fail_report(&mut err as *mut _, &mismatched), 2);
+        assert_eq!(unsafe { qcore_error_free(err) }, 0);
+        // Scan layer maps to empty-scan (4), matching core's single source.
+        let scan = qcore_transport_api::FailureReport::new(
+            qcore_transport_api::FailureLayer::Scan,
+            "h",
+            "nothing",
+            "whatever",
+        );
+        let mut err: *mut QcoreError = std::ptr::null_mut();
+        assert_eq!(fail_report(&mut err as *mut _, &scan), 4);
+        assert_eq!(unsafe { qcore_error_free(err) }, 0);
+        // String fallback only: a `usage` kind with no Usage layer variant.
+        let usage = qcore_transport_api::FailureReport::new(
+            qcore_transport_api::FailureLayer::Transport,
+            "h",
+            "bad call",
+            "usage",
+        );
+        let mut err: *mut QcoreError = std::ptr::null_mut();
+        assert_eq!(fail_report(&mut err as *mut _, &usage), 6);
+        assert_eq!(unsafe { qcore_error_free(err) }, 0);
+    }
+
+    #[test]
     fn ok_string_null_out_is_usage_not_success() {
         // Null out-param must not masquerade as success: out-params are
-        // null-checked per the FFI contract (usage error 6).
-        assert_eq!(ok_string(std::ptr::null_mut(), "x".to_string()), 6);
+        // null-checked per the FFI contract (usage error 6, with err set).
+        let mut err: *mut QcoreError = std::ptr::null_mut();
+        assert_eq!(
+            ok_string(std::ptr::null_mut(), "x".to_string(), &mut err as *mut _),
+            6
+        );
+        assert!(!err.is_null());
+        assert_eq!(unsafe { qcore_error_free(err) }, 0);
         let mut out: *mut c_char = std::ptr::null_mut();
-        assert_eq!(ok_string(&mut out as *mut _, "ok".to_string()), 0);
+        let mut err2: *mut QcoreError = std::ptr::null_mut();
+        assert_eq!(
+            ok_string(&mut out as *mut _, "ok".to_string(), &mut err2 as *mut _),
+            0
+        );
         assert!(!out.is_null());
+        assert!(err2.is_null());
         // SAFETY: `out` was just written by `ok_string` per its contract.
         let s = unsafe { CStr::from_ptr(out) }.to_str().unwrap().to_string();
         assert_eq!(s, "ok");
         assert_eq!(unsafe { qcore_string_free(out) }, 0);
+    }
+
+    #[test]
+    fn ok_string_interior_nul_populates_err_out() {
+        // A code must never arrive with no message: interior NUL populates
+        // the error out-param instead of returning bare -1.
+        let mut out: *mut c_char = std::ptr::null_mut();
+        let mut err: *mut QcoreError = std::ptr::null_mut();
+        let rc = ok_string(&mut out as *mut _, "ab\0cd".to_string(), &mut err as *mut _);
+        assert_eq!(rc, -1);
+        assert!(out.is_null());
+        assert!(!err.is_null());
+        let msg = unsafe { CStr::from_ptr((*err).message) }
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(msg.contains("NUL"), "got: {msg}");
+        assert_eq!(unsafe { qcore_error_free(err) }, 0);
+    }
+
+    #[test]
+    fn live_handle_set_restores_after_poison() {
+        // Poison the set, then prove lookups still work (restore, not a
+        // silent false) instead of failing closed on every handle.
+        let poisoned = std::panic::catch_unwind(|| {
+            let _guard = lock_live_handles();
+            panic!("intentional poison probe");
+        });
+        assert!(poisoned.is_err());
+        // The set is restored with contents preserved: a forged handle is
+        // still rejected as usage-error, not as a poison artifact.
+        let chain = CString::new("mock").unwrap();
+        let mut out: *mut c_char = std::ptr::null_mut();
+        let mut err: *mut QcoreError = std::ptr::null_mut();
+        let forged = 0x1234 as *mut QcoreEngine;
+        let rc = unsafe {
+            qcore_engine_start(
+                forged,
+                chain.as_ptr(),
+                &mut out as *mut _,
+                &mut err as *mut _,
+            )
+        };
+        assert_eq!(rc, 6);
+        if !err.is_null() {
+            assert_eq!(unsafe { qcore_error_free(err) }, 0);
+        }
+        // And a real engine still tracks through the restored set.
+        let base = std::env::temp_dir().join(format!("qcore-ffi-poison-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let cfg = serde_json::json!({
+            "config_dir": base.join("config").to_str().unwrap(),
+            "profile_dir": base.join("profiles").to_str().unwrap(),
+        })
+        .to_string();
+        let cfg = CString::new(cfg).unwrap();
+        let mut out: *mut QcoreEngine = std::ptr::null_mut();
+        let mut err: *mut QcoreError = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { qcore_engine_new(cfg.as_ptr(), &mut out as *mut _, &mut err as *mut _) },
+            0
+        );
+        assert!(handle_is_live(out));
+        assert_eq!(unsafe { qcore_engine_free(out) }, 0);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

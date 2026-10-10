@@ -6,6 +6,7 @@ use qcore_core::session::net::{root_dialer, FamilyPolicy};
 use qcore_transport_api::{HopConfig, HopFactory};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
+use tests_conformance::testutil::closed_port;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use transport_wireguard::test_support::{generate_keypair, WgResponder};
 
@@ -87,10 +88,11 @@ async fn unreachable_wireguard_names_transport_and_cause() {
     let _ = qcore_transports::linked_kinds();
     let (c_sk, _c_pk) = generate_keypair();
     let (_s_sk, s_pk) = generate_keypair();
+    let dead = closed_port();
     let mut cfg = HopConfig::new("wireguard");
     cfg.fields.insert("hop_id".into(), "wg-dead-0".into());
     cfg.fields.insert("peer".into(), "warp".into());
-    cfg.fields.insert("endpoint".into(), "127.0.0.1:1".into());
+    cfg.fields.insert("endpoint".into(), dead.to_string());
     cfg.fields.insert("private_key".into(), hex(&c_sk));
     cfg.fields.insert("peer_public_key".into(), hex(&s_pk));
     let carrier = root_dialer(FamilyPolicy::default(), Duration::from_secs(5));
@@ -104,7 +106,7 @@ async fn unreachable_wireguard_names_transport_and_cause() {
     let msg = err.to_string();
     assert!(msg.contains("wireguard"), "names transport: {msg}");
     assert!(
-        msg.contains("127.0.0.1:1") || msg.contains("timed out"),
+        msg.contains(&dead.to_string()) || msg.contains("timed out"),
         "actionable cause: {msg}"
     );
 }

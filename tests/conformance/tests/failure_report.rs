@@ -6,6 +6,7 @@
 use qcore_core::api::{Engine, EngineConfig};
 use qcore_core::chain::ExpandedHop;
 use qcore_transport_api::{FailureLayer, FailureReport};
+use tests_conformance::testutil::{closed_port, unique_dir};
 
 fn engine_in(dir: &std::path::Path) -> Engine {
     let _ = qcore_transports::linked_kinds();
@@ -24,12 +25,13 @@ fn is_transport_layer(layer: &FailureLayer) -> bool {
 
 #[tokio::test]
 async fn unreachable_hop_reports_layer_and_cause() {
-    let work = std::env::temp_dir().join(format!("qcore-failrep-{}", std::process::id()));
+    let work = unique_dir("qcore-failrep");
     let engine = engine_in(&work);
     // H2 to a closed loopback port fails fast (refusal) or via the 15 s
     // QUIC/connect timeouts (filtered hangs) — either way the transport is
     // unreachable and start fails closed without waiting out the session.
-    let spec = Engine::parse_single_hop("masque", "alpn=h2 endpoint=127.0.0.1:1")
+    let dead = closed_port();
+    let spec = Engine::parse_single_hop("masque", &format!("alpn=h2 endpoint={dead}"))
         .expect("unreachable spec parses");
     let report: FailureReport = engine
         .start(vec![ExpandedHop::Hop(spec)])

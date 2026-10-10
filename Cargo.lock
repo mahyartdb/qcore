@@ -4279,6 +4279,7 @@ dependencies = [
  "qcore-transport-masque",
  "qcore-transport-mock",
  "qcore-transport-psiphon",
+ "qcore-transport-relay",
  "qcore-transport-tor",
  "qcore-transport-wireguard",
  "qcore-transports",

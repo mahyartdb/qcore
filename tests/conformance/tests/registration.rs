@@ -12,9 +12,10 @@ use qcore_core::identity::register::ProviderOptions;
 use qcore_core::identity::report::ReportAction;
 use qcore_core::identity::store::IdentityRole;
 use tests_conformance::fixture::{Fixture, FixtureMode};
+use tests_conformance::testutil::unique_dir;
 
 fn work(name: &str) -> ProfileDirs {
-    let dir = std::env::temp_dir().join(format!("qcore-reg-{name}-{}", std::process::id()));
+    let dir = unique_dir(&format!("qcore-reg-{name}"));
     let _ = std::fs::remove_dir_all(&dir);
     ProfileDirs::resolve(Some(dir.join("config")), Some(dir.join("profiles")))
 }

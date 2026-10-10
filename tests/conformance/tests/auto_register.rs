@@ -8,9 +8,10 @@ use qcore_core::config::profile_dir::ProfileDirs;
 use qcore_core::identity::register::ProviderOptions;
 use qcore_core::identity::store::IdentityRole;
 use tests_conformance::fixture::{Fixture, FixtureMode};
+use tests_conformance::testutil::{closed_port, unique_dir};
 
 fn work(name: &str) -> ProfileDirs {
-    let dir = std::env::temp_dir().join(format!("qcore-auto-{name}-{}", std::process::id()));
+    let dir = unique_dir(&format!("qcore-auto-{name}"));
     let _ = std::fs::remove_dir_all(&dir);
     ProfileDirs::resolve(Some(dir.join("config")), Some(dir.join("profiles")))
 }
@@ -68,8 +69,9 @@ async fn chains_needing_no_identity_skip_registration() {
     dirs.ensure_dirs().expect("dirs");
     let e = engine_in(&dirs);
     // No fixture at all: nothing may touch the network.
+    let dead = closed_port();
     let dummy = ProviderOptions {
-        provider_base: "http://127.0.0.1:1/closed".to_string(),
+        provider_base: format!("http://{dead}/closed"),
         timeout_secs: 2,
         family: "dual".to_string(),
     };

@@ -8,8 +8,13 @@ permissions:
 
 jobs:
   # Tier C (tag): every contracted target built and smoked; publish blocked
-  # unless green. KNOWN GAP, not yet proven end-to-end (issue #16 triage):
-  # the matrix covers 3/9 xtask/src/targets.toml entries (Windows only).
+  # unless green. DOCUMENTED STUB (T7 story 18), not yet proven end-to-end
+  # (issue #16 triage): the matrix below covers 3/9 xtask/src/targets.toml
+  # entries (Windows only) and MUST match the COVERED list in
+  # `xtask/src/release.rs::run` triple-for-triple. The contract side cannot
+  # drift: release.rs reads CONTRACT from targets.toml at compile time, and
+  # `cargo xtask release` fails closed without --allow-partial-matrix naming
+  # the 6 unproven targets.
   # Expanding to all 9 is DEFERRED: removing/demoting targets needs a
   # constitution amendment, and the linux/android legs need runner capacity
   # plus a tag dry-run. Do not tag `v*` until the matrix is complete and a

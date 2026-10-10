@@ -2,6 +2,11 @@
 // state, and stop it through the documented C ABI only (qcore.h), with no
 // access to internal types. Offline against the mock transport.
 //
+// CI coverage (T7 story 23): exercised on Linux by the `go-consumer` job in
+// `.github/workflows/ci.yml` (FFI release build + `go run .`). The Windows
+// MSVC/MinGW link paths below are documented but NOT CI-gated; verify by
+// hand after ABI or harness changes.
+//
 // Build (from the workspace root; requires a C toolchain for cgo):
 //
 //	cargo build -p qcore-ffi --release

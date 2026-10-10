@@ -12,9 +12,10 @@ use qcore_core::config::profile_dir::ProfileDirs;
 use qcore_core::session::net::FamilyPolicy;
 use qcore_core::session::Session;
 use std::path::PathBuf;
+use tests_conformance::testutil::unique_dir;
 
 fn work(name: &str) -> ProfileDirs {
-    let dir = std::env::temp_dir().join(format!("qcore-hygiene-{name}"));
+    let dir = unique_dir(&format!("qcore-hygiene-{name}"));
     let _ = std::fs::remove_dir_all(&dir);
     ProfileDirs::resolve(Some(dir.join("config")), Some(dir.join("profiles")))
 }

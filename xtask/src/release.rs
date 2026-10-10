@@ -14,6 +14,22 @@
 
 use std::path::{Path, PathBuf};
 
+/// Single source for the contracted target list: `targets.toml` next to this
+/// file. Parsed the same way as `smoke.rs` so the manifest and the gate
+/// cannot drift (T7 story 18).
+const TARGETS_TOML: &str = include_str!("targets.toml");
+
+fn contract_targets() -> Vec<String> {
+    TARGETS_TOML
+        .lines()
+        .filter_map(|l| {
+            let l = l.trim();
+            l.strip_prefix("triple = ")
+                .map(|v| v.trim().trim_matches('"').to_string())
+        })
+        .collect()
+}
+
 fn version() -> Result<String, String> {
     // Single source: [workspace.package] version in the root manifest.
     let root =
@@ -215,11 +231,14 @@ pub fn package(args: Vec<String>) -> super::anyhow::Result<()> {
 
 pub fn run(_args: Vec<String>) -> super::anyhow::Result<()> {
     let fail = |m: String| super::anyhow::Error::msg(m);
-    // Tier C local gates: everything CI runs that is runnable here.
+    // Tier C local gates: the same workspace-wide nextest invocations CI runs
+    // (`xtask ci` in main.rs; T7 story 15). Local and CI results agree by
+    // construction — a single definition, not two similar command lists.
     for gate in [
         "cargo fmt --check",
-        "cargo clippy --all-targets --all-features -- -D warnings",
-        "cargo test --workspace --all-features",
+        "cargo clippy --workspace --all-targets --all-features -- -D warnings",
+        "cargo nextest run --workspace --all-features --exclude tests-conformance",
+        "cargo nextest run -p tests-conformance",
         "cargo run -q -p xtask -- abi-diff",
         "cargo run -q -p xtask -- smoke --target native",
     ] {
@@ -234,28 +253,27 @@ pub fn run(_args: Vec<String>) -> super::anyhow::Result<()> {
     // closed unless the operator acknowledges the partial matrix
     // explicitly. Full expansion needs runner capacity + a constitution
     // amendment (see AGENTS.md release row); do not tag `v*` until then.
+    //
+    // DOCUMENTED STUB (T7 story 18): COVERED is the Windows-only subset the
+    // tag matrix in `.github/workflows/release.yml` proves today. It must
+    // match that file's `matrix.target` list triple-for-triple; CONTRACT is
+    // read from `targets.toml` at compile time, so manifest drift fails the
+    // count here instead of shipping silently.
     const COVERED: &[&str] = &[
         "i686-pc-windows-msvc",
         "x86_64-pc-windows-msvc",
         "aarch64-pc-windows-msvc",
     ];
-    const CONTRACT: &[&str] = &[
-        "i686-pc-windows-msvc",
-        "x86_64-pc-windows-msvc",
-        "aarch64-pc-windows-msvc",
-        "x86_64-unknown-linux-gnu",
-        "i686-unknown-linux-gnu",
-        "aarch64-unknown-linux-gnu",
-        "armv7-unknown-linux-gnueabihf",
-        "aarch64-linux-android",
-        "armv7-linux-androideabi",
-    ];
-    let uncovered: Vec<_> = CONTRACT.iter().filter(|t| !COVERED.contains(t)).collect();
+    let contract = contract_targets();
+    let uncovered: Vec<_> = contract
+        .iter()
+        .filter(|t| !COVERED.contains(&t.as_str()))
+        .collect();
     if !_args.iter().any(|a| a == "--allow-partial-matrix") {
         return Err(fail(format!(
             "release blocked: tag matrix covers {}/{} targets ({}); unproven: {}. Re-run with --allow-partial-matrix to acknowledge, or expand the matrix (constitution amendment required).",
             COVERED.len(),
-            CONTRACT.len(),
+            contract.len(),
             COVERED.join(", "),
             uncovered
                 .iter()
@@ -511,7 +529,17 @@ mod serde_json_lite {
 
 #[cfg(test)]
 mod tests {
-    use super::sha256_hex;
+    use super::{contract_targets, sha256_hex};
+
+    #[test]
+    fn contract_targets_match_manifest() {
+        // The release gate reads the contract from targets.toml: 9 triples,
+        // Windows legs first. Manifest edits flow here with no code change.
+        let contract = contract_targets();
+        assert_eq!(contract.len(), 9, "manifest triple count: {contract:?}");
+        assert!(contract.contains(&"x86_64-pc-windows-msvc".to_string()));
+        assert!(contract.contains(&"aarch64-linux-android".to_string()));
+    }
 
     #[test]
     fn sha256_nist_vector() {

@@ -43,12 +43,19 @@ pub struct WarpProfiles {
 }
 
 /// Load warp.toml: profile-dir override when present, else the shipped
-/// data. Shape errors fail closed naming the file and field.
+/// data. Shape errors fail closed naming the file and field. A
+/// present-but-unreadable override fails closed — only `NotFound` falls
+/// back to shipped data (mirrors `config::obfuscation::load_profiles`).
 pub fn load_warp_profiles(dirs: &ProfileDirs) -> Result<WarpProfiles, String> {
     let path = dirs.profile_dir.join("warp.toml");
     let (text, file) = match std::fs::read_to_string(&path) {
         Ok(t) => (t, "warp.toml"),
-        Err(_) => (SHIPPED_WARP_TOML.to_string(), "shipped warp.toml"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            (SHIPPED_WARP_TOML.to_string(), "shipped warp.toml")
+        }
+        Err(e) => {
+            return Err(format!("warp.toml: cannot read {}: {e}", path.display()));
+        }
     };
     parse_warp_toml(&text).map_err(|e| format!("{file}: {e}"))
 }
@@ -287,5 +294,29 @@ mod tests {
         assert_eq!(p.default_scan_profile, "balanced");
         assert_eq!(p.warp.ports[0], 2408);
         assert_eq!(p.masque.ports[0], 443);
+    }
+
+    #[test]
+    fn load_fails_closed_only_not_found_falls_back() {
+        // Absent file falls back to shipped data.
+        let base = std::env::temp_dir().join(format!("qcore-warp-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dirs = ProfileDirs::resolve(None, Some(base.join("prof")));
+        let p = load_warp_profiles(&dirs).expect("missing falls back");
+        assert_eq!(p.default_scan_profile, "balanced");
+        // Present-but-unreadable (a directory at the file path) fails closed
+        // instead of silently using shipped data.
+        let base2 = std::env::temp_dir().join(format!("qcore-warp-unread-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base2);
+        let prof = base2.join("prof");
+        std::fs::create_dir_all(prof.join("warp.toml")).unwrap();
+        let dirs2 = ProfileDirs::resolve(None, Some(prof));
+        let err = load_warp_profiles(&dirs2).unwrap_err();
+        assert!(
+            err.contains("cannot read") && err.contains("warp.toml"),
+            "fail closed: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&base2);
     }
 }

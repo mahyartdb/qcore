@@ -7,6 +7,7 @@ use qcore_core::api::{Engine, EngineConfig};
 use qcore_core::chain::ExpandedHop;
 use qcore_core::config::import::{store_import, ConfigImport, ImportVerdict};
 use qcore_core::config::profile_dir::ProfileDirs;
+use tests_conformance::testutil::unique_dir;
 use transport_wireguard::test_support::{generate_keypair, WgResponder};
 
 fn b64(data: &[u8]) -> String {
@@ -14,7 +15,7 @@ fn b64(data: &[u8]) -> String {
 }
 
 fn work(name: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("qcore-obf-{name}-{}", std::process::id()));
+    let dir = unique_dir(&format!("qcore-obf-{name}"));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
@@ -203,4 +204,92 @@ async fn unknown_profile_is_rejected_by_name() {
         "names profile: {}",
         err.cause
     );
+}
+
+// --- T7 story 20: aggressive/off paths --------------------------------------
+// Every shipped profile family needs an offline establishment proof, not
+// just the balanced defaults.
+
+#[tokio::test]
+async fn masque_aggressive_on_h2_applies_and_reports() {
+    let dir = work("h2-aggr");
+    let responder =
+        transport_masque::test_support::H2Responder::spawn("127.0.0.1".parse().unwrap())
+            .await
+            .unwrap();
+    let engine = engine_in(&dir);
+    let handle = engine
+        .start(vec![hop(
+            "masque",
+            &format!(
+                "alpn=h2 endpoint={} obfuscation=masque-aggressive",
+                responder.addr
+            ),
+            "mq-aggr-0",
+        )])
+        .await
+        .expect("aggressive masque-h2 establishes");
+    assert_eq!(
+        handle.hop_reports()[0].obfuscation.as_deref(),
+        Some("masque-aggressive")
+    );
+    handle.stop_all().await.expect("clean stop");
+}
+
+#[tokio::test]
+async fn awg_aggressive_on_awg_peer_applies_and_reports() {
+    let dir = work("awg-aggr");
+    let (c_sk, c_pk) = generate_keypair();
+    let (s_sk, s_pk) = generate_keypair();
+    let responder = WgResponder::spawn("127.0.0.1".parse().unwrap(), s_sk, c_pk)
+        .await
+        .unwrap();
+    let r = import_conf(
+        &dir,
+        "awg.conf",
+        &conf_text(&b64(&c_sk), &b64(&s_pk), &responder.addr.to_string(), true),
+    );
+    let engine = engine_in(&dir);
+    let handle = engine
+        .start(vec![hop(
+            "wireguard",
+            &format!("peer=awg import={r} obfuscation=awg-aggressive"),
+            "awg-aggr-0",
+        )])
+        .await
+        .expect("AWG aggressive establishes");
+    assert_eq!(
+        handle.hop_reports()[0].obfuscation.as_deref(),
+        Some("awg-aggressive")
+    );
+    handle.stop_all().await.expect("clean stop");
+}
+
+#[tokio::test]
+async fn awg_off_on_awg_peer_applies_and_reports() {
+    let dir = work("awg-off");
+    let (c_sk, c_pk) = generate_keypair();
+    let (s_sk, s_pk) = generate_keypair();
+    let responder = WgResponder::spawn("127.0.0.1".parse().unwrap(), s_sk, c_pk)
+        .await
+        .unwrap();
+    let r = import_conf(
+        &dir,
+        "awg.conf",
+        &conf_text(&b64(&c_sk), &b64(&s_pk), &responder.addr.to_string(), true),
+    );
+    let engine = engine_in(&dir);
+    let handle = engine
+        .start(vec![hop(
+            "wireguard",
+            &format!("peer=awg import={r} obfuscation=awg-off"),
+            "awg-off-0",
+        )])
+        .await
+        .expect("AWG off establishes");
+    assert_eq!(
+        handle.hop_reports()[0].obfuscation.as_deref(),
+        Some("awg-off")
+    );
+    handle.stop_all().await.expect("clean stop");
 }

@@ -101,3 +101,49 @@ jobs:
           fi
       - name: native smoke
         run: cargo xtask smoke --target native
+
+  # T7 story 16: Windows gate leg running the native subset, so
+  # Windows-only linkage/permission/keyring failures surface on PRs instead
+  # of at tag time. Linux remains the full gate; this leg proves the native
+  # unit/contract suites + offline smoke on MSVC.
+  gate-windows:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: v2-pruned-windows
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.145
+      - name: clippy (windows)
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: unit + contract tests (windows)
+        run: cargo nextest run --workspace --all-features --exclude tests-conformance
+      - name: native smoke (windows)
+        run: cargo xtask smoke --target native
+
+  # T7 story 23: the Go C-ABI consumer sample is exercised here on Linux, so
+  # it cannot silently rot. Windows MSVC/MinGW link paths in
+  # examples/c-abi-consumer/main.go are documented but not CI-gated.
+  go-consumer:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: build FFI release libs
+        run: cargo build -p qcore-ffi --release
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: examples/c-abi-consumer/go.mod
+      - name: run Go C-ABI consumer (mock transport, offline)
+        run: |
+          cd examples/c-abi-consumer
+          CGO_CFLAGS=-I../../crates/qcore-ffi CGO_LDFLAGS="-L../../target/release -lqcore_ffi -ldl -lm -lpthread" go run .

@@ -9,8 +9,15 @@
 //! asserts descriptor/capabilities plus fail-closed wiring (missing
 //! sidecar_path names hop + cause).
 
+use qcore_core::api::Engine;
+use qcore_core::chain::{ChainBuilder, ExpandedHop};
+use qcore_core::registry::TransportRegistry;
 use qcore_transport_api::{HopConfig, HopFactory};
 use std::time::Duration;
+
+fn hop(kind: &str, opts: &str) -> ExpandedHop {
+    ExpandedHop::Hop(Engine::parse_single_hop(kind, opts).expect("spec parses"))
+}
 
 fn tor_cfg() -> HopConfig {
     let mut cfg = HopConfig::new("tor");
@@ -53,11 +60,25 @@ async fn tor_bootstrap_failure_is_fail_closed_and_named() {
     }
 }
 
-#[tokio::test]
-async fn tor_dial_udp_names_relay_insertion() {
-    // dial_udp on a tor dialer is statically rejected; the integration-level
-    // proof (validator rejects bare tor,wireguard) lives in US3 T051.
-    // Here: descriptor-level guarantee dials_udp=false (see descriptor test).
+#[test]
+fn tor_dial_udp_names_relay_insertion() {
+    // dial_udp on a tor dialer is statically rejected (TCP-only transport):
+    // the descriptor guarantees dials_udp=false, and a UDP hop after tor is
+    // rejected at validation naming the relay insertion. Both halves assert
+    // here (mock dials UDP, so tor,mock exercises the rule with only
+    // transports already linked into this binary).
+    let _ = qcore_transports::linked_kinds();
+    assert!(
+        !transport_tor::plugin_descriptor().capabilities.dials_udp,
+        "tor never dials UDP"
+    );
+    let registry = TransportRegistry::global();
+    let err = ChainBuilder::new(&registry, 3)
+        .build(vec![hop("tor", ""), hop("mock", "")])
+        .expect_err("UDP hop after TCP-only tor");
+    let msg = err.to_string();
+    assert!(msg.contains("tor"), "names carrier: {msg}");
+    assert!(msg.contains("insert `relay`"), "names fix: {msg}");
 }
 
 #[test]

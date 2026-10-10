@@ -12,9 +12,10 @@ use qcore_core::identity::renew::renew_role;
 use qcore_core::identity::report::ReportAction;
 use qcore_core::identity::store::IdentityRole;
 use tests_conformance::fixture::{Fixture, FixtureMode};
+use tests_conformance::testutil::{closed_port, unique_dir};
 
 fn work(name: &str) -> ProfileDirs {
-    let dir = std::env::temp_dir().join(format!("qcore-renew-{name}-{}", std::process::id()));
+    let dir = unique_dir(&format!("qcore-renew-{name}"));
     let _ = std::fs::remove_dir_all(&dir);
     ProfileDirs::resolve(Some(dir.join("config")), Some(dir.join("profiles")))
 }
@@ -42,9 +43,10 @@ fn seed_settings(dirs: &ProfileDirs) {
         "# operator customisation\ncustom = true\n",
     )
     .unwrap();
+    let stale = closed_port();
     std::fs::write(
         dirs.endpoints_file(),
-        serde_json::json!({"last_known_good": "127.0.0.1:9"}).to_string(),
+        serde_json::json!({"last_known_good": stale.to_string()}).to_string(),
     )
     .unwrap();
 }

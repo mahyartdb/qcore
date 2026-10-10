@@ -73,6 +73,7 @@ struct GlobalOpts {
     max_depth: Option<u32>,
     timeout_secs: u64,
     quiet: bool,
+    verbose: u8,
 }
 
 fn check_globals(cli: &Cli) -> Result<GlobalOpts, i32> {
@@ -91,6 +92,7 @@ fn check_globals(cli: &Cli) -> Result<GlobalOpts, i32> {
         max_depth: cli.max_depth,
         timeout_secs,
         quiet: cli.quiet,
+        verbose: cli.verbose,
     })
 }
 
@@ -370,15 +372,7 @@ async fn async_main(cli: Cli) -> i32 {
         Commands::Export { import_ref } => cmd::import::run_export(&import_ref, cli.json, &dirs),
         Commands::Legal => help::run(cli.json),
         Commands::External(args) => {
-            run_shortcut(
-                args,
-                cli.json,
-                dirs,
-                cli.config,
-                cli.profile_dir,
-                globals.max_depth,
-            )
-            .await
+            run_shortcut(args, cli.json, dirs, cli.config, cli.profile_dir, &globals).await
         }
         Commands::Connect {
             chain,
@@ -474,7 +468,7 @@ async fn run_shortcut(
     dirs: ProfileDirs,
     config: Option<std::path::PathBuf>,
     profile_dir: Option<std::path::PathBuf>,
-    max_depth: Option<u32>,
+    globals: &GlobalOpts,
 ) -> i32 {
     let engine = cmd::preflight::default_engine(dirs.clone());
     let presets = match qcore_core::chain::preset::resolve_presets(&dirs) {
@@ -485,9 +479,9 @@ async fn run_shortcut(
         }
     };
     let name = args.join(" ");
-    // Shortcuts honor --max-depth like --chain does (validated 1..=5 in
-    // check_globals); default 3 matches the connect default.
-    let max_depth = max_depth.unwrap_or(3);
+    // Shortcuts honor validated globals like --chain does (max-depth
+    // validated 1..=5 in check_globals); default 3 matches connect.
+    let max_depth = globals.max_depth.unwrap_or(3);
     match cmd::shortcuts::resolve(
         &engine,
         &presets,
@@ -512,12 +506,13 @@ async fn run_shortcut(
                 detach: false,
                 bind: None,
                 child: false,
-                scan: false,
+                // Match `connect` default: discovery on unless --no-scan.
+                scan: true,
                 obfuscation: None,
                 globals_max_depth: Some(max_depth),
-                globals_timeout: 30,
-                globals_quiet: false,
-                globals_verbose: 0,
+                globals_timeout: globals.timeout_secs,
+                globals_quiet: globals.quiet,
+                globals_verbose: globals.verbose,
                 globals_dirs: dirs.clone(),
                 globals_config: config,
                 globals_profile_dir: profile_dir,
@@ -919,6 +914,11 @@ fn spawn_detached(o: ConnectOpts) -> i32 {
     if let Some(profile) = o.obfuscation {
         cmd.arg("--obfuscation").arg(profile);
     }
+    // Detached child writes the report itself; forward so --detach keeps
+    // the same --report-out contract as foreground connect.
+    if let Some(r) = o.report_out.as_deref() {
+        cmd.arg("--report-out").arg(r);
+    }
     // Globals survive the re-spawn so the child uses the same dirs/budget.
     if let Some(d) = o.globals_max_depth {
         cmd.arg("--max-depth").arg(d.to_string());
@@ -939,12 +939,17 @@ fn spawn_detached(o: ConnectOpts) -> i32 {
     if o.json {
         cmd.arg("--json");
     }
-    cmd.stdin(std::process::Stdio::null())
-        .stdout(log_file.try_clone().unwrap_or_else(|_| {
-            std::fs::File::create(std::env::temp_dir().join("qcore-null.log"))
-                .expect("temp-dir log fallback is writable when detaching")
-        }))
-        .stderr(log_file);
+    cmd.stdin(std::process::Stdio::null());
+    // Panic-free detach: a failed stdout clone is a typed hop-failure
+    // (exit 3), never .expect()/panic — e.g. unwritable temp log path.
+    let stdout_log = match log_file.try_clone() {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("qcore: cannot clone log {}: {e}", log_path.display());
+            return exit::HOP_FAILURE;
+        }
+    };
+    cmd.stdout(stdout_log).stderr(log_file);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;

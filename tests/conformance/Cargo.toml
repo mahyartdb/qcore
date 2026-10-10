@@ -13,6 +13,7 @@ transport-mock = { version = "0.1.0", package = "qcore-transport-mock", path = "
 transport-masque = { version = "0.1.0", package = "qcore-transport-masque", path = "../../crates/qcore-transports/transport-masque" }
 transport-wireguard = { version = "0.1.0", package = "qcore-transport-wireguard", path = "../../crates/qcore-transports/transport-wireguard" }
 transport-tor = { version = "0.1.0", package = "qcore-transport-tor", path = "../../crates/qcore-transports/transport-tor" }
+transport-relay = { version = "0.1.0", package = "qcore-transport-relay", path = "../../crates/qcore-transports/transport-relay" }
 transport-psiphon = { version = "0.1.0", package = "qcore-transport-psiphon", path = "../../crates/qcore-transports/transport-psiphon" }
 tokio = { workspace = true }
 async-trait = { workspace = true }
@@ -37,6 +38,10 @@ path = "tests/masque.rs"
 [[test]]
 name = "tor_psiphon"
 path = "tests/tor_psiphon.rs"
+
+[[test]]
+name = "relay"
+path = "tests/relay.rs"
 
 [[test]]
 name = "failure_report"

@@ -95,13 +95,19 @@ pub const SHIPPED_SCAN_TOML: &str = include_str!("../../../../profiles/scan.toml
 
 /// Load a named profile: profile-dir `scan.toml` override when present, else
 /// the shipped data. Exactly `turbo`, `balanced`, `stealth` exist; anything
-/// else is an error.
+/// else is an error. A present-but-unreadable override (permissions,
+/// directory, transient IO) fails closed — only `NotFound` (absent file)
+/// falls back to shipped data (mirrors `config::obfuscation::load_profiles`).
 pub fn load_profile(
     dirs: &crate::config::profile_dir::ProfileDirs,
     name: &str,
 ) -> Result<ScanProfile, String> {
     let path = dirs.profile_dir.join("scan.toml");
-    let text = std::fs::read_to_string(&path).unwrap_or_else(|_| SHIPPED_SCAN_TOML.to_string());
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => SHIPPED_SCAN_TOML.to_string(),
+        Err(e) => return Err(format!("scan.toml: cannot read {}: {e}", path.display())),
+    };
     parse_scan_toml(&text, name)
 }
 
@@ -184,27 +190,55 @@ fn parse_scan_toml(text: &str, name: &str) -> Result<ScanProfile, String> {
 /// (data; empty by default — discovery providers plug in here). Capped at
 /// `seeds::MAX_SEEDED_CANDIDATES` (F4): an adversarial profile dir must not
 /// turn one scan into unbounded sockets.
+///
+/// Fail-closed like [`load_profile`]: a present-but-unreadable file or
+/// invalid TOML errors (naming `scan.toml`); only a missing file falls back
+/// to the shipped default (which carries no seeds → empty). A present
+/// `seeds` list with non-socket entries errors naming the entry, so a
+/// typo'd/garbage seed list cannot silently disable discovery.
 pub fn discovery_seeds(
     dirs: &crate::config::profile_dir::ProfileDirs,
     transport: &str,
-) -> Vec<SocketAddr> {
-    let Ok(text) = std::fs::read_to_string(dirs.profile_dir.join("scan.toml")) else {
-        return Vec::new();
+) -> Result<Vec<SocketAddr>, String> {
+    let path = dirs.profile_dir.join("scan.toml");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => SHIPPED_SCAN_TOML.to_string(),
+        Err(e) => return Err(format!("scan.toml: cannot read {}: {e}", path.display())),
     };
-    let Ok(v) = toml::from_str::<toml::Value>(&text) else {
-        return Vec::new();
+    let v: toml::Value = toml::from_str(&text).map_err(|e| format!("scan.toml invalid: {e}"))?;
+    let Some(discovery) = v.get("discovery") else {
+        return Ok(Vec::new());
     };
-    v.get("discovery")
-        .and_then(|d| d.get(transport))
-        .and_then(|t| t.get("seeds"))
-        .and_then(|s| s.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|x| x.as_str()?.parse::<SocketAddr>().ok())
-                .take(seeds::MAX_SEEDED_CANDIDATES)
-                .collect()
+    let discovery = discovery
+        .as_table()
+        .ok_or_else(|| "scan.toml [discovery] must be a table".to_string())?;
+    let Some(entry) = discovery.get(transport) else {
+        return Ok(Vec::new());
+    };
+    let entry = entry
+        .as_table()
+        .ok_or_else(|| format!("scan.toml [discovery.{transport}] must be a table"))?;
+    let Some(seeds) = entry.get("seeds") else {
+        return Ok(Vec::new());
+    };
+    let seeds = seeds
+        .as_array()
+        .ok_or_else(|| format!("scan.toml [discovery.{transport}] `seeds` must be a list"))?;
+    seeds
+        .iter()
+        .take(seeds::MAX_SEEDED_CANDIDATES)
+        .map(|x| {
+            let s = x.as_str().ok_or_else(|| {
+                format!("scan.toml [discovery.{transport}] `seeds` entries must be strings")
+            })?;
+            s.parse::<SocketAddr>().map_err(|_| {
+                format!(
+                    "scan.toml [discovery.{transport}] `seeds` entry `{s}` is not a socket address"
+                )
+            })
         })
-        .unwrap_or_default()
+        .collect()
 }
 
 /// One scan invocation: transport + profile + family + candidates.
@@ -301,23 +335,28 @@ impl Scanner {
             .clamp(5_000, MAX_SCAN_OVERALL_MS);
         let deadline = t0 + std::time::Duration::from_millis(overall_ms);
         let kind = req.profile.probe_kind;
-        let stealth_gap = req.profile.stealth;
+        let stealth = req.profile.stealth;
         let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(limit));
         // Pre-sized (#15): one join per candidate, at most one pass each —
         // no reason to grow these incrementally on large seeded scans.
         // Post-truncate len <= 512, so spawns are bounded (F4).
+        //
+        // Stealth stagger lives inside the spawned tasks (`i * 50 ms`), not
+        // as a serial pre-spawn sleep: the spawn loop itself never awaits,
+        // so all probes are scheduled immediately and their staggers count
+        // down concurrently; the semaphore still bounds in-flight sockets.
+        // A serial pre-spawn sleep adds 50 ms per candidate (25 s at the
+        // 512 cap) plus re-sleeps after every permit wait under contention,
+        // pushing large stealth scans into the overall deadline.
         let mut joins = Vec::with_capacity(cands.len());
-        for addr in cands {
-            if stealth_gap {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
-            let permit = sem
-                .clone()
-                .acquire_owned()
-                .await
-                .map_err(|e| e.to_string())?;
+        for (i, addr) in cands.into_iter().enumerate() {
+            let sem = sem.clone();
             joins.push(tokio::spawn(async move {
-                let _permit = permit;
+                if stealth {
+                    let stagger_ms = (i as u64).saturating_mul(50);
+                    tokio::time::sleep(std::time::Duration::from_millis(stagger_ms)).await;
+                }
+                let _permit = sem.acquire_owned().await.ok()?;
                 probe(addr, kind, budget).await
             }));
         }
@@ -444,6 +483,103 @@ fn rand8() -> [u8; 8] {
         *b = (x.wrapping_mul(0x2545F4914F6CDD1D) >> 56) as u8;
     }
     out
+}
+
+/// Shared scan-request pipeline (T6): winner fast-path, seed expansion,
+/// verify, persist/evict — called by both CLI `scan` and FFI `qcore_scan`
+/// so identical inputs give identical results and cache effects.
+///
+/// - Per-transport winner re-verify (fast path — full scan skipped while
+///   the cached winner answers);
+/// - else full scan over legacy LKG + warp.toml seeds + scan.toml
+///   discovery seeds; winners cached per transport (and legacy LKG).
+///
+/// Verified winners are cached; a fully-failed scan evicts stale state.
+/// Profile loading stays with the caller via [`load_profile`] (T3 owns the
+/// fallback semantics) — this takes an already-loaded profile.
+pub async fn run_scan_request(
+    dirs: &crate::config::profile_dir::ProfileDirs,
+    transport: &str,
+    profile: ScanProfile,
+    family: &str,
+) -> Result<ScanReport, String> {
+    let budget = std::time::Duration::from_millis(profile.rtt_budget_ms.clamp(1, 5000));
+    if let Some((addr, latency_ms)) =
+        cache::verify_winner_first(dirs, transport, family, budget).await
+    {
+        // Fast path: the recorded winner still answers. It was
+        // traffic-verified when recorded; the re-verify confirms continued
+        // reachability, so the Verified verdict stands without a rescan.
+        return Ok(ScanReport {
+            transport: transport.to_string(),
+            profile: profile.name.clone(),
+            ranked: vec![EndpointCandidate {
+                address: addr,
+                family: if addr.is_ipv4() {
+                    "ipv4".to_string()
+                } else {
+                    "ipv6".to_string()
+                },
+                latency_ms,
+                reachability: Reachability::Passed,
+                confidence: Confidence::Verified,
+                last_known_good: true,
+            }],
+            failed: 0,
+            elapsed_ms: latency_ms,
+        });
+    }
+    let mut candidates = Vec::new();
+    if let Some(lkg) = crate::session::reconnect::last_known_good(dirs) {
+        let ok = match family {
+            "ipv4" => lkg.is_ipv4(),
+            "ipv6" => lkg.is_ipv6(),
+            _ => true,
+        };
+        if ok {
+            candidates.push(lkg);
+        }
+    }
+    // Seeded candidates (FR-014): malformed/empty warp data selects nothing
+    // rather than failing the scan — discovery seeds still run.
+    if let Ok(warp) = seeds::load_warp_profiles(dirs) {
+        candidates.extend(seeds::candidates_for(&warp, transport, family));
+    }
+    candidates.extend(discovery_seeds(dirs, transport)?);
+    candidates.sort();
+    candidates.dedup();
+    // F4: scan-wide ceiling (reuses the seeded bound) — the scanner truncates
+    // again defensively, this keeps the pre-scan sort/dedup bounded too.
+    candidates.truncate(seeds::MAX_SEEDED_CANDIDATES);
+    let report = Scanner::scan(ScanRequest {
+        transport: transport.to_string(),
+        profile,
+        family: family.to_string(),
+        candidates,
+    })
+    .await?;
+    if report.ranked.is_empty() {
+        // F1: per-transport eviction — a dead transport must not wipe
+        // siblings' winners.
+        evict_stale_lkg(dirs, transport, &report)?;
+    } else {
+        persist_verified(dirs, &report)?;
+        if let Some(top) = report.ranked.iter().find(|c| {
+            c.confidence == Confidence::Verified && c.reachability == Reachability::Passed
+        }) {
+            let _ = cache::record_winner(
+                dirs,
+                transport,
+                cache::TransportWinner {
+                    address: top.address.to_string(),
+                    profile: report.profile.clone(),
+                    verified_at_ms: crate::identity::model::now_ms(),
+                    family: top.family.clone(),
+                },
+            );
+        }
+    }
+    Ok(report)
 }
 
 /// Persist the top verified candidate as last-known-good (FR-017). Returns
@@ -714,7 +850,7 @@ mod tests {
         }
         seeds.push_str("]\n");
         std::fs::write(d.profile_dir.join("scan.toml"), seeds).unwrap();
-        let got = discovery_seeds(&d, "warp");
+        let got = discovery_seeds(&d, "warp").expect("seeds load");
         assert!(
             got.len() <= seeds::MAX_SEEDED_CANDIDATES,
             "discovery capped to {}, got {}",
@@ -722,5 +858,138 @@ mod tests {
             got.len()
         );
         let _ = std::fs::remove_dir_all(&d.config_dir);
+    }
+
+    /// T3: `load_profile` fails closed on corrupt/unreadable overrides
+    /// (naming `scan.toml`); only a missing file falls back to shipped data
+    /// (mirrors `config::obfuscation` loader semantics).
+    #[test]
+    fn load_profile_fail_closed_only_not_found_falls_back() {
+        // Absent file falls back to the shipped default.
+        let d = evict_dirs("profile-missing");
+        let b = load_profile(&d, "balanced").expect("missing falls back");
+        assert_eq!(b.concurrency, 32);
+        // Corrupt TOML fails closed naming the file.
+        let d = evict_dirs("profile-corrupt");
+        std::fs::write(d.profile_dir.join("scan.toml"), "[[[not toml").unwrap();
+        let err = load_profile(&d, "balanced").unwrap_err();
+        assert!(
+            err.contains("scan.toml"),
+            "corrupt override names the file: {err}"
+        );
+        // Present-but-unreadable (a directory at the file path) fails closed
+        // instead of silently using shipped data.
+        let d = evict_dirs("profile-unreadable");
+        std::fs::create_dir_all(d.profile_dir.join("scan.toml")).unwrap();
+        let err = load_profile(&d, "balanced").unwrap_err();
+        assert!(
+            err.contains("cannot read") && err.contains("scan.toml"),
+            "unreadable override fails closed: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&d.config_dir);
+    }
+
+    /// T3: `discovery_seeds` is explicit — missing file (shipped default
+    /// carries no seeds) is `Ok(empty)`, while corrupt/unreadable files and
+    /// malformed `seeds` lists error naming the field, so an adversarial
+    /// profile dir cannot silently disable discovery.
+    #[test]
+    fn discovery_seeds_fail_closed_only_not_found_falls_back() {
+        // Missing file → shipped default → no seeds, still Ok.
+        let d = evict_dirs("seeds-missing");
+        assert!(discovery_seeds(&d, "warp")
+            .expect("missing → empty")
+            .is_empty());
+        // Valid seeds parse.
+        let d = evict_dirs("seeds-valid");
+        std::fs::write(
+            d.profile_dir.join("scan.toml"),
+            "[discovery.warp]\nseeds = [\"127.0.0.1:2408\"]\n",
+        )
+        .unwrap();
+        let got = discovery_seeds(&d, "warp").expect("valid seeds load");
+        assert_eq!(got, vec!["127.0.0.1:2408".parse().unwrap()]);
+        // Corrupt TOML fails closed naming the file.
+        let d = evict_dirs("seeds-corrupt");
+        std::fs::write(d.profile_dir.join("scan.toml"), "[[[not toml").unwrap();
+        let err = discovery_seeds(&d, "warp").unwrap_err();
+        assert!(
+            err.contains("scan.toml"),
+            "corrupt file names scan.toml: {err}"
+        );
+        // Present-but-unreadable fails closed, no silent empty.
+        let d = evict_dirs("seeds-unreadable");
+        std::fs::create_dir_all(d.profile_dir.join("scan.toml")).unwrap();
+        let err = discovery_seeds(&d, "warp").unwrap_err();
+        assert!(
+            err.contains("cannot read") && err.contains("scan.toml"),
+            "unreadable file fails closed: {err}"
+        );
+        // A present `seeds` list with a garbage entry errors naming `seeds`
+        // instead of silently dropping the entry (or the whole list).
+        let d = evict_dirs("seeds-bad-entry");
+        std::fs::write(
+            d.profile_dir.join("scan.toml"),
+            "[discovery.warp]\nseeds = [\"127.0.0.1:2408\", \"not-an-addr\"]\n",
+        )
+        .unwrap();
+        let err = discovery_seeds(&d, "warp").unwrap_err();
+        assert!(err.contains("seeds"), "bad entry names the field: {err}");
+        // `seeds` of the wrong shape errors too.
+        let d = evict_dirs("seeds-not-a-list");
+        std::fs::write(
+            d.profile_dir.join("scan.toml"),
+            "[discovery.warp]\nseeds = \"127.0.0.1:2408\"\n",
+        )
+        .unwrap();
+        let err = discovery_seeds(&d, "warp").unwrap_err();
+        assert!(
+            err.contains("seeds"),
+            "non-list seeds names the field: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&d.config_dir);
+    }
+
+    /// T3: a 100-candidate stealth scan staggers inside the spawned tasks, so
+    /// it completes well under the overall deadline. The stagger is
+    /// preserved (elapsed reflects the ~5 s tail), just no longer serialized
+    /// through the spawn loop.
+    #[tokio::test]
+    async fn stealth_hundred_candidates_fits_deadline() {
+        let closed: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let profile = ScanProfile {
+            name: "stealth".to_string(),
+            concurrency: 8,
+            rtt_budget_ms: 200,
+            probe_kind: ProbeKind::Handshake,
+            family_order: vec!["ipv4".to_string()],
+            stealth: true,
+        };
+        let t0 = std::time::Instant::now();
+        let report = Scanner::scan(ScanRequest {
+            transport: "warp".into(),
+            profile,
+            family: "ipv4".into(),
+            candidates: vec![closed; 100],
+        })
+        .await
+        .expect("scan runs");
+        assert_eq!(report.failed, 100);
+        // Stagger preserved: the last task sleeps 99 * 50 ms before probing.
+        assert!(
+            report.elapsed_ms >= 4_500,
+            "stealth stagger preserved, got {} ms",
+            report.elapsed_ms
+        );
+        // …but the scan fits well inside the 30 s overall deadline.
+        assert!(
+            report.elapsed_ms < MAX_SCAN_OVERALL_MS,
+            "overall deadline holds: {} ms",
+            report.elapsed_ms
+        );
+        assert!(
+            t0.elapsed().as_millis() < 20_000,
+            "100-candidate stealth scan completes well under deadline"
+        );
     }
 }

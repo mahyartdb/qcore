@@ -10,9 +10,10 @@ use qcore_core::scan::{
 };
 use std::net::SocketAddr;
 use std::time::Instant;
+use tests_conformance::testutil::{closed_port, unique_dir};
 
 fn dirs(name: &str) -> ProfileDirs {
-    let dir = std::env::temp_dir().join(format!("qcore-scan-{name}-{}", std::process::id()));
+    let dir = unique_dir(&format!("qcore-scan-{name}"));
     let _ = std::fs::remove_dir_all(&dir);
     let d = ProfileDirs::resolve(Some(dir.join("cfg")), Some(dir.join("prof")));
     d.ensure_dirs().unwrap();
@@ -39,10 +40,6 @@ async fn echo_listener() -> SocketAddr {
         }
     });
     addr
-}
-
-fn closed_port() -> SocketAddr {
-    "127.0.0.1:1".parse().unwrap()
 }
 
 #[test]
@@ -138,9 +135,10 @@ async fn verified_scan_caches_last_known_good_for_reconnect() {
 async fn empty_scan_exits_4_with_no_silent_reuse() {
     let d = dirs("empty");
     // A stale LKG that no longer answers must be evicted, not reused.
+    let stale = closed_port();
     std::fs::write(
         d.endpoints_file(),
-        serde_json::json!({"last_known_good": "127.0.0.1:1"}).to_string(),
+        serde_json::json!({"last_known_good": stale.to_string()}).to_string(),
     )
     .unwrap();
     let profile = load_profile(&d, "balanced").unwrap();
@@ -225,7 +223,7 @@ async fn per_transport_winner_reverified_first() {
 #[tokio::test]
 async fn dead_winner_evicts_instead_of_reuse() {
     let d = dirs("evict");
-    let dead: SocketAddr = "127.0.0.1:1".parse().unwrap();
+    let dead: SocketAddr = closed_port();
     record_winner(&d, "warp", winner_for(dead)).expect("records");
 
     // Dead winner: miss + eviction, so the caller runs a full scan.

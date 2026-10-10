@@ -5,6 +5,7 @@
 use qcore_core::api::{Engine, EngineConfig};
 use qcore_core::chain::ExpandedHop;
 use std::time::Duration;
+use tests_conformance::testutil::unique_dir;
 use transport_mock::stub_peer::StubPeer;
 
 fn engine_in(dir: &std::path::Path) -> Engine {
@@ -16,7 +17,7 @@ fn engine_in(dir: &std::path::Path) -> Engine {
 }
 
 async fn roundtrip_on(family: &str, stub_mode: &str) {
-    let work = std::env::temp_dir().join(format!("qcore-single-{family}-{}", std::process::id()));
+    let work = unique_dir(&format!("qcore-single-{family}"));
     let engine = engine_in(&work);
     let stub = StubPeer::bind(stub_mode).await.unwrap();
     let dst = stub.udp_addrs[0];

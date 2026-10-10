@@ -9,9 +9,10 @@ use qcore_core::config::profile_dir::ProfileDirs;
 use qcore_core::scan::seeds::{candidates_for, load_warp_profiles};
 use qcore_core::scan::{ProbeKind, ScanProfile, ScanRequest, Scanner};
 use std::net::SocketAddr;
+use tests_conformance::testutil::{closed_port, unique_dir};
 
 fn work(name: &str) -> ProfileDirs {
-    let dir = std::env::temp_dir().join(format!("qcore-seed-{name}-{}", std::process::id()));
+    let dir = unique_dir(&format!("qcore-seed-{name}"));
     let _ = std::fs::remove_dir_all(&dir);
     let d = ProfileDirs::resolve(Some(dir.join("config")), Some(dir.join("profiles")));
     d.ensure_dirs().unwrap();
@@ -66,13 +67,14 @@ fn test_profile() -> ScanProfile {
 async fn seeded_scan_ranks_verified_by_rtt() {
     let d = work("rank");
     let live = echo_listener().await;
-    write_warp_toml(&d, live, 1);
+    let dead = closed_port();
+    write_warp_toml(&d, live, dead.port());
     let profiles = load_warp_profiles(&d).expect("override loads");
 
     // Seeded candidates: live echo × its port + dead port; closed port dies.
     let cands = candidates_for(&profiles, "warp", "ipv4");
     assert!(cands.contains(&live), "seed × port expands: {cands:?}");
-    assert!(cands.contains(&"127.0.0.1:1".parse().unwrap()));
+    assert!(cands.contains(&dead));
 
     let report = Scanner::scan(ScanRequest {
         transport: "warp".into(),
@@ -96,7 +98,8 @@ async fn seeded_scan_ranks_verified_by_rtt() {
 async fn candidate_selection_covers_families_and_transports() {
     let d = work("families");
     let live = echo_listener().await;
-    write_warp_toml(&d, live, 1);
+    let dead = closed_port();
+    write_warp_toml(&d, live, dead.port());
     let profiles = load_warp_profiles(&d).expect("override loads");
 
     // wireguard/gool resolve to the warp section; masque to its own.

@@ -21,7 +21,7 @@ fn take_string(ptr: *mut c_char) -> String {
 }
 
 fn config_json() -> CString {
-    let dir = std::env::temp_dir().join("qcore-abi-consumer");
+    let dir = tests_conformance::testutil::unique_dir("qcore-abi-consumer");
     let _ = std::fs::remove_dir_all(&dir);
     CString::new(
         serde_json::json!({

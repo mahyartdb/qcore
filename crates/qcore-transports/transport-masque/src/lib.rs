@@ -75,7 +75,7 @@ impl qcore_transport_api::HopFactory for MasqueFactory {
                 )
             })?;
         let insecure = cfg.get("insecure_skip_verify") == Some("true");
-        let fragment = obfuscate::fragment_size(&cfg);
+        let fragment = obfuscate::fragment_size(&cfg)?;
         match alpn {
             "h3" => MasqueHop::bring_up_h3(hop_id, endpoint, insecure, carrier).await,
             "h2" => MasqueHop::bring_up_h2(hop_id, endpoint, carrier, fragment).await,

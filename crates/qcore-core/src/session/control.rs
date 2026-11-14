@@ -11,8 +11,8 @@
 use crate::config::profile_dir::ProfileDirs;
 use crate::session::report::ConnectionReport;
 use serde::{Deserialize, Serialize};
-use std::io::{BufRead, BufReader, Write};
-use std::time::Duration;
+use std::io::{Read, Write};
+use std::time::{Duration, Instant};
 use tokio::io::AsyncBufReadExt;
 
 /// How long `status`/`stop` wait for the control channel before failing
@@ -21,11 +21,21 @@ pub const CONTROL_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Persisted rendezvous: where the session process listens and the token it
 /// demands. Written after a successful start, removed on stop.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ControlInfo {
     pub port: u16,
     pub token: String,
     pub pid: u32,
+}
+
+impl std::fmt::Debug for ControlInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ControlInfo")
+            .field("port", &self.port)
+            .field("token", &"<redacted>")
+            .field("pid", &self.pid)
+            .finish()
+    }
 }
 
 pub fn control_file(dirs: &ProfileDirs) -> std::path::PathBuf {
@@ -150,7 +160,10 @@ pub async fn serve_control_shared(
             res = listener.accept() => {
                 let (stream, _) = match res {
                     Ok(v) => v,
-                    Err(_) => continue,
+                    Err(_) => {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
                 };
                 let token = token.clone();
                 let report = report.clone();
@@ -211,9 +224,13 @@ async fn handle_shared(
         // STOP consumes the sender exactly once; further STOPs get ERR.
         let mut slot = stopped.lock().await;
         if let Some(tx) = slot.take() {
-            let _ = tx.send(());
-            shutdown.notify_one();
-            "OK STOPPED\n".to_string()
+            if tx.send(()).is_ok() {
+                shutdown.notify_one();
+                "OK STOPPED\n".to_string()
+            } else {
+                shutdown.notify_one();
+                "ERR supervisor gone; stop signal lost\n".to_string()
+            }
         } else {
             "ERR already stopping\n".to_string()
         }
@@ -224,14 +241,71 @@ async fn handle_shared(
     let _ = w.write_all(reply.as_bytes()).await;
 }
 
+/// Client read budget: overall reply deadline from connect, plus a
+/// per-read cap. `read` loops internally on short reads, so a per-read
+/// timeout alone never bounds total time; the deadline does.
+const CLIENT_REPLY_DEADLINE: Duration = Duration::from_secs(3);
+const CLIENT_PER_READ_CAP: Duration = Duration::from_secs(2);
+/// Reply ceiling: a control reply is one short line; anything larger is a
+/// runaway peer, not a protocol message.
+const MAX_REPLY_BYTES: usize = 64 * 1024;
+
+/// Read one newline-terminated reply under the overall deadline, into a
+/// fixed buffer. Deadline exceeded or the 64 KiB cap hit fails closed
+/// naming the control channel.
+fn read_reply_line(stream: &mut std::net::TcpStream, deadline: Instant) -> std::io::Result<String> {
+    let mut raw: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "control channel reply exceeded the deadline",
+            ));
+        }
+        let remaining = deadline - now;
+        stream.set_read_timeout(Some(remaining.min(CLIENT_PER_READ_CAP)))?;
+        let n = match stream.read(&mut chunk) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "control channel closed before a full reply",
+                ));
+            }
+            Ok(n) => n,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "control channel reply timed out",
+                ));
+            }
+            Err(e) => return Err(e),
+        };
+        if let Some(pos) = chunk[..n].iter().position(|&b| b == b'\n') {
+            raw.extend_from_slice(&chunk[..pos]);
+            return Ok(String::from_utf8_lossy(&raw).into_owned());
+        }
+        raw.extend_from_slice(&chunk[..n]);
+        if raw.len() > MAX_REPLY_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "control channel reply exceeded the size cap",
+            ));
+        }
+    }
+}
+
 /// Blocking STATUS query. Ok(report JSON) on live, Err(kind) otherwise:
 /// `NotConnected` (refused/timeout: process dead) vs `Unverifiable`.
 pub fn query_status(addr: std::net::SocketAddr, token: &str) -> std::io::Result<String> {
+    let deadline = Instant::now() + CLIENT_REPLY_DEADLINE;
     let mut stream = std::net::TcpStream::connect_timeout(&addr, CONTROL_TIMEOUT)?;
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     stream.write_all(format!("STATUS {token}\n").as_bytes())?;
-    let mut line = String::new();
-    BufReader::new(&stream).read_line(&mut line)?;
+    let line = read_reply_line(&mut stream, deadline)?;
     line.strip_prefix("OK ")
         .map(|s| s.trim_end().to_string())
         .ok_or_else(|| {
@@ -244,11 +318,10 @@ pub fn query_status(addr: std::net::SocketAddr, token: &str) -> std::io::Result<
 
 /// Blocking STOP command. Ok(()) when the session acknowledged stopping.
 pub fn send_stop(addr: std::net::SocketAddr, token: &str) -> std::io::Result<()> {
+    let deadline = Instant::now() + CLIENT_REPLY_DEADLINE;
     let mut stream = std::net::TcpStream::connect_timeout(&addr, CONTROL_TIMEOUT)?;
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     stream.write_all(format!("STOP {token}\n").as_bytes())?;
-    let mut line = String::new();
-    BufReader::new(&stream).read_line(&mut line)?;
+    let line = read_reply_line(&mut stream, deadline)?;
     if line.starts_with("OK") {
         Ok(())
     } else {
@@ -265,6 +338,62 @@ mod tests {
 
     fn is_hex32(s: &str) -> bool {
         s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit())
+    }
+
+    #[test]
+    fn control_info_debug_redacts_token() {
+        let token = new_token();
+        let info = ControlInfo {
+            port: 12730,
+            token: token.clone(),
+            pid: 4242,
+        };
+        let dbg = format!("{info:?}");
+        assert!(
+            !dbg.contains(&token),
+            "Debug must not leak the token: {dbg}"
+        );
+        assert!(dbg.contains("<redacted>"), "token field redacted: {dbg}");
+        assert!(dbg.contains("12730"), "port printed normally: {dbg}");
+        assert!(dbg.contains("4242"), "pid printed normally: {dbg}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_when_supervisor_receiver_dropped_replies_err() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let token = new_token();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        drop(rx);
+        tokio::spawn(serve_control(
+            listener,
+            token.clone(),
+            ConnectionReport::new(Vec::new(), "exit".to_string()),
+            tx,
+        ));
+        send_stop(addr, &token).expect_err("receiver-dropped STOP must not report OK");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_with_live_supervisor_replies_ok_and_resolves() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let token = new_token();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let report = std::sync::Arc::new(tokio::sync::RwLock::new(ConnectionReport::new(
+            Vec::new(),
+            "exit".to_string(),
+        )));
+        tokio::spawn(serve_control_shared(listener, token.clone(), report, tx));
+        send_stop(addr, &token).expect("live supervisor STOP replies OK");
+        tokio::time::timeout(std::time::Duration::from_secs(2), rx)
+            .await
+            .expect("stop signal resolved")
+            .expect("sender alive");
     }
 
     #[test]

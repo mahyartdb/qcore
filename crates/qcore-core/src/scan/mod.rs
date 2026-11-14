@@ -2,6 +2,17 @@
 //!
 //! Full `Scanner::scan` implementation lands in US4 (T066); types live here so
 //! the session reconnect sink (US1 T048) can consume candidates.
+//!
+//! Probe honesty: the data-plane probe is a TCP connect+echo exchange, so
+//! data-plane verification covers TCP-probeable transports only (a
+//! transport whose descriptor sets `Capabilities::accepts_tcp_carrier` —
+//! its endpoint terminates a TCP stream). Endpoints of transports that ride
+//! UDP only can never pass a TCP probe; they are verified by successful
+//! session bring-up instead. The winner cache honors this: a cached winner
+//! of a non-TCP-probeable transport misses WITHOUT eviction on the fast-path
+//! re-verify (`cache::verify_winner_first`), so a TCP refusal can never
+//! destroy a healthy UDP winner. Eviction on probe failure stays for
+//! TCP-probeable transports.
 
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -252,31 +263,45 @@ pub struct ScanRequest {
 }
 
 /// Ranked scan outcome: `ranked` holds passed candidates best-first; failed
-/// endpoints are counted and discarded, never reused.
+/// endpoints are counted and discarded, never reused. `family` is the
+/// family the scan was scoped to (never `"dual"` after validation): cache
+/// eviction decisions are family-aware because a family-scoped empty scan
+/// must not destroy sibling-family winners it never probed.
 #[derive(Debug, Clone)]
 pub struct ScanReport {
     pub transport: String,
     pub profile: String,
+    pub family: String,
     pub ranked: Vec<EndpointCandidate>,
     pub failed: usize,
     pub elapsed_ms: u64,
 }
 
 /// Scan failure: empty means nothing reachable (exit 4, never silent reuse).
+/// `NonEmpty` reports a caller bug (asking for an error on a passing scan) —
+/// it names the discrepancy instead of lying with `Empty`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanError {
     Empty,
+    NonEmpty,
 }
 
 impl ScanError {
+    /// Honest classification of a report: only a verified-empty report is
+    /// `Empty` (exit 4); anything else is a caller-contract violation
+    /// (`NonEmpty`) — the error never ignores its input.
     pub fn for_report(report: &ScanReport) -> Self {
-        let _ = report;
-        ScanError::Empty
+        if report.ranked.is_empty() {
+            ScanError::Empty
+        } else {
+            ScanError::NonEmpty
+        }
     }
 
     pub fn exit_code(&self) -> i32 {
         match self {
             ScanError::Empty => 4,
+            ScanError::NonEmpty => 6,
         }
     }
 }
@@ -285,6 +310,9 @@ impl std::fmt::Display for ScanError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ScanError::Empty => write!(f, "scan found nothing reachable (exit 4)"),
+            ScanError::NonEmpty => {
+                write!(f, "scan error requested for a non-empty report (exit 6)")
+            }
         }
     }
 }
@@ -389,12 +417,16 @@ impl Scanner {
         Ok(ScanReport {
             transport: req.transport,
             profile: req.profile.name,
+            family: req.family,
             ranked,
             failed,
             elapsed_ms: t0.elapsed().as_millis() as u64,
         })
     }
 }
+
+/// Canonical scan family: exactly `ipv4`, `ipv6`, `dual`.
+pub const SCAN_FAMILIES: &[&str] = &["ipv4", "ipv6", "dual"];
 
 fn family_of(addr: SocketAddr) -> String {
     if addr.is_ipv4() {
@@ -405,10 +437,17 @@ fn family_of(addr: SocketAddr) -> String {
 }
 
 fn family_matches(family: &str, addr: SocketAddr) -> bool {
+    if family == "dual" {
+        return true;
+    }
     match family {
         "ipv4" => addr.is_ipv4(),
         "ipv6" => addr.is_ipv6(),
-        _ => true,
+        // Unknown strings filter everything (fail closed): callers validate
+        // against SCAN_FAMILIES first, so reaching here means a caller
+        // bypassed validation and the sieve must select nothing rather than
+        // silently scan "everything" for a typo'd family.
+        _ => false,
     }
 }
 
@@ -494,15 +533,25 @@ fn rand8() -> [u8; 8] {
 /// - else full scan over legacy LKG + warp.toml seeds + scan.toml
 ///   discovery seeds; winners cached per transport (and legacy LKG).
 ///
-/// Verified winners are cached; a fully-failed scan evicts stale state.
-/// Profile loading stays with the caller via [`load_profile`] (T3 owns the
-/// fallback semantics) — this takes an already-loaded profile.
+/// Verified winners are cached; a fully-failed scan evicts stale state
+/// (family-aware: a family-scoped empty scan never evicts a sibling-family
+/// winner it never probed). Profile loading stays with the caller via
+/// [`load_profile`] (T3 owns the fallback semantics) — this takes an
+/// already-loaded profile. `family` must be exactly one of
+/// [`SCAN_FAMILIES`]; unknown values are rejected naming the field so a
+/// typo'd family cannot silently scan "everything" (`family_matches` stays
+/// fail-closed too, so both layers reject).
 pub async fn run_scan_request(
     dirs: &crate::config::profile_dir::ProfileDirs,
     transport: &str,
     profile: ScanProfile,
     family: &str,
 ) -> Result<ScanReport, String> {
+    if !SCAN_FAMILIES.contains(&family) {
+        return Err(format!(
+            "scan family `{family}` is unknown: family must be one of ipv4|ipv6|dual"
+        ));
+    }
     let budget = std::time::Duration::from_millis(profile.rtt_budget_ms.clamp(1, 5000));
     if let Some((addr, latency_ms)) =
         cache::verify_winner_first(dirs, transport, family, budget).await
@@ -513,6 +562,7 @@ pub async fn run_scan_request(
         return Ok(ScanReport {
             transport: transport.to_string(),
             profile: profile.name.clone(),
+            family: family.to_string(),
             ranked: vec![EndpointCandidate {
                 address: addr,
                 family: if addr.is_ipv4() {
@@ -541,10 +591,12 @@ pub async fn run_scan_request(
         }
     }
     // Seeded candidates (FR-014): malformed/empty warp data selects nothing
-    // rather than failing the scan — discovery seeds still run.
-    if let Ok(warp) = seeds::load_warp_profiles(dirs) {
-        candidates.extend(seeds::candidates_for(&warp, transport, family));
-    }
+    // rather than failing the scan — discovery seeds still run. A
+    // present-but-broken override fails closed (naming warp.toml): silently
+    // disabling warp seeding on a corrupt file is not "empty data", it is a
+    // broken source (same fail-closed semantics as discovery_seeds below).
+    let warp = seeds::load_warp_profiles(dirs)?;
+    candidates.extend(seeds::candidates_for(&warp, transport, family));
     candidates.extend(discovery_seeds(dirs, transport)?);
     candidates.sort();
     candidates.dedup();
@@ -561,13 +613,13 @@ pub async fn run_scan_request(
     if report.ranked.is_empty() {
         // F1: per-transport eviction — a dead transport must not wipe
         // siblings' winners.
-        evict_stale_lkg(dirs, transport, &report)?;
+        evict_stale_lkg_async(dirs, transport, &report).await?;
     } else {
-        persist_verified(dirs, &report)?;
+        persist_verified_async(dirs, &report).await?;
         if let Some(top) = report.ranked.iter().find(|c| {
             c.confidence == Confidence::Verified && c.reachability == Reachability::Passed
         }) {
-            let _ = cache::record_winner(
+            let _ = cache::record_winner_async(
                 dirs,
                 transport,
                 cache::TransportWinner {
@@ -576,7 +628,8 @@ pub async fn run_scan_request(
                     verified_at_ms: crate::identity::model::now_ms(),
                     family: top.family.clone(),
                 },
-            );
+            )
+            .await;
         }
     }
     Ok(report)
@@ -585,6 +638,7 @@ pub async fn run_scan_request(
 /// Persist the top verified candidate as last-known-good (FR-017). Returns
 /// the cached address, or `None` when nothing verified exists — uncertain
 /// results are never promoted. Reader half is the T048 reconnect sink.
+/// Blocking; async callers use [`persist_verified_async`].
 pub fn persist_verified(
     dirs: &crate::config::profile_dir::ProfileDirs,
     report: &ScanReport,
@@ -603,11 +657,33 @@ pub fn persist_verified(
     Ok(Some(top.address))
 }
 
+/// Async spelling of [`persist_verified`]: the locked RMW + fs write runs
+/// on the blocking pool (never on the calling executor thread).
+pub async fn persist_verified_async(
+    dirs: &crate::config::profile_dir::ProfileDirs,
+    report: &ScanReport,
+) -> Result<Option<SocketAddr>, String> {
+    let top = report
+        .ranked
+        .iter()
+        .find(|c| c.confidence == Confidence::Verified && c.reachability == Reachability::Passed);
+    let Some(top) = top else {
+        return Ok(None);
+    };
+    dirs.ensure_dirs().map_err(|e| e.to_string())?;
+    cache::persist_last_known_good_async(dirs, top.address).await?;
+    Ok(Some(top.address))
+}
+
 /// Drop a stale last-known-good after a scan that passed nothing (FR-016:
 /// failed endpoints are discarded and not reused — no silent reuse).
 /// Per-transport (F1): only `transport`'s winner is dropped; siblings survive.
-/// The legacy `last_known_good` follows a remaining winner, cleared only when
-/// no winners remain.
+/// Family-aware: a family-scoped empty scan never probed the sibling family
+/// (`Scanner::scan` filters candidates and the winner fast-path misses
+/// without probing on family mismatch), so a stored winner of a different
+/// family is kept — only `"dual"` scans (which probe both families) may
+/// evict across families. Blocking; async callers use
+/// [`evict_stale_lkg_async`].
 pub fn evict_stale_lkg(
     dirs: &crate::config::profile_dir::ProfileDirs,
     transport: &str,
@@ -616,7 +692,20 @@ pub fn evict_stale_lkg(
     if !report.ranked.is_empty() {
         return Ok(());
     }
-    cache::evict_stale_transport(dirs, transport)
+    cache::evict_stale_transport(dirs, transport, &report.family)
+}
+
+/// Async spelling of [`evict_stale_lkg`]: the locked RMW + fs write runs on
+/// the blocking pool (never on the calling executor thread).
+pub async fn evict_stale_lkg_async(
+    dirs: &crate::config::profile_dir::ProfileDirs,
+    transport: &str,
+    report: &ScanReport,
+) -> Result<(), String> {
+    if !report.ranked.is_empty() {
+        return Ok(());
+    }
+    cache::evict_stale_transport_async(dirs, transport, &report.family).await
 }
 
 #[cfg(test)]
@@ -719,9 +808,14 @@ mod tests {
     }
 
     fn empty_report(transport: &str) -> ScanReport {
+        empty_report_family(transport, "dual")
+    }
+
+    fn empty_report_family(transport: &str, family: &str) -> ScanReport {
         ScanReport {
             transport: transport.to_string(),
             profile: "balanced".to_string(),
+            family: family.to_string(),
             ranked: Vec::new(),
             failed: 1,
             elapsed_ms: 0,
@@ -775,6 +869,51 @@ mod tests {
         evict_stale_lkg(&d, "warp", &report).expect("evict runs");
         assert!(cache::read_winners(&d).contains_key("warp"));
         let _ = std::fs::remove_dir_all(&d.config_dir);
+    }
+
+    /// F1: a family-scoped empty scan never evicts a sibling-family winner —
+    /// the ipv4 winner was never probed by an `--family ipv6` scan (family
+    /// filtering happens before probing), so its death is unproven.
+    #[test]
+    fn family_scoped_empty_scan_keeps_sibling_family_winner() {
+        let d = evict_dirs("family-scoped");
+        cache::record_winner(&d, "warp", evict_winner("127.0.0.1:2408")).unwrap();
+        evict_stale_lkg(&d, "warp", &empty_report_family("warp", "ipv6")).expect("evict runs");
+        let map = cache::read_winners(&d);
+        assert_eq!(
+            map.get("warp").map(|w| w.address.as_str()),
+            Some("127.0.0.1:2408"),
+            "ipv4 winner survives an empty ipv6-family scan: {map:?}"
+        );
+        // A dual-family scan probed both families: eviction applies.
+        evict_stale_lkg(&d, "warp", &empty_report("warp")).expect("evict runs");
+        assert!(
+            !cache::read_winners(&d).contains_key("warp"),
+            "dual scan evicts the probed winner"
+        );
+        let _ = std::fs::remove_dir_all(&d.config_dir);
+    }
+
+    /// FIX 9: `for_report` is honest — an empty report is `Empty`, a
+    /// non-empty report is never misclassified (the old impl ignored its
+    /// argument and always returned `Empty`).
+    #[test]
+    fn for_report_is_honest_about_emptiness() {
+        assert_eq!(
+            ScanError::for_report(&empty_report("warp")),
+            ScanError::Empty
+        );
+        let mut report = empty_report("warp");
+        report
+            .ranked
+            .push(cand(10, Confidence::Verified, Reachability::Passed));
+        assert_eq!(
+            ScanError::for_report(&report),
+            ScanError::NonEmpty,
+            "non-empty report must not claim Empty"
+        );
+        assert_eq!(ScanError::Empty.exit_code(), 4);
+        assert_eq!(ScanError::NonEmpty.exit_code(), 6);
     }
 
     /// F4: 10k candidates are capped at `MAX_SEEDED_CANDIDATES` (512) — not
@@ -857,6 +996,64 @@ mod tests {
             seeds::MAX_SEEDED_CANDIDATES,
             got.len()
         );
+        let _ = std::fs::remove_dir_all(&d.config_dir);
+    }
+
+    /// FIX 4: `family_matches` is fail-closed for unknown strings — the old
+    /// wildcard (`_ => true`) made "ip4"/"IPv4" scan *everything*. `dual`
+    /// still matches both families; validated callers never reach the
+    /// unknown arm, and if one does, the sieve selects nothing.
+    #[test]
+    fn family_matches_fail_closed_on_unknown_strings() {
+        let v4: std::net::SocketAddr = "192.0.2.1:51820".parse().unwrap();
+        let v6: std::net::SocketAddr = "[2001:db8::1]:51820".parse().unwrap();
+        assert!(family_matches("dual", v4) && family_matches("dual", v6));
+        assert!(family_matches("ipv4", v4) && !family_matches("ipv4", v6));
+        assert!(family_matches("ipv6", v6) && !family_matches("ipv6", v4));
+        for typo in ["ip4", "IPv4", "IPV6", "", "bogus"] {
+            assert!(
+                !family_matches(typo, v4) && !family_matches(typo, v6),
+                "unknown family `{typo}` must filter, not match-all"
+            );
+        }
+    }
+
+    /// FIX 4: `run_scan_request` rejects unknown families naming the field,
+    /// before any probe or cache mutation.
+    #[tokio::test]
+    async fn unknown_family_rejected_naming_field() {
+        let d = evict_dirs("family-unknown");
+        cache::record_winner(&d, "warp", evict_winner("127.0.0.1:2408")).unwrap();
+        let profile = load_profile(&d, "balanced").expect("profile loads");
+        for family in ["ip4", "IPv4", "bogus", ""] {
+            let err = run_scan_request(&d, "warp", profile.clone(), family)
+                .await
+                .expect_err("unknown family rejected");
+            assert!(
+                err.contains("family") && err.contains("ipv4|ipv6|dual"),
+                "error names the field: {err}"
+            );
+        }
+        // Rejection happens before any cache mutation: the winner survives.
+        assert!(
+            cache::read_winners(&d).contains_key("warp"),
+            "family validation precedes cache writes"
+        );
+        let _ = std::fs::remove_dir_all(&d.config_dir);
+    }
+
+    /// FIX 3: a corrupt warp.toml override fails the scan closed (naming
+    /// warp.toml) instead of silently disabling warp seeding — the old
+    /// `if let Ok(warp)` swallow turned a broken source into "empty data".
+    #[tokio::test]
+    async fn corrupt_warp_override_fails_closed() {
+        let d = evict_dirs("warp-corrupt");
+        std::fs::write(d.profile_dir.join("warp.toml"), "[[[not toml").unwrap();
+        let profile = load_profile(&d, "balanced").expect("profile loads");
+        let err = run_scan_request(&d, "warp", profile, "dual")
+            .await
+            .expect_err("corrupt warp.toml fails closed");
+        assert!(err.contains("warp.toml"), "error names warp.toml: {err}");
         let _ = std::fs::remove_dir_all(&d.config_dir);
     }
 

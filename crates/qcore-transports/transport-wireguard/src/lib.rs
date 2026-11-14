@@ -35,6 +35,12 @@ use crate::stream::FrameSender;
 /// (~140 MB growth).
 pub const EGRESS_QUEUE_CAP: usize = 1024;
 
+/// Largest channel-frame length the datagram gate accepts: `wrap_ip` writes
+/// the IPv4 total length as `u16` including its 20-byte header, so a frame
+/// past 65535 - 20 wraps to a bogus tiny length and is dropped by the peer.
+/// A 65515-byte frame wraps exactly to 65535.
+pub const MAX_DGRAM_FRAME: usize = 65515;
+
 /// One queued uplink packet: destination + encrypted bytes.
 pub type EgressItem = (SocketAddr, Vec<u8>);
 
@@ -134,7 +140,28 @@ pub struct WireguardHop {
     hop_id: String,
     inner: Arc<HopInner>,
     events: tokio::sync::broadcast::Sender<HopEvent>,
-    _pump: tokio::task::JoinHandle<()>,
+    pump: PumpGuard,
+}
+
+/// Keeps the pump task alive for the hop's lifetime and aborts it on drop.
+/// `bring_up` holds this guard across the handshake wait so a dropped
+/// build-future (engine timeout race) aborts the pump immediately instead
+/// of leaving a detached task retransmitting handshakes forever.
+struct PumpGuard {
+    abort: tokio::task::AbortHandle,
+}
+
+impl PumpGuard {
+    /// Defuse the abort-on-drop: hand pump ownership to the hop.
+    fn forget(self) {
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for PumpGuard {
+    fn drop(&mut self) {
+        self.abort.abort();
+    }
 }
 
 struct HopInner {
@@ -315,12 +342,20 @@ impl WireguardHop {
             inner.udp.send_to(&packet, params.peer_endpoint).await.ok();
         }
 
-        let pump_inner = inner.clone();
+        let pump_inner = Arc::downgrade(&inner);
         let pump_events = events.clone();
         let pump_id = hop_id.clone();
         let pump = tokio::spawn(async move {
             pump_loop(pump_inner, tx_rx, pump_events, pump_id).await;
         });
+        // Cancellation safety (transport-api HopFactory contract): the
+        // engine races `build` with a timeout and drops the future. This
+        // guard aborts the pump when bring-up is dropped mid-handshake;
+        // on success it is forgotten into the hop so the pump survives
+        // normally (the Weak below makes a residual iteration exit too).
+        let pump_guard = PumpGuard {
+            abort: pump.abort_handle(),
+        };
 
         // Wait for handshake completion (engine wraps with its own timeout).
         // One reused scratch buffer for the retry loop, not one 64K alloc
@@ -366,7 +401,7 @@ impl WireguardHop {
         .await
         .is_ok();
         if !ok {
-            pump.abort();
+            drop(pump_guard);
             return Err(HopError::transport(
                 hop_id,
                 format!(
@@ -379,11 +414,14 @@ impl WireguardHop {
         let _ = events.send(HopEvent::Started {
             hop_id: hop_id.clone(),
         });
+        pump_guard.forget();
         Ok(Arc::new(WireguardHop {
             hop_id,
             inner,
             events,
-            _pump: pump,
+            pump: PumpGuard {
+                abort: pump.abort_handle(),
+            },
         }))
     }
 }
@@ -463,7 +501,7 @@ impl FrameSender for EgressTx {
 }
 
 async fn pump_loop(
-    inner: Arc<HopInner>,
+    inner: std::sync::Weak<HopInner>,
     mut tx_rx: tokio::sync::mpsc::Receiver<EgressItem>,
     events: tokio::sync::broadcast::Sender<HopEvent>,
     hop_id: String,
@@ -478,6 +516,12 @@ async fn pump_loop(
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
+        // Upgrade per iteration: an expired Weak means the hop (and any
+        // surviving guard) is gone — exit instead of ticking forever. This
+        // is the second cancellation net under the bring-up abort guard.
+        let Some(inner) = inner.upgrade() else {
+            break;
+        };
         tokio::select! {
             _ = tick.tick() => {
                 // Keepalive / handshake retransmit driver. Enqueued (never
@@ -505,43 +549,83 @@ async fn pump_loop(
                 inner.udp.send_to(&bytes, peer).await.ok();
             }
             recvd = inner.udp.recv_from(&mut buf) => {
-                let Ok((n, src)) = recvd else { break };
-                let mut tunnel = inner.tunnel.lock().unwrap();
-                match tunnel.decapsulate(Some(src.ip()), &buf[..n], &mut plain) {
-                    TunnResult::WriteToTunnelV4(data, _) | TunnResult::WriteToTunnelV6(data, _) => {
-                        drop(tunnel);
-                        // Roaming: a valid packet from a new source moves the peer.
-                        *inner.peer.write().unwrap() = src;
-                        // Single copy on ingress: the frame is copied out of the
-                        // reused decrypt buffer once, then handed to dispatch
-                        // by value — `Bytes::from` reuses that allocation and
-                        // slices the header by refcount (was two copies).
-                        // Non-channel packets (a TUN integration would route
-                        // these) are skipped, never dispatched.
-                        let Some(inner_frame) = stream::unwrap_ip(data) else {
-                            continue;
-                        };
-                        let inner_frame = inner_frame.to_vec();
-                        if std::env::var("QCORE_WG_TRACE").is_ok() {
-                            eprintln!("[wg-pump] tunnel-data {}B type={:02x}", data.len(), data.first().copied().unwrap_or(0));
-                        }
-                        if let Err(e) = stream::dispatch(&inner.streams, inner_frame) {
-                            let _ = events.send(HopEvent::Failed { hop_id: hop_id.clone(), cause: e });
-                        }
+                match recvd {
+                    Ok((n, src)) => {
+                        handle_inbound(&inner, &events, &hop_id, src, &buf[..n], &mut plain);
                     }
-                    TunnResult::WriteToNetwork(reply) => {
-                        let bytes = reply.to_vec();
-                        drop(tunnel);
-                        // Same FIFO queue: handshake replies stay ordered
-                        // relative to data (replay protection). Best-effort
-                        // on a full queue — the peer retransmits.
-                        let _ = inner.tx.try_send((src, bytes));
+                    Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {
+                        // Windows: an ICMP port-unreachable lands on the
+                        // unconnected socket as ConnectionReset — a routine
+                        // transient, never a pump exit.
+                        continue;
                     }
-                    TunnResult::Done => {}
-                    TunnResult::Err(_) => {}
+                    Err(e) => {
+                        // Terminal recv failure: report like every other
+                        // failure path instead of exiting silently with
+                        // health green and streams parked forever.
+                        let cause = format!("uplink recv failed: {e}");
+                        let _ = events.send(HopEvent::Failed {
+                            hop_id: hop_id.clone(),
+                            cause,
+                        });
+                        break;
+                    }
                 }
             }
         }
+    }
+}
+
+/// Decapsulate and dispatch one inbound packet (matched in the pump select).
+#[allow(clippy::too_many_arguments)]
+fn handle_inbound(
+    inner: &Arc<HopInner>,
+    events: &tokio::sync::broadcast::Sender<HopEvent>,
+    hop_id: &str,
+    src: SocketAddr,
+    packet: &[u8],
+    plain: &mut [u8],
+) {
+    let mut tunnel = inner.tunnel.lock().unwrap();
+    match tunnel.decapsulate(Some(src.ip()), packet, plain) {
+        TunnResult::WriteToTunnelV4(data, _) | TunnResult::WriteToTunnelV6(data, _) => {
+            drop(tunnel);
+            // Roaming: a valid packet from a new source moves the peer.
+            *inner.peer.write().unwrap() = src;
+            // Single copy on ingress: the frame is copied out of the
+            // reused decrypt buffer once, then handed to dispatch
+            // by value — `Bytes::from` reuses that allocation and
+            // slices the header by refcount (was two copies).
+            // Non-channel packets (a TUN integration would route
+            // these) are skipped, never dispatched.
+            let Some(inner_frame) = stream::unwrap_ip(data) else {
+                return;
+            };
+            let inner_frame = inner_frame.to_vec();
+            if std::env::var("QCORE_WG_TRACE").is_ok() {
+                eprintln!(
+                    "[wg-pump] tunnel-data {}B type={:02x}",
+                    data.len(),
+                    data.first().copied().unwrap_or(0)
+                );
+            }
+            if let Err(e) = stream::dispatch(&inner.streams, inner_frame) {
+                let _ = events.send(HopEvent::Failed {
+                    hop_id: hop_id.to_string(),
+                    cause: e,
+                });
+            }
+        }
+        TunnResult::WriteToNetwork(reply) => {
+            let bytes = reply.to_vec();
+            drop(tunnel);
+            // Same FIFO queue: handshake replies stay ordered
+            // relative to data (replay protection). Best-effort
+            // on a full queue — the peer retransmits.
+            let _ = inner.tx.try_send((src, bytes));
+        }
+        TunnResult::Done => {}
+        TunnResult::Err(_) => {}
     }
 }
 
@@ -574,7 +658,11 @@ impl RunningHop for WireguardHop {
     }
 
     async fn stop(&self) -> Result<(), HopError> {
-        self._pump.abort();
+        self.pump.abort.abort();
+        // Clear the stream table: dropping the entries closes the per-lane
+        // channels, so parked readers see EOF/error instead of parking
+        // forever with writes already failing `Closed`.
+        self.inner.streams.clear();
         let _ = self.events.send(HopEvent::Stopped {
             hop_id: self.hop_id.clone(),
         });
@@ -644,13 +732,14 @@ impl UdpFlow for WgUdpFlow {
                 "wireguard flow is bound to its dial destination",
             ));
         }
-        // Bound before framing: the `as u16` IP-length header in `wrap_ip`
-        // wraps past 65535 and the peer would receive a truncated lie.
-        if self.prefix.len().saturating_add(buf.len()) > 65535 {
+        // Bound before framing: `wrap_ip` writes the IPv4 total length as
+        // `u16` including its 20-byte header, so a frame past 65515 wraps
+        // to a bogus tiny length and the peer drops a truncated lie.
+        if self.prefix.len().saturating_add(buf.len()) > MAX_DGRAM_FRAME {
             return Err(HopError::transport(
                 self.hop_id.clone(),
                 format!(
-                    "datagram {} exceeds 65535",
+                    "datagram {} exceeds {MAX_DGRAM_FRAME}",
                     self.prefix.len().saturating_add(buf.len())
                 ),
             ));

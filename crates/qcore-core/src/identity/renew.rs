@@ -258,7 +258,7 @@ async fn renew_masque_only(
             identity: Some(id.device_id.clone()),
             endpoint: None,
             cause: format!(
-                "identity store failed ({}); previous record intact",
+                "identity store failed ({}); the provider already holds the new credential but the local record is stale — retry `renew --masque-only` to reconcile",
                 masked_value("cause", &e.to_string())
             ),
             license_applied: false,

@@ -1,10 +1,14 @@
 //! Release packaging + signing (T089; plan Release Pipeline, constitution
 //! Release Integrity).
 //!
-//! Artifacts: `qcore-<ver>-<target>.zip|.tar.gz` (CLI + `qcore.h` +
-//! `abi-version.txt`), `SHA256SUMS`, `sbom.cdx.json` (CycloneDX, derived
-//! from `cargo metadata` — no extra tool needed), cosign keyless signatures
-//! (`.sig`) plus SLSA attestation when those tools are present.
+//! Artifacts: `qcore-<ver>-<target>.zip|.tar.gz` (CLI binary + cdylib +
+//! `qcore.h` + `abi-version.txt`), `SHA256SUMS`, `sbom.cdx.json` (CycloneDX,
+//! derived from `cargo metadata` — no extra tool needed), cosign keyless
+//! signatures (`.sig`) plus SLSA attestation when those tools are present.
+//! The container format comes from the target's `delivery` field in
+//! `targets.toml` (`cli-zip` → zip, `cli-targz`/`termux-cli` → tar.gz); a
+//! package without the built CLI binary or the cdylib fails closed instead
+//! of shipping an empty archive.
 //! Blocked unless the Tier C matrix is green (locally: fmt, clippy,
 //! workspace tests, `abi-diff`, native smoke).
 //! Emergency path: fix on `release/x.y`, patch bump (never re-tag),
@@ -19,15 +23,93 @@ use std::path::{Path, PathBuf};
 /// cannot drift (T7 story 18).
 const TARGETS_TOML: &str = include_str!("targets.toml");
 
+/// One `[[target]]` entry: the triple plus its delivery spec.
+struct TargetEntry {
+    triple: String,
+    delivery: Vec<String>,
+}
+
+fn contract_target_entries() -> Vec<TargetEntry> {
+    let mut out = Vec::new();
+    let mut current: Option<TargetEntry> = None;
+    for l in TARGETS_TOML.lines() {
+        let l = l.trim();
+        if let Some(v) = l.strip_prefix("triple = ") {
+            if let Some(prev) = current.take() {
+                out.push(prev);
+            }
+            current = Some(TargetEntry {
+                triple: v.trim().trim_matches('"').to_string(),
+                delivery: Vec::new(),
+            });
+        } else if let Some(v) = l.strip_prefix("delivery = ") {
+            if let Some(c) = current.as_mut() {
+                let inner = v.trim().trim_start_matches('[').trim_end_matches(']');
+                c.delivery = inner
+                    .split(',')
+                    .map(|s| s.trim().trim_matches('"').to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+            }
+        }
+    }
+    if let Some(last) = current.take() {
+        out.push(last);
+    }
+    out
+}
+
 fn contract_targets() -> Vec<String> {
-    TARGETS_TOML
-        .lines()
-        .filter_map(|l| {
-            let l = l.trim();
-            l.strip_prefix("triple = ")
-                .map(|v| v.trim().trim_matches('"').to_string())
-        })
+    contract_target_entries()
+        .into_iter()
+        .map(|t| t.triple)
         .collect()
+}
+
+/// Delivery container per the `targets.toml` `delivery` field: windows legs
+/// declare `cli-zip`, linux legs `cli-targz`, android legs ship the Termux
+/// CLI + JNI cdylib in the unix-native tar.gz. The native package follows
+/// the host platform. An unrecognized delivery spec fails closed instead of
+/// guessing a container.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ArchiveFmt {
+    Zip,
+    TarGz,
+}
+
+fn archive_fmt_for(target: &str) -> Result<ArchiveFmt, String> {
+    if target == "native" {
+        return Ok(if cfg!(windows) {
+            ArchiveFmt::Zip
+        } else {
+            ArchiveFmt::TarGz
+        });
+    }
+    let entry = contract_target_entries()
+        .into_iter()
+        .find(|t| t.triple == target)
+        .ok_or_else(|| format!("target `{target}` not in targets.toml"))?;
+    if entry.delivery.iter().any(|d| d.contains("zip")) {
+        Ok(ArchiveFmt::Zip)
+    } else if entry
+        .delivery
+        .iter()
+        .any(|d| d.contains("targz") || d.contains("termux"))
+    {
+        Ok(ArchiveFmt::TarGz)
+    } else {
+        Err(format!(
+            "target `{target}` delivery {:?} names no archive container (expected cli-zip | cli-targz | termux-cli)",
+            entry.delivery
+        ))
+    }
+}
+
+fn archive_extension(fmt: ArchiveFmt) -> &'static str {
+    match fmt {
+        ArchiveFmt::Zip => "zip",
+        ArchiveFmt::TarGz => "tar.gz",
+    }
 }
 
 fn version() -> Result<String, String> {
@@ -131,6 +213,138 @@ fn dist_dir() -> PathBuf {
     Path::new("target/dist").to_path_buf()
 }
 
+/// tar.gz writer (linux/android delivery): deterministic entries, mode
+/// preserved where meaningful.
+fn write_tar_gz(stage: &Path, out: &Path) -> Result<(), String> {
+    let file = std::fs::File::create(out).map_err(|e| format!("create {}: {e}", out.display()))?;
+    let enc = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+    let mut tar = tar::Builder::new(enc);
+    tar.mode(tar::HeaderMode::Deterministic);
+    for entry in read_dir_sorted(stage)? {
+        let meta = entry
+            .metadata()
+            .map_err(|e| format!("stat {}: {e}", entry.path().display()))?;
+        let mut header = tar::Header::new_gnu();
+        header.set_size(meta.len());
+        header.set_mode(0o755);
+        header.set_cksum();
+        let f = std::fs::File::open(entry.path())
+            .map_err(|e| format!("open {}: {e}", entry.path().display()))?;
+        tar.append_data(
+            &mut header,
+            entry.path().file_name().ok_or("stage entry unnamed")?,
+            f,
+        )
+        .map_err(|e| format!("tar append: {e}"))?;
+    }
+    tar.into_inner()
+        .map_err(|e| format!("tar finish: {e}"))?
+        .finish()
+        .map_err(|e| format!("gzip finish: {e}"))?;
+    Ok(())
+}
+
+/// Minimal std-only ZIP writer (STORE method, no compression): the windows
+/// `cli-zip` delivery needs only containment, not ratio — the payloads are
+/// already large binaries where deflate gains little. CRC-32 (IEEE) is
+/// computed inline; no new dependency family.
+fn write_zip(stage: &Path, out: &Path) -> Result<(), String> {
+    let mut out_bytes: Vec<u8> = Vec::new();
+    let mut central: Vec<u8> = Vec::new();
+    let entries = read_dir_sorted(stage)?;
+    let entry_count = entries.len() as u16;
+    for entry in &entries {
+        let path = entry.path();
+        let name = path
+            .file_name()
+            .ok_or("stage entry unnamed")?
+            .to_str()
+            .ok_or("stage entry name not UTF-8")?
+            .as_bytes()
+            .to_vec();
+        let data = std::fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        let crc = crc32_ieee(&data);
+        let offset = out_bytes.len() as u32;
+        // Local file header: sig, version 20 (2.0), flags 0, method 0 (store),
+        // zeroed mod time/date (deterministic), crc, sizes, name.
+        out_bytes.extend_from_slice(&0x04034b50u32.to_le_bytes());
+        out_bytes.extend_from_slice(&20u16.to_le_bytes());
+        out_bytes.extend_from_slice(&0u16.to_le_bytes());
+        out_bytes.extend_from_slice(&0u16.to_le_bytes());
+        out_bytes.extend_from_slice(&0u16.to_le_bytes());
+        out_bytes.extend_from_slice(&0u16.to_le_bytes());
+        out_bytes.extend_from_slice(&crc.to_le_bytes());
+        out_bytes.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out_bytes.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out_bytes.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        out_bytes.extend_from_slice(&0u16.to_le_bytes());
+        out_bytes.extend_from_slice(&name);
+        out_bytes.extend_from_slice(&data);
+        // Central directory record.
+        central.extend_from_slice(&0x02014b50u32.to_le_bytes());
+        central.extend_from_slice(&20u16.to_le_bytes());
+        central.extend_from_slice(&20u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&crc.to_le_bytes());
+        central.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        central.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        central.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes());
+        central.extend_from_slice(&0u32.to_le_bytes());
+        central.extend_from_slice(&offset.to_le_bytes());
+        central.extend_from_slice(&name);
+    }
+    let central_offset = out_bytes.len() as u32;
+    let central_len = central.len() as u32;
+    out_bytes.extend_from_slice(&central);
+    // End of central directory.
+    out_bytes.extend_from_slice(&0x06054b50u32.to_le_bytes());
+    out_bytes.extend_from_slice(&0u16.to_le_bytes());
+    out_bytes.extend_from_slice(&0u16.to_le_bytes());
+    out_bytes.extend_from_slice(&entry_count.to_le_bytes());
+    out_bytes.extend_from_slice(&entry_count.to_le_bytes());
+    out_bytes.extend_from_slice(&central_len.to_le_bytes());
+    out_bytes.extend_from_slice(&central_offset.to_le_bytes());
+    out_bytes.extend_from_slice(&0u16.to_le_bytes());
+    std::fs::write(out, &out_bytes).map_err(|e| format!("write {}: {e}", out.display()))?;
+    Ok(())
+}
+
+fn crc32_ieee(data: &[u8]) -> u32 {
+    let mut table = [0u32; 256];
+    for (i, slot) in table.iter_mut().enumerate() {
+        let mut c = i as u32;
+        for _ in 0..8 {
+            c = if c & 1 != 0 {
+                0xEDB88320 ^ (c >> 1)
+            } else {
+                c >> 1
+            };
+        }
+        *slot = c;
+    }
+    let mut crc = 0xFFFF_FFFFu32;
+    for &b in data {
+        crc = table[((crc ^ b as u32) & 0xFF) as usize] ^ (crc >> 8);
+    }
+    crc ^ 0xFFFF_FFFF
+}
+
+fn read_dir_sorted(dir: &Path) -> Result<Vec<std::fs::DirEntry>, String> {
+    let mut v: Vec<_> = std::fs::read_dir(dir)
+        .map_err(|e| format!("read {}: {e}", dir.display()))?
+        .flatten()
+        .collect();
+    v.sort_by_key(|e| e.file_name());
+    Ok(v)
+}
+
 /// CycloneDX SBOM from `cargo metadata` (no extra tooling).
 fn write_sbom(dist: &Path, ver: &str) -> Result<PathBuf, String> {
     let out = std::process::Command::new("cargo")
@@ -148,6 +362,67 @@ fn write_sbom(dist: &Path, ver: &str) -> Result<PathBuf, String> {
     Ok(out_path)
 }
 
+/// Stage the deliverables and build the container archive (the testable
+/// core of `package`): copies `bin` + `cdylib` + the header/ABI stamp into
+/// `stage`, then writes the `fmt` archive beside it. Every expected input
+/// must exist — absent deliverables fail closed.
+fn stage_and_archive(
+    dist: &Path,
+    stage: &Path,
+    bin: &Path,
+    cdylib: &Path,
+    header: &Path,
+    abi_version: &Path,
+    fmt: ArchiveFmt,
+) -> Result<PathBuf, String> {
+    let fail = |m: String| format!("package: {m}");
+    if stage.exists() {
+        // A stale stage dir from a previous run must not leak old files
+        // into the new archive: wipe it before staging.
+        std::fs::remove_dir_all(stage).map_err(|e| fail(format!("clean stage: {e}")))?;
+    }
+    std::fs::create_dir_all(stage).map_err(|e| fail(format!("stage: {e}")))?;
+    for (file, label) in [
+        (bin, "CLI binary"),
+        (cdylib, "cdylib"),
+        (header, "qcore.h"),
+        (abi_version, "abi-version.txt"),
+    ] {
+        if !file.exists() {
+            return Err(fail(format!(
+                "{label} missing (expected {}); refusing to package an empty artifact",
+                file.display()
+            )));
+        }
+        let dest = stage.join(file.file_name().expect("artifact path has a file name"));
+        std::fs::copy(file, &dest).map_err(|e| fail(format!("stage {}: {e}", file.display())))?;
+    }
+    let archive_path = dist.join(format!(
+        "{}.{}",
+        stage
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| fail("stage dir unnamed".to_string()))?,
+        archive_extension(fmt)
+    ));
+    match fmt {
+        ArchiveFmt::Zip => write_zip(stage, &archive_path).map_err(fail)?,
+        ArchiveFmt::TarGz => write_tar_gz(stage, &archive_path).map_err(fail)?,
+    }
+    let staged: Vec<_> = read_dir_sorted(stage)
+        .map_err(fail)?
+        .into_iter()
+        .map(|e| e.path())
+        .collect();
+    if staged.len() < 4 {
+        return Err(fail(format!(
+            "staging incomplete ({} files, want >= 4: CLI binary, cdylib, qcore.h, abi-version.txt)",
+            staged.len()
+        )));
+    }
+    Ok(archive_path)
+}
+
 pub fn package(args: Vec<String>) -> super::anyhow::Result<()> {
     let fail = |m: String| super::anyhow::Error::msg(m);
     let target = args
@@ -156,11 +431,17 @@ pub fn package(args: Vec<String>) -> super::anyhow::Result<()> {
         .nth(1)
         .cloned()
         .unwrap_or_else(|| "native".to_string());
+    if target != "native" && !contract_targets().contains(&target) {
+        return Err(fail(format!(
+            "unknown target `{target}` (see xtask/src/targets.toml)"
+        )));
+    }
     let ver = version().map_err(fail)?;
     let dist = dist_dir();
     std::fs::create_dir_all(&dist).map_err(|e| fail(format!("dist dir: {e}")))?;
 
-    // Release binaries through the pinned backend.
+    // Release binaries through the pinned backend (build.rs: every
+    // non-native backend builds --release into target/<triple>/release/).
     super::shell(&format!("cargo run -q -p xtask -- build --target {target}"))?;
 
     let name = if target == "native" {
@@ -168,38 +449,47 @@ pub fn package(args: Vec<String>) -> super::anyhow::Result<()> {
     } else {
         format!("qcore-{ver}-{target}")
     };
-    // Stage: CLI + header + ABI stamp (+ cdylib when built).
     let stage = dist.join(&name);
-    std::fs::create_dir_all(&stage).map_err(|e| fail(format!("stage: {e}")))?;
-    for f in [
-        "crates/qcore-ffi/qcore.h",
-        "crates/qcore-ffi/abi-version.txt",
-    ] {
-        let src = Path::new(f);
-        if src.exists() {
-            // Static literal paths below always have a file name.
-            std::fs::copy(
-                src,
-                stage.join(src.file_name().expect("staged path has a file name")),
-            )
-            .map_err(|e| fail(format!("stage {f}: {e}")))?;
-        }
-    }
-    println!("package: staged {name} (+ qcore.h, abi-version.txt)");
+
+    // Built deliverables from the target's build dir, named for the TARGET
+    // platform (cross builds on a foreign host still produce the target's
+    // binary/cdylib layout).
+    let bin_dir = super::build::artifact_dir(&target, true);
+    let bin_name = super::build::cli_binary_name_for_triple(&target);
+    let cdylib_name = if target == "native" {
+        super::build::cdylib_name_host()
+    } else {
+        super::build::cdylib_name_for_triple(&target)
+    };
+    let fmt = archive_fmt_for(&target).map_err(fail)?;
+    let archive_path = stage_and_archive(
+        &dist,
+        &stage,
+        &bin_dir.join(bin_name),
+        &bin_dir.join(cdylib_name),
+        Path::new("crates/qcore-ffi/qcore.h"),
+        Path::new("crates/qcore-ffi/abi-version.txt"),
+        fmt,
+    )
+    .map_err(fail)?;
+    println!("package: staged {name} (CLI {bin_name}, {cdylib_name}, qcore.h, abi-version.txt)");
+    println!("package: {}", archive_path.display());
 
     // SBOM first so it joins the checksum list.
     let sbom = write_sbom(&dist, &ver).map_err(fail)?;
     println!("package: {}", sbom.display());
 
-    // SHA256SUMS over staged files + SBOM.
-    let mut sums = String::new();
-    let mut files = vec![sbom];
+    // SHA256SUMS over the archive + staged files + SBOM: the checksums now
+    // cover the real deliverable, not just the header stamp.
+    let mut files = vec![archive_path.clone(), sbom];
     if let Ok(entries) = std::fs::read_dir(&stage) {
         for e in entries.flatten() {
             files.push(e.path());
         }
     }
     files.sort();
+    files.dedup();
+    let mut sums = String::new();
     for f in &files {
         if f.is_file() {
             let bytes = std::fs::read(f).map_err(|e| fail(format!("hash {}: {e}", f.display())))?;
@@ -529,7 +819,7 @@ mod serde_json_lite {
 
 #[cfg(test)]
 mod tests {
-    use super::{contract_targets, sha256_hex};
+    use super::{archive_fmt_for, contract_targets, sha256_hex, stage_and_archive, ArchiveFmt};
 
     #[test]
     fn contract_targets_match_manifest() {
@@ -555,5 +845,161 @@ mod tests {
             sha256_hex(b""),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
+    }
+
+    #[test]
+    fn archive_fmt_follows_delivery_field() {
+        // targets.toml delivery: windows = zip, linux = targz, android =
+        // termux-cli (tar.gz container for the Termux APK-less install).
+        assert_eq!(
+            archive_fmt_for("x86_64-pc-windows-msvc").unwrap(),
+            ArchiveFmt::Zip
+        );
+        assert_eq!(
+            archive_fmt_for("x86_64-unknown-linux-gnu").unwrap(),
+            ArchiveFmt::TarGz
+        );
+        assert_eq!(
+            archive_fmt_for("aarch64-linux-android").unwrap(),
+            ArchiveFmt::TarGz
+        );
+        assert!(archive_fmt_for("not-a-target").is_err());
+    }
+
+    /// Fake built artifacts in a tmpdir; asserts the staged archive exists
+    /// and contains the CLI binary payload.
+    fn stage_fixture(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let base =
+            std::env::temp_dir().join(format!("qcore-xtask-release-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let build = base.join("build");
+        std::fs::create_dir_all(&build).unwrap();
+        std::fs::write(build.join("qcore.exe"), b"fake-cli-binary-payload").unwrap();
+        std::fs::write(build.join("qcore"), b"fake-cli-binary-payload").unwrap();
+        std::fs::write(build.join("qcore_ffi.dll"), b"fake-cdylib-payload").unwrap();
+        std::fs::write(build.join("libqcore_ffi.so"), b"fake-cdylib-payload").unwrap();
+        let header = base.join("qcore.h");
+        std::fs::write(&header, b"/* header */ uint32_t qcore_abi_version(void);").unwrap();
+        let abi = base.join("abi-version.txt");
+        std::fs::write(&abi, "3\n").unwrap();
+        (base, build)
+    }
+
+    #[test]
+    fn stage_and_archive_zip_contains_staged_binary() {
+        let (base, build) = stage_fixture("zip");
+        let dist = base.join("dist");
+        let stage = dist.join("qcore-0.1.0-native");
+        let archive = stage_and_archive(
+            &dist,
+            &stage,
+            &build.join("qcore.exe"),
+            &build.join("qcore_ffi.dll"),
+            &base.join("qcore.h"),
+            &base.join("abi-version.txt"),
+            ArchiveFmt::Zip,
+        )
+        .expect("stage + zip");
+        assert_eq!(archive, dist.join("qcore-0.1.0-native.zip"));
+        let bytes = std::fs::read(&archive).unwrap();
+        // The archive must exist, be a zip, and contain the fake CLI
+        // binary payload (store method keeps bytes verbatim).
+        assert_eq!(&bytes[..4], &[0x50, 0x4b, 0x03, 0x04], "zip local header");
+        let needle = b"fake-cli-binary-payload";
+        assert!(
+            bytes.windows(needle.len()).any(|w| w == needle),
+            "zip contains the staged CLI binary"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn stage_and_archive_targz_contains_staged_binary() {
+        let (base, build) = stage_fixture("targz");
+        let dist = base.join("dist");
+        let stage = dist.join("qcore-0.1.0-x86_64-unknown-linux-gnu");
+        let archive = stage_and_archive(
+            &dist,
+            &stage,
+            // Cross linux leg: the CLI has no .exe suffix, the cdylib is a
+            // .so — the target platform decides the staged names.
+            &build.join("qcore"),
+            &build.join("libqcore_ffi.so"),
+            &base.join("qcore.h"),
+            &base.join("abi-version.txt"),
+            ArchiveFmt::TarGz,
+        )
+        .expect("stage + tar.gz");
+        assert_eq!(
+            archive,
+            dist.join("qcore-0.1.0-x86_64-unknown-linux-gnu.tar.gz")
+        );
+        let bytes = std::fs::read(&archive).unwrap();
+        assert_eq!(&bytes[..2], &[0x1f, 0x8b], "gzip magic");
+        // Decode and confirm all four staged members are present.
+        let gz = flate2::read::GzDecoder::new(&bytes[..]);
+        let mut tar = tar::Archive::new(gz);
+        let mut names = Vec::new();
+        for e in tar.entries().unwrap() {
+            names.push(e.unwrap().path().unwrap().to_string_lossy().into_owned());
+        }
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "abi-version.txt".to_string(),
+                "libqcore_ffi.so".to_string(),
+                "qcore".to_string(),
+                "qcore.h".to_string(),
+            ],
+            "tar members: {names:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn stage_and_archive_fails_closed_on_missing_binary() {
+        let (base, build) = stage_fixture("failclosed");
+        let dist = base.join("dist");
+        let stage = dist.join("qcore-0.1.0-native");
+        let err = stage_and_archive(
+            &dist,
+            &stage,
+            &build.join("missing-binary"),
+            &build.join("qcore_ffi.dll"),
+            &base.join("qcore.h"),
+            &base.join("abi-version.txt"),
+            ArchiveFmt::Zip,
+        )
+        .expect_err("missing CLI binary fails closed");
+        assert!(err.contains("CLI binary missing"), "{err}");
+        // No archive written on the failure path.
+        assert!(!dist.join("qcore-0.1.0-native.zip").exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn stage_and_archive_rejects_stale_stage_files() {
+        let (base, build) = stage_fixture("stale");
+        let dist = base.join("dist");
+        let stage = dist.join("qcore-0.1.0-native");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::write(stage.join("stale-junk.txt"), b"old run").unwrap();
+        let archive = stage_and_archive(
+            &dist,
+            &stage,
+            &build.join("qcore.exe"),
+            &build.join("qcore_ffi.dll"),
+            &base.join("qcore.h"),
+            &base.join("abi-version.txt"),
+            ArchiveFmt::Zip,
+        )
+        .expect("stage + zip");
+        let bytes = std::fs::read(&archive).unwrap();
+        assert!(
+            !bytes.windows(8).any(|w| w == b"old run"),
+            "stale stage files must not leak into the archive"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

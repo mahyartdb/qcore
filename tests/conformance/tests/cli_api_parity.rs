@@ -6,6 +6,9 @@
 //! surface the CLI itself consumes. A CLI-only path (logic the CLI
 //! reimplements instead of calling) fails this file at compile time (no API
 //! to call) or here at runtime.
+//!
+//! `SessionStatus` does not implement `Debug`-friendly rendering for all
+//! variants; assertions match on the variant, never on its text.
 
 use qcore_core::api::{Engine, EngineConfig};
 use qcore_core::config::profile_dir::ProfileDirs;
@@ -75,7 +78,7 @@ fn max_depth_global_reaches_engine_config() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn connect_status_stop_round_trip() {
     // `qcore connect/up`, `status`, `stop`: start → status → stop, all public.
     let dirs = work("connect");
@@ -87,13 +90,69 @@ async fn connect_status_stop_round_trip() {
     assert_eq!(handle.hop_reports().len(), 1);
     // Status shape + exit-code mapping are public (status/stop commands).
     // A fresh dir has no durable session → NotRunning → exit 10 (contract).
-    let _ = e.status();
+    assert!(matches!(
+        e.status(),
+        qcore_core::session::SessionStatus::NotRunning
+    ));
     assert_eq!(
         qcore_core::session::SessionStatus::read(&work("fresh")).exit_code(),
         10,
         "not_running exit-code mapping is public API"
     );
+    // The durable rendezvous the CLI writes after `connect` (session record
+    // + control channel), assembled here from the same public pieces, so
+    // `status` can be asserted for the started session: Live + the exit hop
+    // id it started with.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("binds control listener");
+    let port = listener.local_addr().expect("local addr").port();
+    let token = qcore_core::session::control::new_token();
+    qcore_core::session::control::write_control_file(
+        &dirs,
+        &qcore_core::session::control::ControlInfo {
+            port,
+            token: token.clone(),
+            pid: std::process::id(),
+        },
+    )
+    .expect("writes control file");
+    let session = qcore_core::session::Session {
+        id: handle.id.clone(),
+        chain: handle.chain.clone(),
+        family_policy: qcore_core::session::net::FamilyPolicy::default(),
+        state: qcore_core::session::SessionState::Up,
+        started_at: 0,
+        failure: None,
+    };
+    session.save(&dirs).expect("saves session record");
+    let (stopped_tx, stopped_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(qcore_core::session::control::serve_control(
+        listener,
+        token,
+        qcore_core::session::report::ConnectionReport::new(
+            handle.hop_reports(),
+            handle.exit_hop_id.clone(),
+        ),
+        stopped_tx,
+    ));
+    match e.status() {
+        qcore_core::session::SessionStatus::Live { report } => {
+            assert_eq!(
+                report.exit_hop_id, "mock-0",
+                "status names the started session's exit hop"
+            );
+            assert_eq!(
+                report.ordered_chain.len(),
+                1,
+                "live report carries the started chain"
+            );
+        }
+        other => panic!("started session must read Live, got {other:?}"),
+    }
     handle.stop_all().await.expect("stops via public API");
+    drop(stopped_rx);
+    let _ = std::fs::remove_dir_all(&dirs.config_dir);
 }
 
 #[test]

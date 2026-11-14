@@ -4,9 +4,9 @@
 //! drives its data plane over carrier flows/streams instead of OS sockets.
 //! Per-layer inner-MTU shrink: each encapsulation layer budgets 80 bytes of
 //! headers (outer IP/UDP + tunnel framing), floored at the IPv6 minimum.
-//! [`PmtuProber`] tracks RFC 4821-style packetization probing per nested
-//! uplink: consecutive timeout/IO failures decay the reported MTU and the
-//! decay is reported in the failure cause.
+//! [`PmtuProber`] models RFC 4821-style packetization probing per nested
+//! uplink: consecutive timeout/IO failures decay the probed MTU and a
+//! success recovers one step.
 //!
 //! Runtime nesting matrix (US3): mock and relay are transparent/framing
 //! carriers; wireguard and masque-h2 ride nested carriers; masque-h3 (QUIC),
@@ -32,7 +32,7 @@ pub fn layer_mtu(depth: u32) -> u16 {
 /// RFC 4821-style prober for one nested uplink. Starts at the layered MTU;
 /// two consecutive timeout/IO losses step down through the probe sizes;
 /// a success recovers one step. Cross-session memory is future work
-/// (US4 endpoints cache); within one bring-up the decay is reported.
+/// (US4 endpoints cache); bring-up itself reports the layered MTU only.
 #[derive(Debug, Clone)]
 pub struct PmtuProber {
     sizes: Vec<u16>,

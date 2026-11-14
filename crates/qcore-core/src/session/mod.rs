@@ -279,7 +279,14 @@ impl SessionStatus {
                     session: corrupt_placeholder(),
                 }
             }
-            Err(_) => return SessionStatus::NotRunning,
+            // Any other read error (permissions, sharing violations) still
+            // means a record we cannot read: fail closed, never a false
+            // "no session".
+            Err(_) => {
+                return SessionStatus::Unverifiable {
+                    session: corrupt_placeholder(),
+                }
+            }
             Ok(s) => s,
         };
         match session.state {
@@ -307,14 +314,9 @@ impl SessionStatus {
                     session: session.clone(),
                 },
             },
-            Err(e)
-                if e.kind() == std::io::ErrorKind::ConnectionRefused
-                    || e.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                SessionStatus::Dead {
-                    id: session.id.clone(),
-                }
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => SessionStatus::Dead {
+                id: session.id.clone(),
+            },
             Err(_) => SessionStatus::Unverifiable {
                 session: session.clone(),
             },
@@ -406,6 +408,32 @@ mod tests {
             SessionStatus::NotRunning
         ));
         assert_eq!(SessionStatus::NotRunning.exit_code(), 10);
+    }
+
+    #[test]
+    fn unreadable_state_file_is_unverifiable_not_not_running() {
+        let root = std::env::temp_dir().join(format!(
+            "qcore-noread-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let dirs = ProfileDirs {
+            config_dir: root.join("config"),
+            profile_dir: root.join("profiles"),
+        };
+        dirs.ensure_dirs().expect("dirs created");
+        std::fs::write(dirs.session_file(), "not json").expect("seed invalid record");
+        assert!(
+            matches!(
+                SessionStatus::read(&dirs),
+                SessionStatus::Unverifiable { .. }
+            ),
+            "a present-but-unreadable record fails closed, never 'no session'"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     struct StopProbe {

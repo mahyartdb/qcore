@@ -5,10 +5,18 @@
 //! legacy top-level `last_known_good`, which is kept updated for the
 //! pre-002 reader (`reconnect::last_known_good`). Rule: a cached winner is
 //! re-verified (fast TCP path) before use; failure evicts that transport's
-//! entry and the caller runs a full scan (FR-008).
+//! entry and the caller runs a full scan (FR-008) — but only when the probe
+//! could actually speak the transport's carrier language (see
+//! `tcp_probeable`): the data-plane probe is TCP-only, so a TCP refusal
+//! proves nothing about a UDP-carried endpoint, and such winners miss
+//! WITHOUT eviction. Every read-modify-write + fs operation reachable from
+//! async contexts is wrapped in `tokio::task::spawn_blocking` at the async
+//! call sites; the std mutex below is only ever held inside blocking
+//! closures (it never blocks an executor thread).
 
 use crate::config::profile_dir::ProfileDirs;
 use crate::identity::model::now_ms;
+use crate::registry::TransportRegistry;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -76,6 +84,28 @@ pub fn read_winners(dirs: &ProfileDirs) -> BTreeMap<String, TransportWinner> {
     read_file(dirs).winners
 }
 
+/// Async spelling of [`read_winners`]: the fs read runs on the blocking
+/// pool, never on the calling executor thread.
+pub async fn read_winners_async(dirs: &ProfileDirs) -> BTreeMap<String, TransportWinner> {
+    let dirs = dirs.clone();
+    tokio::task::spawn_blocking(move || read_file(&dirs).winners)
+        .await
+        .unwrap_or_default()
+}
+
+/// True when a TCP connect+echo probe can meaningfully verify an endpoint of
+/// this transport: the probe opens a TCP stream to the endpoint, so the
+/// transport must terminate a TCP carrier at that address. Only the
+/// registry descriptor decides (no kind matching — FR-006); an unregistered
+/// or unknown transport is not TCP-probeable (fail closed: no eviction on
+/// a probe that cannot work).
+fn tcp_probeable(transport: &str) -> bool {
+    let Some(desc) = TransportRegistry::global().get(transport) else {
+        return false;
+    };
+    desc.capabilities.accepts_tcp_carrier
+}
+
 /// Record a transport's winner, preserving other transports. The legacy
 /// top-level `last_known_good` follows the newest winner for old readers.
 /// Serialized against concurrent same-process writers (see `CACHE_LOCK`).
@@ -103,21 +133,28 @@ pub fn persist_last_known_good(dirs: &ProfileDirs, addr: SocketAddr) -> Result<(
 }
 
 /// Fast path: TCP re-verify the cached winner for `transport`+`family`.
-/// Hit returns the address plus connect latency; miss evicts that entry
-/// (family mismatches miss WITHOUT evicting — the entry belongs to another
-/// family's scan). Winners were traffic-verified when recorded; the
-/// re-verify is a reachability confirmation, not a re-proof.
+/// Hit returns the address plus connect latency; a mismatched family misses
+/// WITHOUT evicting (the entry belongs to another family's scan, which never
+/// probed it), and so does a non-TCP-probeable transport's winner: the
+/// data-plane probe is TCP-only, so a TCP refusal proves nothing about a
+/// UDP-carried endpoint and must not destroy it (see module docs; UDP
+/// transports are verified by successful session bring-up). Winners were
+/// traffic-verified when recorded; the re-verify is a reachability
+/// confirmation, not a re-proof.
 pub async fn verify_winner_first(
     dirs: &ProfileDirs,
     transport: &str,
     family: &str,
     timeout: Duration,
 ) -> Option<(SocketAddr, u64)> {
-    let winner = read_winners(dirs).get(transport)?.clone();
+    let winner = read_winners_async(dirs).await.get(transport)?.clone();
     if family != "dual" && winner.family != family {
         return None;
     }
     let addr = winner.socket_addr()?;
+    if !tcp_probeable(transport) {
+        return None;
+    }
     let t0 = std::time::Instant::now();
     // Any unsuccessful re-verify (refused, timeout, reset) evicts: a winner
     // that does not answer quickly is not a fast path.
@@ -126,10 +163,12 @@ pub async fn verify_winner_first(
         .map(|r| r.is_ok())
         .unwrap_or(false);
     if !ok {
-        evict_winner(dirs, transport);
+        let dirs = dirs.clone();
+        let transport = transport.to_string();
+        let _ = tokio::task::spawn_blocking(move || evict_winner(&dirs, &transport)).await;
         return None;
     }
-    touch_verified_at(dirs, transport);
+    touch_verified_at_async(dirs, transport).await;
     Some((addr, t0.elapsed().as_millis() as u64))
 }
 
@@ -142,14 +181,29 @@ fn evict_winner(dirs: &ProfileDirs, transport: &str) {
 }
 
 /// Per-transport stale eviction (F1): drop only `transport`'s winner after an
-/// empty scan, preserving siblings. The legacy `last_known_good` follows a
-/// remaining winner when one exists (so reconnect keeps working); it is
-/// cleared only when no winners remain. Deletes the file when fully empty
-/// (legacy-only stale files included).
-pub fn evict_stale_transport(dirs: &ProfileDirs, transport: &str) -> Result<(), String> {
+/// empty scan, preserving siblings — and preserving any winner whose family
+/// the scan never probed: `family` is the scan's scope; a winner of a
+/// different family only gets evicted by a `"dual"` scan (which probes both
+/// families). The legacy `last_known_good` follows a remaining winner when
+/// one exists (so reconnect keeps working); it is cleared only when no
+/// winners remain. Deletes the file when fully empty (legacy-only stale
+/// files included).
+pub fn evict_stale_transport(
+    dirs: &ProfileDirs,
+    transport: &str,
+    family: &str,
+) -> Result<(), String> {
     let _guard = lock_cache();
     let mut file = read_file(dirs);
-    file.winners.remove(transport);
+    let evictable = match file.winners.get(transport) {
+        // Stored winner's family differs from the scan scope: this scan
+        // never probed it, keep it (a dual scan probes both families).
+        Some(w) => family == "dual" || w.family == family,
+        None => true,
+    };
+    if evictable {
+        file.winners.remove(transport);
+    }
     if file.winners.is_empty() {
         file.last_known_good = None;
     } else if !file
@@ -178,6 +232,51 @@ fn touch_verified_at(dirs: &ProfileDirs, transport: &str) {
         w.verified_at_ms = now_ms();
         let _ = write_file(dirs, &file);
     }
+}
+
+/// Async spelling of [`touch_verified_at`]: fs IO on the blocking pool.
+async fn touch_verified_at_async(dirs: &ProfileDirs, transport: &str) {
+    let dirs = dirs.clone();
+    let transport = transport.to_string();
+    let _ = tokio::task::spawn_blocking(move || touch_verified_at(&dirs, &transport)).await;
+}
+
+/// Async spelling of [`record_winner`]: fs IO on the blocking pool.
+pub async fn record_winner_async(
+    dirs: &ProfileDirs,
+    transport: &str,
+    winner: TransportWinner,
+) -> Result<(), String> {
+    let dirs = dirs.clone();
+    let transport = transport.to_string();
+    tokio::task::spawn_blocking(move || record_winner(&dirs, &transport, winner))
+        .await
+        .map_err(|e| format!("winner cache write failed: {e}"))?
+}
+
+/// Async spelling of [`persist_last_known_good`]: fs IO on the blocking pool.
+pub async fn persist_last_known_good_async(
+    dirs: &ProfileDirs,
+    addr: SocketAddr,
+) -> Result<(), String> {
+    let dirs = dirs.clone();
+    tokio::task::spawn_blocking(move || persist_last_known_good(&dirs, addr))
+        .await
+        .map_err(|e| format!("LKG persist failed: {e}"))?
+}
+
+/// Async spelling of [`evict_stale_transport`]: fs IO on the blocking pool.
+pub async fn evict_stale_transport_async(
+    dirs: &ProfileDirs,
+    transport: &str,
+    family: &str,
+) -> Result<(), String> {
+    let dirs = dirs.clone();
+    let transport = transport.to_string();
+    let family = family.to_string();
+    tokio::task::spawn_blocking(move || evict_stale_transport(&dirs, &transport, &family))
+        .await
+        .map_err(|e| format!("winner cache eviction failed: {e}"))?
 }
 
 #[cfg(test)]
@@ -278,6 +377,71 @@ mod tests {
                 .ends_with(".tmp")),
             "atomic replace cleans up its temp"
         );
+        let _ = std::fs::remove_dir_all(&d.config_dir);
+    }
+
+    /// FIX 2: a TCP-refused re-verify of a non-TCP-probeable transport's
+    /// winner misses WITHOUT evicting — the data-plane probe is TCP-only, so
+    /// a refusal proves nothing about a UDP-carried endpoint. Eviction stays
+    /// for TCP-probeable transports (their endpoints do terminate TCP).
+    #[tokio::test]
+    async fn udp_transport_winner_survives_tcp_refused_probe() {
+        let d = dirs("udp-keep");
+        // `relay` does not accept a TCP carrier (its adapter frames UDP over
+        // a TCP carrier it dials itself — a relay-shaped descriptor); a
+        // registry lookup of an unregistered kind is equally non-probeable.
+        assert!(!tcp_probeable("unregistered-kind"));
+        record_winner(&d, "unregistered-kind", winner("127.0.0.1:1")).unwrap();
+        let hit = verify_winner_first(
+            &d,
+            "unregistered-kind",
+            "ipv4",
+            std::time::Duration::from_secs(2),
+        )
+        .await;
+        assert!(hit.is_none(), "non-probeable winner never fast-path-hits");
+        assert!(
+            read_winners(&d).contains_key("unregistered-kind"),
+            "TCP-refused probe must not evict a non-TCP-probeable winner"
+        );
+        let _ = std::fs::remove_dir_all(&d.config_dir);
+    }
+
+    /// FIX 7: the async cache helpers behave like their blocking twins
+    /// (RMW serialization included) — concurrent `record_winner_async`
+    /// calls for different transports keep every winner.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn async_cache_helpers_round_trip() {
+        let d = dirs("async");
+        record_winner_async(&d, "warp", winner("127.0.0.1:2408"))
+            .await
+            .expect("async record");
+        record_winner_async(&d, "masque", winner("127.0.0.1:443"))
+            .await
+            .expect("async record");
+        let map = read_winners_async(&d).await;
+        assert_eq!(map.len(), 2, "both async records visible");
+        persist_last_known_good_async(&d, "127.0.0.1:51820".parse().unwrap())
+            .await
+            .expect("async persist");
+        assert_eq!(
+            crate::session::reconnect::last_known_good(&d),
+            Some("127.0.0.1:51820".parse().unwrap()),
+            "async LKG persist reaches the legacy reader"
+        );
+        // Family-scoped eviction keeps the sibling-family winner (FIX 1),
+        // dual evicts (async path).
+        evict_stale_transport_async(&d, "warp", "ipv6")
+            .await
+            .expect("async evict");
+        assert!(
+            read_winners(&d).contains_key("warp"),
+            "ipv6 scan kept ipv4 winner"
+        );
+        evict_stale_transport_async(&d, "warp", "dual")
+            .await
+            .expect("async evict");
+        assert!(!read_winners(&d).contains_key("warp"), "dual scan evicted");
         let _ = std::fs::remove_dir_all(&d.config_dir);
     }
 }

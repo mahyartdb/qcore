@@ -13,6 +13,7 @@ use qcore_transport_api::{
     RunningHop, TransportDescriptor, UdpFlow,
 };
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -83,6 +84,7 @@ impl qcore_transport_api::HopFactory for TorFactory {
             hop_id,
             client,
             events,
+            stopped: AtomicBool::new(false),
         }))
     }
 }
@@ -105,11 +107,15 @@ pub struct TorHop {
     hop_id: String,
     client: Arc<TorClient<tor_rtcompat::PreferredRuntime>>,
     events: tokio::sync::broadcast::Sender<HopEvent>,
+    /// Stopped-stays-stopped (psiphon invariant): post-stop dials fail
+    /// instead of silently serving through the still-bootstrapped client.
+    stopped: AtomicBool,
 }
 
 struct TorDialer {
     hop_id: String,
     client: Arc<TorClient<tor_rtcompat::PreferredRuntime>>,
+    stopped: Arc<AtomicBool>,
 }
 
 /// Owned Tor stream (orphan-rule-safe wrapper).
@@ -156,6 +162,13 @@ impl ByteStream for TorStream {}
 #[async_trait::async_trait]
 impl Dialer for TorDialer {
     async fn dial_tcp(&self, dst: SocketAddr) -> Result<Box<dyn ByteStream>, HopError> {
+        if self.stopped.load(Ordering::SeqCst) {
+            return Err(HopError::new(
+                HopErrorKind::Transport,
+                Some(self.hop_id.clone()),
+                "tor hop is stopped",
+            ));
+        }
         // `ip().to_string()` drops the IPv6 scope id; rather than dial the
         // wrong interface, fail closed: Tor exits cannot route link-local
         // destinations anyway, so a scoped address is always a caller bug.
@@ -191,6 +204,13 @@ impl Dialer for TorDialer {
     }
 
     async fn dial_udp(&self, _dst: SocketAddr) -> Result<Box<dyn UdpFlow>, HopError> {
+        if self.stopped.load(Ordering::SeqCst) {
+            return Err(HopError::new(
+                HopErrorKind::Transport,
+                Some(self.hop_id.clone()),
+                "tor hop is stopped",
+            ));
+        }
         Err(HopError::new(
             HopErrorKind::Transport,
             Some(self.hop_id.clone()),
@@ -218,12 +238,17 @@ impl RunningHop for TorHop {
         Arc::new(TorDialer {
             hop_id: self.hop_id.clone(),
             client: self.client.clone(),
+            stopped: Arc::new(AtomicBool::new(self.stopped.load(Ordering::SeqCst))),
         })
     }
 
     fn health(&self) -> HopHealth {
-        // build() only returns after successful bootstrap.
-        HopHealth::Healthy
+        if self.stopped.load(Ordering::SeqCst) {
+            HopHealth::Stopped
+        } else {
+            // build() only returns after successful bootstrap.
+            HopHealth::Healthy
+        }
     }
 
     fn events(&self) -> tokio::sync::broadcast::Receiver<HopEvent> {
@@ -231,6 +256,7 @@ impl RunningHop for TorHop {
     }
 
     async fn stop(&self) -> Result<(), HopError> {
+        self.stopped.store(true, Ordering::SeqCst);
         let _ = self.events.send(HopEvent::Stopped {
             hop_id: self.hop_id.clone(),
         });

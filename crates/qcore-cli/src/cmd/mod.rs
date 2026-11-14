@@ -3,7 +3,7 @@
 //! conformance test).
 //!
 //! - [`preflight`]: validate chain + profiles + config, zero sockets.
-//! - [`scan`]: endpoint discovery + `--scan`/`--no-scan` on connect.
+//! - [`scan`]: endpoint discovery + the `--no-scan` switch on connect.
 //! - [`import`]: WireGuard/AmneziaWG import (exit 5) + redacted export.
 //! - [`profiles`]: `ls`/`profiles` listing (transports, scan + obfuscation
 //!   profiles, presets, shortcuts) and the `-O` chain-default helper.

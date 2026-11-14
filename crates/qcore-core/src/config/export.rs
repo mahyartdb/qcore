@@ -9,14 +9,29 @@ use crate::config::import::{AwgParams, ConfigImport};
 use std::collections::BTreeMap;
 
 /// Full-fidelity export using the in-memory secrets. `parse(export_plain(a))`
-/// reproduces `a` (see the T059 round-trip test).
-pub fn export_plain(imp: &ConfigImport) -> String {
-    export_with(imp, &|key| {
-        imp.secrets
-            .get(key)
-            .map(|s| String::from_utf8_lossy(s.expose()).into_owned())
-            .unwrap_or_else(|| "<missing>".to_string())
-    })
+/// reproduces `a` (see the T059 round-trip test). Fails closed when a
+/// secret is unavailable: embedding a `<missing>` sentinel would poison
+/// the artifact (a re-import of it stores the literal string as key
+/// material), so the caller gets an error naming the account/field.
+pub fn export_plain(imp: &ConfigImport) -> Result<String, String> {
+    let missing = std::cell::RefCell::new(Vec::<String>::new());
+    let text = export_with(imp, &|key| {
+        imp.secrets.get(key).map_or_else(
+            || {
+                missing.borrow_mut().push(key.to_string());
+                String::new()
+            },
+            |s| String::from_utf8_lossy(s.expose()).into_owned(),
+        )
+    });
+    let missing = missing.into_inner();
+    if let Some(first) = missing.first() {
+        return Err(format!(
+            "export `{}`: secret `{first}` unavailable (in-memory secrets only — re-import the .conf)",
+            imp.ref_name
+        ));
+    }
+    Ok(text)
 }
 
 /// CLI export: values reproduced, secrets replaced with `<redacted>`.
@@ -152,7 +167,8 @@ mod tests {
     fn plain_round_trips() {
         let a = sample();
         assert_eq!(a.verdict, ImportVerdict::Accepted);
-        let b = ConfigImport::parse_str(&export_plain(&a), std::path::Path::new("x.conf")).unwrap();
+        let text = export_plain(&a).expect("secrets present");
+        let b = ConfigImport::parse_str(&text, std::path::Path::new("x.conf")).unwrap();
         assert_eq!(b.interface, a.interface);
         assert_eq!(b.peers, a.peers);
     }
@@ -161,6 +177,24 @@ mod tests {
     fn redacted_hides_keys() {
         let text = export_redacted(&sample());
         assert!(!text.contains("cB6V3Xk8"));
+        assert!(text.contains("PrivateKey = <redacted>"));
+    }
+
+    #[test]
+    fn plain_export_fails_closed_when_secret_missing() {
+        // An unloadable secret must error naming the field, never emit a
+        // `<missing>` sentinel (a re-import of that artifact would store
+        // the literal string as key material).
+        let mut a = sample();
+        a.secrets.remove("interface.private_key");
+        let err = export_plain(&a).expect_err("missing secret");
+        assert!(
+            err.contains("interface.private_key") && err.contains("sample"),
+            "names secret and ref: {err}"
+        );
+        assert!(!err.contains("PrivateKey = <missing>"));
+        // Redacted export still masks (that is its purpose) — no failure.
+        let text = export_redacted(&a);
         assert!(text.contains("PrivateKey = <redacted>"));
     }
 }

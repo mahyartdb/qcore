@@ -162,14 +162,18 @@ pub fn masked_value(key: &str, value: &str) -> String {
 
 /// One masked `layer=… hop=… kind=… cause=…` line shared by every sink that
 /// renders a failure report as text (session text/stderr reports, FFI error
-/// messages). The free-text cause is masked; the raw `Display` impl is never
-/// emitted to a sink. One format means a `FailureReport` shape change lands
-/// here, not in three hand-copied literals that silently diverge.
+/// messages). Free-text fields are masked like the NDJSON stream masks them:
+/// the cause by key (`cause`), and `hop_id` by value so a secret-shaped hop
+/// id is never emitted raw from any sink (same `masked_value` semantics —
+/// hop ids are hop-local labels, and a provider echo that put a secret in
+/// one must not survive rendering). One format means a `FailureReport`
+/// shape change lands here, not in three hand-copied literals that silently
+/// diverge.
 pub fn masked_failure_line(f: &qcore_transport_api::FailureReport) -> String {
     format!(
         "layer={} hop={} kind={} cause={}",
         f.layer,
-        f.hop_id,
+        masked_value("hop_id", &f.hop_id),
         f.kind,
         masked_value("cause", &f.cause)
     )
@@ -355,6 +359,22 @@ mod tests {
             line,
             "layer=transport hop=wg-0 kind=transport cause=<redacted>"
         );
+    }
+
+    #[test]
+    fn masked_failure_line_masks_secret_like_hop_id() {
+        // FIX: `hop_id` reaches sinks raw (`layer=… hop=…`) while the same
+        // string in `cause` gets masked — a secret-shaped hop id must mask
+        // with the same `masked_value` semantics in every sink.
+        use qcore_transport_api::{FailureLayer, FailureReport};
+        let hop = ECHO_44;
+        let f = FailureReport::new(FailureLayer::Transport, hop, "refused", "transport");
+        let line = masked_failure_line(&f);
+        assert!(!line.contains(hop), "secret-like hop_id leaked: {line}");
+        assert!(line.contains("hop=<redacted>"), "masked in place: {line}");
+        // Ordinary hop ids pass through untouched.
+        let plain = FailureReport::new(FailureLayer::Transport, "wg-0", "refused", "transport");
+        assert!(masked_failure_line(&plain).contains("hop=wg-0"));
     }
 
     #[test]

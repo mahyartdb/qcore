@@ -18,6 +18,21 @@ use std::process::Command;
 
 const TARGETS_TOML: &str = include_str!("targets.toml");
 
+/// Which stream an assertion's `contains` needle must appear in (FIX:
+/// merged output let stream-swap regressions pass — a JSON document on
+/// stderr or a diagnostic on stdout both counted as success). The CLI
+/// contract has exactly two result/diagnostic streams; every assertion
+/// pins the one its content legally lands on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Stream {
+    /// Results (JSON documents, table output).
+    Stdout,
+    /// Diagnostics (`qcore: ...`).
+    Stderr,
+}
+
+use Stream::{Stderr, Stdout};
+
 const QCORE_SYMBOLS: &[&str] = &[
     "qcore_abi_version",
     "qcore_engine_new",
@@ -43,47 +58,77 @@ fn targets() -> Vec<String> {
         .collect()
 }
 
-fn cli(args: &[&str]) -> Result<(i32, String), String> {
+struct CliOutput {
+    code: i32,
+    stdout: String,
+    stderr: String,
+}
+
+fn cli(args: &[&str]) -> Result<CliOutput, String> {
     let mut cmd = Command::new("cargo");
     cmd.args(["run", "-q", "-p", "qcore-cli", "--"]);
     cmd.args(args);
     let out = cmd.output().map_err(|e| format!("spawn qcore-cli: {e}"))?;
-    let code = out.status.code().unwrap_or(-1);
-    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
-    text.push_str(&String::from_utf8_lossy(&out.stderr));
-    Ok((code, text))
+    Ok(CliOutput {
+        code: out.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+    })
 }
 
-fn expect(args: &[&str], code: i32, contains: &str, what: &str) -> Result<(), String> {
-    let (got, text) = cli(args)?;
-    if got != code {
-        return Err(format!("smoke {what}: exit {got}, want {code}\n{text}"));
+/// Run the CLI and assert exit code plus that `contains` appears on the
+/// expected stream. `needles` may be empty (code-only assertion).
+fn expect(args: &[&str], code: i32, needles: &[(&str, Stream)], what: &str) -> Result<(), String> {
+    let out = cli(args)?;
+    if out.code != code {
+        let text = format!("{}\n{}", out.stdout, out.stderr);
+        return Err(format!(
+            "smoke {what}: exit {}, want {code}\n{text}",
+            out.code
+        ));
     }
-    if !contains.is_empty() && !text.contains(contains) {
-        return Err(format!("smoke {what}: output lacks `{contains}`\n{text}"));
+    for (contains, stream) in needles {
+        let haystack = match stream {
+            Stdout => &out.stdout,
+            Stderr => &out.stderr,
+        };
+        if !haystack.contains(contains) {
+            let text = format!("stdout:\n{}\nstderr:\n{}", out.stdout, out.stderr);
+            return Err(format!(
+                "smoke {what}: {stream:?} lacks `{contains}`\n{text}"
+            ));
+        }
     }
     println!("smoke {what}: ok");
     Ok(())
 }
 
 fn native_matrix() -> Result<(), String> {
-    expect(&["version", "--json"], 0, "\"abi\"", "version --json")?;
+    // JSON results on stdout (the one-document contract), diagnostics on
+    // stderr: the per-assertion stream selector below makes a stream swap
+    // a smoke failure instead of a silent pass.
+    expect(
+        &["version", "--json"],
+        0,
+        &[("\"abi\"", Stdout)],
+        "version --json",
+    )?;
     expect(
         &["preflight", "--chain", "mock"],
         0,
-        "preflight ok",
+        &[("preflight ok", Stderr)],
         "preflight mock",
     )?;
     expect(
         &["preflight", "--chain", "mock,relay"],
         0,
-        "preflight ok",
+        &[("preflight ok", Stderr)],
         "preflight mock,relay",
     )?;
     for family in ["ipv4", "ipv6", "dual"] {
         // Empty discovery per family: exit 4 with a shaped empty document
-        // (`--output json` prints `{"ok":false,...,"candidates":[]}`), never
-        // a silent fallback and never an unshaped stdout.
+        // (`--output json` prints `{"ok":false,...,"candidates":[]}`) on
+        // stdout, never a silent fallback and never an unshaped stdout.
         expect(
             &[
                 "scan",
@@ -97,7 +142,7 @@ fn native_matrix() -> Result<(), String> {
                 "json",
             ],
             4,
-            "\"candidates\":[]",
+            &[("\"candidates\":[]", Stdout)],
             &format!("empty scan {family} exit 4"),
         )?;
     }
@@ -105,17 +150,21 @@ fn native_matrix() -> Result<(), String> {
     expect(
         &["preflight", "--chain", "gool,gool"],
         2,
-        "exit 2",
+        &[("exit 2", Stderr)],
         "over-depth exit 2",
     )?;
-    expect(&["ls"], 0, "transports:", "ls lists transports")?;
-    expect(&["ls"], 0, "obfuscation profiles:", "ls lists obfuscation")?;
-    // Import rejection is exit 5 naming the field; empty scan is exit 4
-    // with no silent unverified fallback.
+    expect(
+        &["ls"],
+        0,
+        &[("transports:", Stdout), ("obfuscation profiles:", Stdout)],
+        "ls lists transports",
+    )?;
+    // Import rejection is exit 5 naming the field (diagnostic on stderr);
+    // empty scan is exit 4 with no silent unverified fallback.
     expect(
         &["import", "tests/fixtures/bogus.conf"],
         5,
-        "Bogus",
+        &[("Bogus", Stderr)],
         "import rejection exit 5",
     )?;
     Ok(())
@@ -167,16 +216,6 @@ pub fn check_cdylib_exports(path: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
-fn cdylib_name() -> &'static str {
-    if cfg!(windows) {
-        "qcore_ffi.dll"
-    } else if cfg!(target_os = "macos") {
-        "libqcore_ffi.dylib"
-    } else {
-        "libqcore_ffi.so"
-    }
-}
-
 pub fn run(args: Vec<String>) -> super::anyhow::Result<()> {
     let target = args
         .iter()
@@ -195,7 +234,7 @@ pub fn run(args: Vec<String>) -> super::anyhow::Result<()> {
         // cache miss) cannot silently skip the gate, then fail closed when
         // the artifact is still absent.
         super::shell("cargo build -q -p qcore-ffi")?;
-        let path = std::path::Path::new("target/debug").join(cdylib_name());
+        let path = std::path::Path::new("target/debug").join(super::build::cdylib_name_host());
         if !path.exists() {
             return Err(super::anyhow::Error::msg(format!(
                 "cdylib artifact missing after build: {}",
@@ -210,11 +249,10 @@ pub fn run(args: Vec<String>) -> super::anyhow::Result<()> {
     super::shell(&format!("cargo run -q -p xtask -- build --target {target}"))?;
     // The cross artifact cannot execute here, but its presence plus the
     // export scan still gate packaging: a target that builds nothing (or
-    // drops symbols) fails instead of printing build-OK.
-    let artifact = std::path::Path::new("target")
-        .join(&target)
-        .join("debug")
-        .join(cdylib_name());
+    // drops symbols) fails instead of printing build-OK. The path matches
+    // the build backend (build.rs): every non-native backend builds
+    // `--release`, so artifacts land in `target/<triple>/release/`.
+    let artifact = super::build::cross_cdylib_path(&target);
     if !artifact.exists() {
         return Err(super::anyhow::Error::msg(format!(
             "cross artifact missing after build (expected {}); per-target smoke cannot validate an unbuilt target",
@@ -227,4 +265,59 @@ pub fn run(args: Vec<String>) -> super::anyhow::Result<()> {
     }
     println!("smoke {target}: build + exports OK (execution on its runner)");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::build::{artifact_dir, cdylib_name_for_triple, cross_cdylib_path};
+
+    #[test]
+    fn native_debug_dir_for_smoke_gate() {
+        let p = artifact_dir("native", false);
+        assert_eq!(p, std::path::PathBuf::from("target/debug"));
+        let r = artifact_dir("native", true);
+        assert_eq!(r, std::path::PathBuf::from("target/release"));
+    }
+
+    #[test]
+    fn cross_targets_use_release_dir_matching_build_backend() {
+        // build.rs backends pass `--release` for every non-native target:
+        // the smoke check must look where the build actually wrote.
+        for triple in [
+            "x86_64-unknown-linux-gnu",
+            "aarch64-linux-android",
+            "i686-pc-windows-msvc",
+        ] {
+            let p = artifact_dir(triple, true);
+            assert_eq!(
+                p,
+                std::path::PathBuf::from("target")
+                    .join(triple)
+                    .join("release"),
+                "{triple}"
+            );
+        }
+    }
+
+    #[test]
+    fn cdylib_names_follow_target_platform_not_host() {
+        assert_eq!(
+            cdylib_name_for_triple("i686-pc-windows-msvc"),
+            "qcore_ffi.dll"
+        );
+        assert_eq!(
+            cdylib_name_for_triple("x86_64-unknown-linux-gnu"),
+            "libqcore_ffi.so"
+        );
+        assert_eq!(
+            cdylib_name_for_triple("aarch64-linux-android"),
+            "libqcore_ffi.so"
+        );
+        // A windows host cross-building linux must still expect .so.
+        let p = cross_cdylib_path("x86_64-unknown-linux-gnu");
+        assert_eq!(
+            p,
+            std::path::PathBuf::from("target/x86_64-unknown-linux-gnu/release/libqcore_ffi.so")
+        );
+    }
 }

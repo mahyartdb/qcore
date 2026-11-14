@@ -128,10 +128,16 @@ fn resolve_fields(cfg: &HopConfig, peer: &str) -> Result<WgParams, String> {
         .get("peer_public_key")
         .ok_or_else(|| "wireguard hop requires peer_public_key=<64 hex>".to_string())
         .and_then(parse_key_hex)?;
-    let preshared_key = cfg.get("preshared_key").map(parse_key_hex).transpose()?;
+    let preshared_key = cfg
+        .get("preshared_key")
+        .map(|s| parse_key_hex(s).map_err(|e| format!("invalid preshared_key: {e}")))
+        .transpose()?;
     let keepalive = cfg
         .get("keepalive")
-        .map(|s| s.parse::<u16>().map_err(|e| e.to_string()))
+        .map(|s| {
+            s.parse::<u16>()
+                .map_err(|e| format!("invalid keepalive: {e}"))
+        })
         .transpose()?;
     let awg = if peer == "awg" {
         Some(crate::awg::parse_fields(cfg)?)
@@ -245,6 +251,36 @@ mod tests {
         ]))
         .expect_err("bad awg value");
         assert!(err.contains("awg_jc"), "{err}");
+    }
+
+    #[test]
+    fn bad_keepalive_names_field() {
+        let k = "ab".repeat(32);
+        let err = resolve(&cfg(&[
+            ("endpoint", "127.0.0.1:51820"),
+            ("private_key", &k),
+            ("peer_public_key", &k),
+            ("keepalive", "abc"),
+        ]))
+        .expect_err("bad keepalive");
+        assert!(err.contains("invalid keepalive"), "{err}");
+        assert!(
+            !err.contains("invalid digit found in string") || err.contains("invalid keepalive"),
+            "cause rides the field-named message: {err}"
+        );
+    }
+
+    #[test]
+    fn bad_preshared_key_names_field() {
+        let k = "ab".repeat(32);
+        let err = resolve(&cfg(&[
+            ("endpoint", "127.0.0.1:51820"),
+            ("private_key", &k),
+            ("peer_public_key", &k),
+            ("preshared_key", "zz"),
+        ]))
+        .expect_err("bad preshared_key");
+        assert!(err.contains("invalid preshared_key"), "{err}");
     }
 
     #[tokio::test]

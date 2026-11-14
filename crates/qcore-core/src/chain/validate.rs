@@ -89,6 +89,38 @@ pub fn validate(
         }
     }
 
+    // Sidecar requirement from descriptors: a transport that spawns a local
+    // helper process (`needs_sidecar`, e.g. psiphon) needs its executable
+    // path authored on the hop — an empty sidecar_path would pass preflight
+    // and die at factory build (with sockets). Fail closed here instead.
+    for (i, hop) in hops.iter().enumerate() {
+        let Some(desc) = registry.get(hop.config.kind()) else {
+            continue;
+        };
+        if !desc.needs_sidecar {
+            continue;
+        }
+        let empty = match hop.config.to_factory_config().fields.get("sidecar_path") {
+            None => true,
+            Some(p) => p.trim().is_empty(),
+        };
+        if empty {
+            return Err(ChainError::new(
+                Some(i),
+                Some(hop.id.clone()),
+                format!(
+                    "hop `{}` (transport `{}`) requires `sidecar_path=<executable path>`",
+                    hop.id,
+                    hop.config.kind()
+                ),
+                Some(format!(
+                    "pass `sidecar_path=` pointing at the {} helper executable",
+                    desc.kind
+                )),
+            ));
+        }
+    }
+
     // Carrier compatibility from descriptors: a hop that dials UDP datagrams
     // from its carrier needs a carrier providing UDP egress. A hop that
     // frames UDP over a TCP carrier (accepts_tcp_carrier without
@@ -235,6 +267,21 @@ static RELAY_DESC: TransportDescriptor = TransportDescriptor {
     obfuscation_families: &[],
     config_schema: "test",
     needs_sidecar: false,
+};
+
+/// Sidecar-requiring transport (the psiphon shape): needs_sidecar true.
+#[cfg(test)]
+static SIDECAR_DESC: TransportDescriptor = TransportDescriptor {
+    kind: "sidecar-test",
+    capabilities: qcore_transport_api::Capabilities {
+        accepts_tcp_carrier: true,
+        accepts_udp_carrier: true,
+        dials_tcp: true,
+        dials_udp: true,
+    },
+    obfuscation_families: &[],
+    config_schema: "test",
+    needs_sidecar: true,
 };
 
 /// Hypothetical second UDP-over-TCP adapter: relay-shaped capabilities under
@@ -399,6 +446,59 @@ pub(crate) mod tests {
     #[test]
     fn empty_chain_rejected() {
         assert!(validate(&[], 3, &TestDescriptors::standard()).is_err());
+    }
+
+    fn sidecar_hop(id: &str, sidecar_path: &str) -> HopSpec {
+        use crate::config::hop::PluginHopConfig;
+        use crate::config::HopConfig;
+        HopSpec {
+            id: id.into(),
+            config: HopConfig::Plugin(PluginHopConfig {
+                kind: "sidecar-test".into(),
+                family: "dual".into(),
+                fields: if sidecar_path.is_empty() {
+                    std::collections::BTreeMap::new()
+                } else {
+                    std::collections::BTreeMap::from([(
+                        "sidecar_path".to_string(),
+                        sidecar_path.to_string(),
+                    )])
+                },
+            }),
+        }
+    }
+
+    #[test]
+    fn sidecar_transport_without_sidecar_path_rejected_at_validation() {
+        // Descriptor says needs_sidecar: an empty/absent sidecar_path must
+        // fail at validation (zero sockets), not at factory build.
+        let source = TestDescriptors::default().with(&SIDECAR_DESC);
+        for id in ["psi-0", "psi-1"] {
+            let err = validate(&[sidecar_hop(id, "")], 3, &source).unwrap_err();
+            assert!(
+                err.reason.contains("sidecar_path") && err.reason.contains("sidecar-test"),
+                "names field and transport: {err}"
+            );
+            assert_eq!(err.hop_id.as_deref(), Some(id));
+        }
+    }
+
+    #[test]
+    fn sidecar_transport_with_sidecar_path_valid() {
+        let source = TestDescriptors::default().with(&SIDECAR_DESC);
+        validate(
+            &[sidecar_hop("psi-0", "/usr/local/bin/psiphon")],
+            3,
+            &source,
+        )
+        .expect("authored sidecar_path validates");
+    }
+
+    #[test]
+    fn non_sidecar_transports_unaffected_by_sidecar_gate() {
+        // needs_sidecar=false kinds pass with no sidecar_path (regression
+        // guard: the gate must key off the descriptor, not the kind).
+        validate(&[wg("w")], 3, &TestDescriptors::standard()).expect("no sidecar needed");
     }
 
     #[test]

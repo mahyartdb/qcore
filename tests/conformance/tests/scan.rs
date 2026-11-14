@@ -202,12 +202,16 @@ fn winner_for(addr: SocketAddr) -> TransportWinner {
 
 #[tokio::test]
 async fn per_transport_winner_reverified_first() {
+    let _ = qcore_transports::linked_kinds();
     let d = dirs("winner");
     let live = echo_listener().await;
-    record_winner(&d, "warp", winner_for(live)).expect("records");
+    // `mock` is a registered kind with a TCP-carrier descriptor, so the
+    // fast-path re-verify applies (FIX 2: non-TCP-probeable transports miss
+    // without eviction — see udp_winner_survives_tcp_refused_probe).
+    record_winner(&d, "mock", winner_for(live)).expect("records");
 
     // Healthy winner: fast-path hit, no full scan needed downstream.
-    let hit = verify_winner_first(&d, "warp", "ipv4", std::time::Duration::from_secs(2)).await;
+    let hit = verify_winner_first(&d, "mock", "ipv4", std::time::Duration::from_secs(2)).await;
     let (addr, latency_ms) = hit.expect("winner re-verifies");
     assert_eq!(addr, live);
     assert!(latency_ms < 2000, "re-verify is the fast path");
@@ -215,22 +219,25 @@ async fn per_transport_winner_reverified_first() {
     // Transports are independent namespaces.
     assert!(!read_winners(&d).contains_key("masque"));
     assert_eq!(
-        read_winners(&d).get("warp").unwrap().address,
+        read_winners(&d).get("mock").unwrap().address,
         live.to_string()
     );
 }
 
 #[tokio::test]
 async fn dead_winner_evicts_instead_of_reuse() {
+    let _ = qcore_transports::linked_kinds();
     let d = dirs("evict");
     let dead: SocketAddr = closed_port();
-    record_winner(&d, "warp", winner_for(dead)).expect("records");
+    // `mock` is TCP-probeable: a refused probe proves the endpoint dead, so
+    // eviction (not retention) is honest here.
+    record_winner(&d, "mock", winner_for(dead)).expect("records");
 
     // Dead winner: miss + eviction, so the caller runs a full scan.
-    let hit = verify_winner_first(&d, "warp", "ipv4", std::time::Duration::from_secs(2)).await;
+    let hit = verify_winner_first(&d, "mock", "ipv4", std::time::Duration::from_secs(2)).await;
     assert!(hit.is_none(), "dead winner is not reused");
     assert!(
-        !read_winners(&d).contains_key("warp"),
+        !read_winners(&d).contains_key("mock"),
         "dead winner evicted"
     );
 }
@@ -242,8 +249,29 @@ async fn winner_family_mismatch_keeps_entry() {
     record_winner(&d, "warp", winner_for(live)).expect("records");
 
     // Wrong family for this scan: miss, but the entry survives for its own
-    // family's next scan (no destruction on a non-applicable lookup).
+    // family's next scan (no destruction on a non-applicable lookup). This
+    // precedes probeability: the scan never probed this family at all.
     let hit = verify_winner_first(&d, "warp", "ipv6", std::time::Duration::from_secs(2)).await;
     assert!(hit.is_none());
     assert!(read_winners(&d).contains_key("warp"), "entry kept");
+}
+
+/// FIX 2: a non-TCP-probeable transport's winner misses WITHOUT eviction on
+/// a TCP-refused re-verify — the data-plane probe is TCP-only, so a refusal
+/// proves nothing about a UDP-carried endpoint (shipped warp.toml seeds are
+/// UDP ports; a healthy WG/MASQUE winner must not be destroyed). Eviction
+/// stays for TCP-probeable transports (`dead_winner_evicts_instead_of_reuse`).
+#[tokio::test]
+async fn udp_winner_survives_tcp_refused_probe() {
+    let d = dirs("udpkeep");
+    let dead: SocketAddr = closed_port();
+    // "warp" is not a registered transport kind → not TCP-probeable (fail
+    // closed: no eviction on a probe that cannot speak the carrier).
+    record_winner(&d, "warp", winner_for(dead)).expect("records");
+    let hit = verify_winner_first(&d, "warp", "ipv4", std::time::Duration::from_secs(2)).await;
+    assert!(hit.is_none(), "non-probeable winner never fast-path-hits");
+    assert!(
+        read_winners(&d).contains_key("warp"),
+        "TCP-refused probe must not evict a non-TCP-probeable winner"
+    );
 }

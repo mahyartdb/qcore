@@ -263,13 +263,35 @@ impl Engine {
         })
     }
 
-    /// Tear down all live sessions (exit-first per session).
+    /// Tear down all live sessions (exit-first per session). Best effort:
+    /// every handle is removed and stopped even when earlier stops fail; the
+    /// first failure is reported once after the sweep.
     pub async fn stop(&self) -> Result<(), FailureReport> {
-        let ids: Vec<String> = { self.lock_live().keys().cloned().collect() };
-        for id in ids {
-            self.stop_session(&id).await?;
+        let handles: Vec<SessionHandle> = {
+            let map = self.lock_live();
+            map.values().cloned().collect()
+        };
+        let mut first_err = None;
+        for handle in handles {
+            let removed = { self.lock_live().remove(&handle.id) }.is_some();
+            if !removed {
+                continue;
+            }
+            if let Err(e) = handle.stop_all().await {
+                if first_err.is_none() {
+                    first_err = Some(FailureReport::new(
+                        FailureLayer::Chain,
+                        handle.exit_hop_id.clone(),
+                        e.message,
+                        "shutdown",
+                    ));
+                }
+            }
         }
-        Ok(())
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     /// Load a stored provider identity (002). `None` on missing, corrupt,
@@ -290,16 +312,20 @@ impl Engine {
         crate::identity::store::save(&self.config.dirs, role, id)
     }
 
-    /// How many WARP identities these specs need: WARP hops without
-    /// endpoint/import material, capped at 2 (outer + inner for GOOL-like
-    /// pairs). Read-only: presets resolve from dirs, zero sockets (FR-003).
+    /// How many WARP identities these specs need: every WARP hop without
+    /// import material (an explicit `endpoint=` still needs identity keys),
+    /// capped at 2 (outer + inner for GOOL-like pairs). Read-only: presets
+    /// resolve from dirs, zero sockets (FR-003). The predicate must match
+    /// [`crate::identity::inject::materials_for_chain`] exactly — that is
+    /// the hop set inject resolves identity material for at start, so a
+    /// hop counted here must be a hop inject demands an identity for.
     pub fn warp_identities_needed(&self, specs: &[ExpandedHop]) -> Result<usize, ChainError> {
         let presets = crate::chain::preset::resolve_presets(&self.config.dirs)?;
         let hops = crate::chain::preset::expand(specs.to_vec(), &presets)?;
         let mut need = 0;
         for h in &hops {
             if let crate::config::HopConfig::Wireguard(c) = &h.config {
-                if c.peer == "warp" && c.endpoint.is_none() && c.import_ref.is_none() {
+                if c.peer == "warp" && c.import_ref.is_none() {
                     need += 1;
                 }
             }
@@ -722,5 +748,271 @@ mod tests {
             .expect("stop-all on poisoned map succeeds");
         assert!(engine.session_report("s1").is_none());
         assert!(engine.session_report("s2").is_none());
+    }
+
+    static FAILING_STOP_DESCRIPTOR: qcore_transport_api::TransportDescriptor =
+        qcore_transport_api::TransportDescriptor {
+            kind: "failing-stop",
+            capabilities: qcore_transport_api::Capabilities {
+                accepts_tcp_carrier: false,
+                accepts_udp_carrier: false,
+                dials_tcp: false,
+                dials_udp: false,
+            },
+            obfuscation_families: &[],
+            config_schema: "failing-stop/v1",
+            needs_sidecar: false,
+        };
+
+    struct FailingStopHop {
+        stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    struct UnusedDialer;
+
+    #[async_trait::async_trait]
+    impl qcore_transport_api::Dialer for UnusedDialer {
+        async fn dial_tcp(
+            &self,
+            _dst: std::net::SocketAddr,
+        ) -> Result<Box<dyn qcore_transport_api::ByteStream>, qcore_transport_api::HopError>
+        {
+            Err(qcore_transport_api::HopError::validation("unused"))
+        }
+        async fn dial_udp(
+            &self,
+            _dst: std::net::SocketAddr,
+        ) -> Result<Box<dyn qcore_transport_api::UdpFlow>, qcore_transport_api::HopError> {
+            Err(qcore_transport_api::HopError::validation("unused"))
+        }
+        fn capabilities(&self) -> qcore_transport_api::Capabilities {
+            qcore_transport_api::Capabilities {
+                accepts_tcp_carrier: false,
+                accepts_udp_carrier: false,
+                dials_tcp: false,
+                dials_udp: false,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl qcore_transport_api::RunningHop for FailingStopHop {
+        fn descriptor(&self) -> &'static qcore_transport_api::TransportDescriptor {
+            &FAILING_STOP_DESCRIPTOR
+        }
+        fn dialer(&self) -> std::sync::Arc<dyn qcore_transport_api::Dialer> {
+            std::sync::Arc::new(UnusedDialer)
+        }
+        fn health(&self) -> qcore_transport_api::HopHealth {
+            qcore_transport_api::HopHealth::Healthy
+        }
+        fn events(&self) -> tokio::sync::broadcast::Receiver<HopEvent> {
+            tokio::sync::broadcast::channel(1).0.subscribe()
+        }
+        async fn stop(&self) -> Result<(), qcore_transport_api::HopError> {
+            self.stopped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Err(qcore_transport_api::HopError::validation("stop boom"))
+        }
+    }
+
+    fn failing_handle(
+        id: &str,
+        stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> SessionHandle {
+        let (events, _) = tokio::sync::broadcast::channel(8);
+        SessionHandle {
+            id: id.to_string(),
+            exit_hop_id: "exit-f".to_string(),
+            chain: ChainSer {
+                hops: Vec::new(),
+                max_depth: 3,
+            },
+            started: vec![crate::session::lifecycle::StartedHop {
+                hop_id: id.to_string(),
+                kind: "failing-stop".to_string(),
+                family: "ipv4".to_string(),
+                endpoint: None,
+                via: "root".to_string(),
+                nested: false,
+                inner_mtu: 1500,
+                obfuscation: None,
+                hop: std::sync::Arc::new(FailingStopHop { stopped }),
+                congested_drops: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                keepalive: None,
+                forwarder: None,
+            }],
+            events,
+        }
+    }
+
+    #[test]
+    fn warp_identities_needed_matches_inject_predicate() {
+        // The count predicate must agree with `materials_for_chain` (inject
+        // resolves identity material for exactly these hops): a hop counted
+        // here but not injectable (or vice versa) breaks the auto-register
+        // contract. Representative shapes: explicit-endpoint warp hop,
+        // import hop, non-warp hop, plain warp hop.
+        let dir = std::env::temp_dir().join(format!(
+            "qcore-engine-pair-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
+        ));
+        let dirs = crate::config::profile_dir::ProfileDirs::resolve(
+            Some(dir.join("config")),
+            Some(dir.join("profiles")),
+        );
+        let engine = Engine::new(EngineConfig {
+            dirs: dirs.clone(),
+            ..EngineConfig::default()
+        });
+        // Seed the outer identity so inject resolves warp hops (its
+        // contract: stored identity + endpoint from chain or cache).
+        crate::identity::store::save(
+            &dirs,
+            crate::identity::store::IdentityRole::Outer,
+            &crate::identity::model::ProviderIdentity {
+                device_id: "dev-pair-1".to_string(),
+                access_token: crate::config::secret::SecretString::new("tok"),
+                private_key_b64: crate::config::secret::SecretString::new(
+                    "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=",
+                ),
+                peer_key_b64: "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk=".to_string(),
+                interface_v4: "172.16.0.2".to_string(),
+                interface_v6: "2606:4700:110::2".to_string(),
+                masque: None,
+                refused: false,
+                license_upgraded: false,
+            },
+        )
+        .expect("seeds identity");
+        let wg = |peer: &str, endpoint: Option<&str>, import: Option<&str>| HopSpec {
+            id: format!("wg-{peer}-{import:?}-{endpoint:?}"),
+            config: crate::config::HopConfig::Wireguard(crate::config::WireguardConfig {
+                peer: peer.to_string(),
+                import_ref: import.map(str::to_string),
+                obfuscation: None,
+                family: "dual".to_string(),
+                endpoint: endpoint.map(str::to_string),
+            }),
+        };
+        let masque = |endpoint: Option<&str>| HopSpec {
+            id: format!("masque-{endpoint:?}"),
+            config: crate::config::HopConfig::Masque(crate::config::MasqueConfig {
+                alpn: "h3".to_string(),
+                obfuscation: None,
+                family: "dual".to_string(),
+                endpoint: endpoint.map(str::to_string),
+            }),
+        };
+        let expanded = |hops: &[HopSpec]| {
+            hops.iter()
+                .map(|h| ExpandedHop::Hop(h.clone()))
+                .collect::<Vec<_>>()
+        };
+        let inject_count = |hops: &[HopSpec]| {
+            crate::identity::inject::materials_for_chain(&dirs, hops)
+                .map(|m| m.len())
+                .unwrap_or_else(|(hop, msg)| {
+                    panic!("inject must resolve for the pairing test: {hop}: {msg}")
+                })
+        };
+        // Explicit-endpoint warp hop: identity keys still needed (the
+        // endpoint removes only the scan requirement).
+        let explicit = vec![wg("warp", Some("162.159.192.1:2408"), None)];
+        let needed = engine
+            .warp_identities_needed(&expanded(&explicit))
+            .expect("presets resolve");
+        assert_eq!(needed, 1, "explicit-endpoint warp hop needs an identity");
+        assert_eq!(needed, inject_count(&explicit));
+        // Import hop: no identity (its keys come from the import store);
+        // inject skips it too, so the counts pair at zero.
+        let imported = vec![wg("imported", None, Some("ref"))];
+        let needed = engine
+            .warp_identities_needed(&expanded(&imported))
+            .expect("presets resolve");
+        assert_eq!(needed, 0, "import hop carries its own keys");
+        assert_eq!(needed, inject_count(&imported));
+        // Non-warp shapes: identity-free hops count zero on both sides.
+        let plain = vec![
+            wg("personal", Some("203.0.113.9:51820"), None),
+            masque(Some("162.159.192.1:443")),
+        ];
+        let needed = engine
+            .warp_identities_needed(&expanded(&plain))
+            .expect("presets resolve");
+        assert_eq!(needed, 0, "non-warp hops need no identity");
+        assert_eq!(needed, inject_count(&plain));
+        // Mixed chain: the warp hop is the only identity consumer.
+        let mixed = vec![
+            wg("warp", Some("162.159.192.1:2408"), None),
+            masque(Some("162.159.192.1:443")),
+            wg("imported", None, Some("ref")),
+        ];
+        let needed = engine
+            .warp_identities_needed(&expanded(&mixed))
+            .expect("presets resolve");
+        assert_eq!(needed, 1);
+        assert_eq!(needed, inject_count(&mixed));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn stop_all_reports_first_error_but_stops_every_session() {
+        let engine = test_engine();
+        let fail_stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        engine.lock_live().insert(
+            "s-fail".to_string(),
+            failing_handle("s-fail", fail_stopped.clone()),
+        );
+        engine
+            .lock_live()
+            .insert("s-ok".to_string(), dummy_handle("s-ok"));
+        let err = engine
+            .stop()
+            .await
+            .expect_err("failing session surfaces one report");
+        assert!(err.to_string().contains("stop boom"), "got: {err:?}");
+        assert_eq!(err.hop_id, "exit-f");
+        assert!(
+            fail_stopped.load(std::sync::atomic::Ordering::SeqCst),
+            "failing session's stop ran"
+        );
+        assert!(
+            engine.session_report("s-ok").is_none(),
+            "healthy session reaped despite the earlier failure"
+        );
+        assert!(
+            engine.session_report("s-fail").is_none(),
+            "failed session removed from live map"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_all_second_session_still_stops_after_first_fails() {
+        let engine = test_engine();
+        let fail_stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let second_stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        engine.lock_live().insert(
+            "s-fail".to_string(),
+            failing_handle("s-fail", fail_stopped.clone()),
+        );
+        engine.lock_live().insert(
+            "s-second".to_string(),
+            failing_handle("s-second", second_stopped.clone()),
+        );
+        let err = engine.stop().await.expect_err("first error reported");
+        assert!(err.to_string().contains("stop boom"), "got: {err:?}");
+        assert!(
+            fail_stopped.load(std::sync::atomic::Ordering::SeqCst),
+            "first failing session's stop ran"
+        );
+        assert!(
+            second_stopped.load(std::sync::atomic::Ordering::SeqCst),
+            "second session's stop still ran after the first errored"
+        );
     }
 }

@@ -166,11 +166,28 @@ impl SidecarSupervisor {
                             return Err(format!("sidecar `{label}`: stdout: {e}"));
                         }
                         Ok(None) => {
-                            // EOF before READY: exited early?
-                            let status = child.wait().await.ok();
-                            return Err(format!(
-                                "sidecar `{label}`: exited before readiness (status={status:?})"
-                            ));
+                            // EOF before READY: exited early? The exit wait
+                            // is a readiness path too — bound it by the
+                            // remaining budget (a wedged child cannot hang
+                            // spawn past the handshake deadline).
+                            match tokio::select! {
+                                status = child.wait() => Some(status),
+                                _ = &mut deadline => None,
+                            } {
+                                Some(status) => {
+                                    return Err(format!(
+                                        "sidecar `{label}`: exited before readiness (status={status:?})"
+                                    ));
+                                }
+                                None => {
+                                    let _ = child.kill().await;
+                                    let _ = child.wait().await;
+                                    return Err(format!(
+                                        "sidecar `{label}`: readiness handshake timed out after {:?} (no exit after stdout EOF)",
+                                        self.config.ready_timeout
+                                    ));
+                                }
+                            }
                         }
                         Ok(Some(l)) => {
                             if let Some(addr) = l.strip_prefix(READY_PREFIX) {

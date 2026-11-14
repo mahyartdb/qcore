@@ -336,6 +336,15 @@ fn build_hop(
         }
     }
     let family = get(pairs, "family", "dual");
+    // Explicit endpoints validate at the parse gate: a malformed
+    // `endpoint=` (bad host, non-numeric port) must die here naming the
+    // field, not mid-connect inside the transport. Same rules as the
+    // import parser's Endpoint check.
+    if let Some(ep) = pairs.get("endpoint") {
+        if let Err(e) = crate::config::import::validate_explicit_endpoint(ep) {
+            return Err(err(format!("invalid endpoint for transport `{kind}`: {e}")));
+        }
+    }
     let config = match kind {
         "wireguard" => HopConfig::Wireguard(WireguardConfig {
             peer: get(pairs, "peer", "warp"),
@@ -457,5 +466,40 @@ mod tests {
             "got: {}",
             err.reason
         );
+    }
+
+    #[test]
+    fn invalid_explicit_endpoint_rejected_at_parse() {
+        // `999.999.999.999` parses as a hostname-shaped token but the
+        // endpoint gate rejects the non-numeric port; both malformed
+        // shapes die at parse time naming the field, never mid-connect.
+        // `build_hop` directly: the test binary links no wireguard
+        // transport, so the registry-backed `parse_chain` path is
+        // unavailable here (chain-file gate coverage lives in chain_file).
+        let reg = crate::registry::TransportRegistry::global();
+        let pairs =
+            |v: &str| std::collections::BTreeMap::from([("endpoint".to_string(), v.to_string())]);
+        for bad in [
+            "999.999.999.999:notaport",
+            "1.2.3.4:0",
+            "[::1:51820",
+            "10.0.0.1:notaport",
+        ] {
+            let err = build_hop("wireguard", &pairs(bad), 0, &reg).unwrap_err();
+            assert!(
+                err.reason.contains("endpoint"),
+                "{bad}: names field: {}",
+                err.reason
+            );
+            let err = build_hop("masque", &pairs(bad), 0, &reg).unwrap_err();
+            assert!(
+                err.reason.contains("endpoint"),
+                "masque {bad}: names field: {}",
+                err.reason
+            );
+        }
+        // Well-formed explicit endpoints still build (bracketed IPv6 too).
+        build_hop("wireguard", &pairs("10.0.0.1:51820"), 0, &reg).expect("valid endpoint builds");
+        build_hop("masque", &pairs("[2001:db8::1]:443"), 0, &reg).expect("bracketed IPv6 builds");
     }
 }

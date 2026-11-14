@@ -9,3 +9,9 @@ name = "xtask"
 path = "src/main.rs"
 
 [dependencies]
+# Release archives (T089): tar.gz for linux/android delivery, zip for the
+# windows legs. flate2 1.x is already the tree's single flate2 line (shared
+# with the tor subtree); `zip` crate would add a new dependency family, so
+# the zip writer is std-only (STORE method) in release.rs.
+flate2 = "1"
+tar = "0.4"

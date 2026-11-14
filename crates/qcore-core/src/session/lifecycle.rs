@@ -8,7 +8,7 @@
 
 use crate::chain::Chain;
 use crate::registry::TransportRegistry;
-use crate::session::nest::{layer_mtu, PmtuProber};
+use crate::session::nest::layer_mtu;
 use crate::session::net::{spawn_keepalive, KeepalivePolicy};
 use qcore_transport_api::{
     Dialer, FailureLayer, FailureReport, HopErrorKind, HopEvent, RunningHop,
@@ -21,7 +21,7 @@ use std::time::Instant;
 /// hop's fixed endpoint when it has one, else the hop's configured family.
 /// `via` names the incoming carrier ("root" or the carrier hop id);
 /// `nested` is true when the carrier is encapsulated; `inner_mtu` is the
-/// layered (PMTU-probed) MTU reported for this layer.
+/// layered MTU reported for this layer.
 #[derive(Clone)]
 pub struct StartedHop {
     pub hop_id: String,
@@ -98,7 +98,7 @@ pub async fn bring_up(
                 .map(|s: &StartedHop| s.hop_id.clone())
                 .unwrap_or_else(|| "root".to_string())
         };
-        let mut prober = PmtuProber::new(layer_mtu(depth as u32));
+        let inner_mtu = layer_mtu(depth as u32);
         let kind = spec.config.kind();
         let Some(factory) = registry.factory(kind) else {
             unwind(&started).await;
@@ -159,12 +159,9 @@ pub async fn bring_up(
             }
             Ok(Err(e)) => {
                 unwind(&started).await;
-                return Err(to_report(&spec.id, e, nested, &mut prober));
+                return Err(to_report(&spec.id, e));
             }
-            Ok(Ok(hop)) => {
-                prober.report_success();
-                hop
-            }
+            Ok(Ok(hop)) => hop,
         };
         // Fan hop events into the session bus (push, not poll). The per-hop
         // bus is bounded-drop (#12): a slow session consumer loses bursts as
@@ -205,7 +202,7 @@ pub async fn bring_up(
             endpoint,
             via,
             nested,
-            inner_mtu: prober.current_mtu(),
+            inner_mtu,
             obfuscation: active_obfuscation,
             hop,
             congested_drops: forwarder_drops,
@@ -283,14 +280,10 @@ impl Drop for StartedHop {
     }
 }
 
-/// Map a factory build error to a layer + hop-naming report. Nested
-/// timeout/IO failures decay the PMTU prober and the decay is reported.
-fn to_report(
-    hop_id: &str,
-    e: qcore_transport_api::HopError,
-    nested: bool,
-    prober: &mut PmtuProber,
-) -> FailureReport {
+/// Map a factory build error to a layer + hop-naming report. The layered
+/// MTU already accounts for nesting depth; failures do not report a probe
+/// step-down (a fresh bring-up has no probe history to decay).
+fn to_report(hop_id: &str, e: qcore_transport_api::HopError) -> FailureReport {
     let layer = match e.kind {
         HopErrorKind::Validation => FailureLayer::Validation,
         HopErrorKind::Sidecar => FailureLayer::Sidecar,
@@ -302,18 +295,7 @@ fn to_report(
         HopErrorKind::Config | HopErrorKind::Shutdown => FailureLayer::Config,
     };
     let kind = format!("{:?}", e.kind).to_lowercase();
-    let mut cause = e.message;
-    if nested
-        && matches!(
-            e.kind,
-            HopErrorKind::Timeout | HopErrorKind::Io | HopErrorKind::Transport
-        )
-    {
-        if let Some(mtu) = prober.report_loss() {
-            cause.push_str(&format!(" (path MTU probed down to {mtu})"));
-        }
-    }
-    FailureReport::new(layer, hop_id, cause, kind)
+    FailureReport::new(layer, hop_id, e.message, kind)
 }
 
 #[cfg(test)]

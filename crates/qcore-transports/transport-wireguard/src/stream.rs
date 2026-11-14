@@ -184,6 +184,12 @@ impl StreamTable {
         self.dgram_drops.load(Ordering::Relaxed)
     }
 
+    /// Drop every stream entry (hop stop): closing the per-lane channels
+    /// delivers EOF/error to parked readers — writes already fail `Closed`.
+    pub fn clear(&self) {
+        self.inner.lock().unwrap().streams.clear();
+    }
+
     /// Count stream-lane drops and emit one `Congested` carrying the new
     /// cumulative total (best-effort: a full event bus drops the event, and
     /// the session forwarder's own lag accounting re-emits the count).
@@ -265,10 +271,14 @@ pub fn dispatch(table: &StreamTable, frame: Vec<u8>) -> Result<(), String> {
             // Zero-copy handoff: no payload copy, header sliced by refcount.
             let payload = Bytes::from(frame).slice(9..);
             // Bounded lane: the queue step cannot block (sync path, table
-            // lock held), so a full lane drops and counts — never unbounded
-            // growth, never a stall. A closed lane (reader gone) drops
-            // silently as before: only `Full` is congestion. Emission
-            // happens after the lock drops.
+            // lock held). A full lane drops and counts — and, per the module
+            // contract (loss stalls a stream, never silent corruption), the
+            // in-order cursor is NOT advanced until the chunk is actually
+            // queued: advancing first would let seq N+1 take the slot the
+            // dropped N was re-delivered into, punching a hole the reader
+            // sees as corruption. A closed lane (reader gone) drops
+            // silently: only `Full` is congestion. Emission happens after
+            // the lock drops.
             let mut dropped = 0u64;
             {
                 let mut t = table.inner.lock().unwrap();
@@ -277,22 +287,29 @@ pub fn dispatch(table: &StreamTable, frame: Vec<u8>) -> Result<(), String> {
                 };
                 // In-order delivery with reorder buffer.
                 if seq == entry.expect {
-                    entry.expect = entry.expect.wrapping_add(1);
-                    if matches!(
-                        entry.tx.try_send(StreamMsg::Data(payload)),
-                        Err(tokio::sync::mpsc::error::TrySendError::Full(_))
-                    ) {
-                        dropped += 1;
-                    }
-                    while let Some(next) = entry.pending.remove(&entry.expect) {
-                        entry.expect = entry.expect.wrapping_add(1);
-                        match entry.tx.try_send(StreamMsg::Data(next)) {
-                            Ok(()) => {}
-                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                dropped += 1;
-                                break;
+                    match entry.tx.try_send(StreamMsg::Data(payload)) {
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            // Congested: the chunk is dropped, the cursor
+                            // stays on this seq, so the sender's stall-model
+                            // re-delivery can queue it (and the buffered
+                            // successors) once the lane drains.
+                            dropped += 1;
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+                        Ok(()) => {
+                            entry.expect = entry.expect.wrapping_add(1);
+                            while let Some(next) = entry.pending.remove(&entry.expect) {
+                                match entry.tx.try_send(StreamMsg::Data(next)) {
+                                    Ok(()) => {
+                                        entry.expect = entry.expect.wrapping_add(1);
+                                    }
+                                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                        dropped += 1;
+                                        break;
+                                    }
+                                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
+                                }
                             }
-                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
                         }
                     }
                 } else if seq.wrapping_sub(entry.expect) < 1024 {
@@ -593,6 +610,7 @@ impl ByteStream for WgTcpStream {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     struct StubSender;
 
@@ -621,7 +639,11 @@ mod tests {
     /// Failing-first (#12 handoff): burst overflow on a bounded lane yields a
     /// counted `Congested` event — never unbounded growth. Pre-fix this
     /// failed: the lane was unbounded, so `stream_drops()` stayed 0 no
-    /// matter the burst.
+    /// matter the burst. Stall-model adaptation: the cursor no longer
+    /// advances past a Full lane (loss stalls, never corrupts), so beyond
+    /// the first Full drop the burst's later seqs hold their place in the
+    /// bounded reorder window instead of serially dropping — exactly one
+    /// drop is counted and the rest stall for re-delivery.
     #[tokio::test]
     async fn burst_overflow_yields_counted_congested_event() {
         let table = Arc::new(StreamTable::new());
@@ -640,7 +662,25 @@ mod tests {
         for seq in 0..burst as u32 {
             dispatch(&table, data_frame(id, seq, b"x")).expect("dispatches");
         }
-        assert_eq!(table.stream_drops(), 76, "overflow is counted, not grown");
+        assert_eq!(
+            table.stream_drops(),
+            1,
+            "the Full seq is counted, the rest stall"
+        );
+        // The cursor is parked at the Full seq: re-delivering it after a
+        // drain must queue — no seq was silently skipped.
+        assert_eq!(
+            table
+                .inner
+                .lock()
+                .unwrap()
+                .streams
+                .get(&id)
+                .expect("lane alive")
+                .expect,
+            STREAM_QUEUE_CAP as u32,
+            "cursor stalls on the dropped seq, never advances past it"
+        );
         // The last emission carries the cumulative total.
         let mut max_seen = 0u64;
         let mut seen_hop = String::new();
@@ -656,7 +696,7 @@ mod tests {
                 Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
             }
         }
-        assert_eq!(max_seen, 76, "cumulative total survives bus lag");
+        assert_eq!(max_seen, 1, "cumulative total survives bus lag");
         assert_eq!(seen_hop, "wg-test-0");
     }
 
@@ -668,6 +708,59 @@ mod tests {
         f.push(dst.len() as u8);
         f.extend_from_slice(dst.as_bytes());
         f
+    }
+
+    /// Stall-model contract (stream.rs 15-17: loss stalls a stream, never
+    /// silent corruption): a Full on the expected seq must NOT advance the
+    /// cursor past it — pre-fix the cursor advanced before try_send, so a
+    /// chunk dropped on Full let its successor deliver in its place and the
+    /// reader saw a silent hole. Fill the lane to its last slot, hit Full on
+    /// the next in-order chunk, drain one, then re-deliver: the reader must
+    /// see the predecessor and then the re-delivered chunk — never a hole.
+    #[tokio::test]
+    async fn full_lane_stalls_cursor_no_hole() {
+        use tokio::io::AsyncReadExt;
+        let table = Arc::new(StreamTable::new());
+        let dst: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let send: SendFrame = Arc::new(StubSender);
+        let mut stream = open_stream(&table, dst, send).await.expect("opens");
+        let id = stream.id;
+        // Fill the lane to its bound: seqs 0..=cap-1 queue in order, cursor
+        // ends at cap.
+        for seq in 0..STREAM_QUEUE_CAP as u32 {
+            dispatch(&table, data_frame(id, seq, b"x")).expect("dispatches");
+        }
+        // Next in-order chunk hits Full: dropped + counted, cursor stays.
+        dispatch(&table, data_frame(id, STREAM_QUEUE_CAP as u32, b"late"))
+            .expect("full lane drops, not errors");
+        assert_eq!(table.stream_drops(), 1, "full is counted congestion");
+        // Drain exactly one chunk so exactly one slot frees.
+        let mut first = [0u8; 1];
+        let n = stream.read(&mut first).await.expect("one chunk");
+        assert_eq!(&first[..n], b"x", "first in-order chunk");
+        // Stall model: the sender re-delivers the dropped seq once space
+        // exists. It must queue (cursor had stayed on it) and flush the
+        // buffered predecessors in order.
+        dispatch(&table, data_frame(id, STREAM_QUEUE_CAP as u32, b"late"))
+            .expect("re-delivery queues after drain");
+        // Drain the rest byte-wise until the lane goes quiet: the tail must
+        // be the last pre-drop in-order chunk then the re-delivery — N then
+        // N+1, no hole.
+        let mut got: Vec<u8> = Vec::new();
+        let deadline = Duration::from_millis(300);
+        loop {
+            let mut chunk = [0u8; 1];
+            match tokio::time::timeout(deadline, stream.read(&mut chunk)).await {
+                Ok(Ok(1)) => got.push(chunk[0]),
+                _ => break,
+            }
+        }
+        assert!(
+            got.len() >= 5 && &got[got.len() - 5..] == b"xlate",
+            "tail is the cap-1 chunk then the re-delivered late chunk, no hole: {:?}",
+            String::from_utf8_lossy(&got[got.len().saturating_sub(10)..])
+        );
+        assert_eq!(table.stream_drops(), 1, "re-delivery was not another drop");
     }
 
     #[test]

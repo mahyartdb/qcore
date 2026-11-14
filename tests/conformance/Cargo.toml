@@ -24,8 +24,8 @@ base64 = { workspace = true }
 rcgen = { workspace = true }
 
 [[test]]
-name = "matrix_generated"
-path = "tests/matrix_generated.rs"
+name = "matrix_shapes"
+path = "tests/matrix_shapes.rs"
 
 [[test]]
 name = "wireguard"

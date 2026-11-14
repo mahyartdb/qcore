@@ -341,9 +341,25 @@ fn parse_response(raw: &[u8]) -> Result<HttpResponse, HttpError> {
                     if content_length.is_some() {
                         return Err(HttpError::Blocked("duplicate content-length".to_string()));
                     }
+                    // Smuggling pair regardless of header order: CL after
+                    // TE would silently override the chunked framing.
+                    if chunked {
+                        return Err(HttpError::Blocked(
+                            "content-length with transfer-encoding".to_string(),
+                        ));
+                    }
                     content_length = Some(n);
                 }
                 "transfer-encoding" if v.to_ascii_lowercase().contains("chunked") => {
+                    // Content-Length + Transfer-Encoding together is the
+                    // classic smuggling pair (the chunked branch would win
+                    // and the conflicting length silently ignored — same
+                    // hazard as the duplicate-CL gate above): fail closed.
+                    if content_length.is_some() {
+                        return Err(HttpError::Blocked(
+                            "content-length with transfer-encoding".to_string(),
+                        ));
+                    }
                     chunked = true;
                 }
                 _ => {}
@@ -526,6 +542,30 @@ mod tests {
         let dup = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 100\r\n\r\n12345";
         let e = parse_response(dup).unwrap_err();
         assert!(matches!(e, HttpError::Blocked(_)), "{e}");
+    }
+
+    #[test]
+    fn content_length_with_chunked_transfer_encoding_blocked() {
+        // Symmetric with the duplicate-CL gate: CL + TE:chunked together is
+        // a smuggling primitive (chunked would win, the conflicting CL is
+        // silently ignored) — rejected in either header order.
+        let cl_then_te =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nHELLO\r\n0\r\n\r\n";
+        let e = parse_response(cl_then_te).unwrap_err();
+        assert!(matches!(e, HttpError::Blocked(_)), "{e}");
+        assert!(
+            e.to_string().contains("content-length"),
+            "names the conflict: {e}"
+        );
+        let te_then_cl =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n5\r\nHELLO\r\n0\r\n\r\n";
+        let e = parse_response(te_then_cl).unwrap_err();
+        assert!(matches!(e, HttpError::Blocked(_)), "{e}");
+        // Chunked alone still decodes through the same parser.
+        let chunked_only =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nHELLO\r\n0\r\n\r\n";
+        let r = parse_response(chunked_only).expect("chunked alone is fine");
+        assert_eq!(r.body, b"HELLO");
     }
 
     #[test]

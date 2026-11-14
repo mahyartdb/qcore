@@ -39,6 +39,24 @@ pub fn parse_chain_file_str_in(
 ) -> Result<ChainFile, ChainError> {
     let v: toml::Value = toml::from_str(s)
         .map_err(|e| ChainError::new(None, None, format!("chain file: invalid TOML: {e}"), None))?;
+    let root = v.as_table().ok_or_else(|| {
+        ChainError::new(
+            None,
+            None,
+            "chain file: top level must be a table".to_string(),
+            None,
+        )
+    })?;
+    for k in root.keys() {
+        if k != "chain" {
+            return Err(ChainError::new(
+                None,
+                None,
+                format!("chain file: unknown field `{k}` (expected `[chain]`)"),
+                None,
+            ));
+        }
+    }
     let chain = v.get("chain").ok_or_else(|| {
         ChainError::new(
             None,
@@ -171,6 +189,14 @@ fn parse_file_hop(
         }
     }
     let family = field(hop, i, &id, "family")?.unwrap_or_else(|| "dual".into());
+    // Explicit endpoints validate at the parse gate (same rules as the
+    // import parser's Endpoint check): a malformed `endpoint=` dies here
+    // naming the field, not mid-connect inside the transport.
+    if let Some(ep) = field(hop, i, &id, "endpoint")? {
+        if let Err(e) = crate::config::import::validate_explicit_endpoint(&ep) {
+            return Err(err(format!("chain file: hop `{id}` invalid endpoint: {e}")));
+        }
+    }
     let config = match kind {
         "wireguard" => HopConfig::Wireguard(WireguardConfig {
             peer: field(hop, i, &id, "peer")?.unwrap_or_else(|| "warp".into()),
@@ -285,5 +311,55 @@ kind = "mock"
     #[test]
     fn missing_section_rejected() {
         assert!(parse_chain_file_str("foo = 1").is_err());
+    }
+
+    #[test]
+    fn unknown_root_key_rejected_naming_field() {
+        // A stray root key would be silently dropped (typo'd operator key
+        // becomes a silent default): rejected naming the field instead.
+        for bad in [
+            "[scanning]\nturbo = 1\n[[chain.hop]]\nkind = \"mock\"\n",
+            "max_deph = 3\n[chain]\n[[chain.hop]]\nkind = \"mock\"\n",
+            "bogus = \"1\"\n[chain]\n[[chain.hop]]\nkind = \"mock\"\n",
+        ] {
+            let err = parse_chain_file_str(bad).unwrap_err();
+            assert!(
+                err.reason.contains("unknown field"),
+                "unknown root key: {err}"
+            );
+        }
+        // The offending root key is named (not just `chain`-section keys).
+        let err = parse_chain_file_str("max_deph = 3\n[chain]\n[[chain.hop]]\nkind = \"mock\"\n")
+            .unwrap_err();
+        assert!(err.reason.contains("max_deph"), "names field: {err}");
+    }
+
+    #[test]
+    fn invalid_explicit_endpoint_rejected_at_chain_file_parse() {
+        let err = parse_chain_file_str(
+            r#"
+[chain]
+[[chain.hop]]
+kind = "wireguard"
+peer = "warp"
+endpoint = "999.999.999.999:notaport"
+"#,
+        )
+        .unwrap_err();
+        assert!(
+            err.reason.contains("endpoint"),
+            "names field: {}",
+            err.reason
+        );
+        parse_chain_file_str(
+            r#"
+[chain]
+[[chain.hop]]
+kind = "wireguard"
+peer = "warp"
+endpoint = "10.0.0.1:51820"
+"#,
+        )
+        .expect("valid endpoint parses");
     }
 }

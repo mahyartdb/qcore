@@ -162,6 +162,16 @@ pub fn parse_compositions_toml(s: &str) -> Result<Vec<CompositionPreset>, String
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for p in presets {
+        let t = p
+            .as_table()
+            .ok_or_else(|| "compositions.toml: preset must be a table".to_string())?;
+        for k in t.keys() {
+            if k != "name" && k != "hop" {
+                return Err(format!(
+                    "compositions.toml: unknown field `{k}` in preset table"
+                ));
+            }
+        }
         let name = p
             .get("name")
             .and_then(|n| n.as_str())
@@ -512,6 +522,26 @@ kind = "mock"
         assert!(
             err.contains("duplicate") && err.contains("dup"),
             "names preset: {err}"
+        );
+    }
+
+    #[test]
+    fn unknown_preset_table_key_rejected_naming_field() {
+        // Anything but name/hop in a preset table would be silently dropped
+        // (a typo'd operator key becomes a silent default): rejected naming
+        // the field, like the hop-level unknown-field gate.
+        let bad = r#"
+[[preset]]
+name = "x"
+priority = "high"
+[[preset.hop]]
+id = "x-0"
+kind = "mock"
+"#;
+        let err = parse_compositions_toml(bad).expect_err("unknown preset key");
+        assert!(
+            err.contains("unknown field") && err.contains("priority"),
+            "names field: {err}"
         );
     }
 }

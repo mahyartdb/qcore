@@ -190,6 +190,19 @@ pub fn parse_single_hop_in(
         }
     }
     let family = get("family", "dual");
+    // Explicit endpoints validate at the parse gate (same rules as the
+    // import parser's Endpoint check): a malformed `endpoint=` dies here
+    // naming the field, not mid-connect inside the transport.
+    if let Some(ep) = pairs.get("endpoint") {
+        if let Err(e) = crate::config::import::validate_explicit_endpoint(ep) {
+            return Err(ChainError::new(
+                None,
+                None,
+                format!("invalid endpoint for transport `{kind}`: {e}"),
+                None,
+            ));
+        }
+    }
     let config = match kind {
         "wireguard" => HopConfig::Wireguard(WireguardConfig {
             peer: get("peer", "warp"),

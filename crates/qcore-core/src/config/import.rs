@@ -387,6 +387,15 @@ fn check_cidr(entry: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Validate an explicit `endpoint=` value (shared by the chain grammar and
+/// chain-file gates): `host:port`, numeric non-zero port, IPv6 bracketed.
+/// The import parser owns the rules; chain-authored explicit endpoints are
+/// validated with the same gate so a malformed value dies at parse time
+/// instead of mid-connect inside the transport.
+pub(crate) fn validate_explicit_endpoint(endpoint: &str) -> Result<(), String> {
+    check_endpoint(endpoint)
+}
+
 fn check_endpoint(ep: &str) -> Result<(), String> {
     let (host, port) = ep
         .rsplit_once(':')
@@ -912,7 +921,11 @@ pub fn load_import(
 }
 
 /// Preflight check (T063 wiring): every wireguard `import=<ref>` in the
-/// expanded chain must resolve. File reads only — zero sockets.
+/// expanded chain must resolve — the record file exists AND its secrets
+/// load (file + keyring reads only — zero sockets). A restored config dir
+/// (file present, keyring secret gone) passes an existence-only check and
+/// dies at connect materialize; the probe fails preflight instead, naming
+/// the import and the missing secret.
 pub fn check_refs(dirs: &ProfileDirs, hops: &[crate::config::HopSpec]) -> Result<(), ChainError> {
     for hop in hops {
         if let crate::config::HopConfig::Wireguard(c) = &hop.config {
@@ -925,6 +938,19 @@ pub fn check_refs(dirs: &ProfileDirs, hops: &[crate::config::HopSpec]) -> Result
                         Some(hop.id.clone()),
                         format!("unknown import `{import_ref}` (see `qcore import`)"),
                         Some("import the .conf first".to_string()),
+                    ));
+                }
+                // Zero-socket secret probe: loading reads the stored record
+                // plus its secret-store entries (keyring / 0600 file).
+                if let Err(e) = load_import(dirs, import_ref) {
+                    return Err(ChainError::new(
+                        None,
+                        Some(hop.id.clone()),
+                        e,
+                        Some(
+                            "import the .conf first (or re-import to restore its secrets)"
+                                .to_string(),
+                        ),
                     ));
                 }
             }
@@ -1276,6 +1302,104 @@ mod tests {
         let priv_b64 = b64_encode(&[7u8; 32]);
         let pub_b64 = b64_encode(&[9u8; 32]);
         (priv_b64, pub_b64)
+    }
+
+    fn probe_dirs(tag: &str) -> ProfileDirs {
+        let dir = std::env::temp_dir().join(format!(
+            "qcore-import-refs-{tag}-{}-{}",
+            std::process::id(),
+            nowish_ms()
+        ));
+        ProfileDirs::resolve(Some(dir.join("config")), Some(dir.join("profiles")))
+    }
+
+    fn nowish_ms() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    }
+
+    fn seed_stored_import(dirs: &ProfileDirs, ref_name: &str) {
+        let (priv_b64, pub_b64) = keys();
+        let text = format!(
+            "[Interface]\nPrivateKey = {priv_b64}\nAddress = 10.0.0.2/32\n\n[Peer]\nPublicKey = {pub_b64}\nAllowedIPs = 0.0.0.0/0\nEndpoint = 203.0.113.10:51820\n"
+        );
+        let imp = ConfigImport::parse_str(&text, std::path::Path::new("seed.conf"))
+            .expect("parses to a verdict");
+        assert_eq!(imp.verdict, ImportVerdict::Accepted, "{:?}", imp.reasons);
+        let stored = StoredImport::from_import(&imp, ref_name.to_string());
+        let dir = imports_dir(dirs);
+        std::fs::create_dir_all(&dir).expect("imports dir");
+        std::fs::write(dir.join(format!("{ref_name}.toml")), stored.to_toml())
+            .expect("writes record");
+        let store = crate::config::secret::SecretStore::new(
+            "qcore-imports-probe",
+            dirs.config_dir.join("secrets"),
+        );
+        for (field, secret) in &imp.secrets {
+            store
+                .put(&format!("import/{ref_name}/{field}"), secret)
+                .expect("seeds secret");
+        }
+    }
+
+    #[test]
+    fn check_refs_preflight_fails_when_secret_gone() {
+        // Restored config dir: the stored record file exists, but its
+        // keyring secret is gone. An existence-only preflight passes and
+        // dies at connect; the secret probe must fail preflight instead,
+        // naming the import and the missing secret.
+        let dirs = probe_dirs("secret-gone");
+        dirs.ensure_dirs().expect("dirs");
+        seed_stored_import(&dirs, "home");
+        // Sanity: with secrets intact the check passes.
+        let hops = vec![crate::config::HopSpec {
+            id: "wg-0".into(),
+            config: crate::config::HopConfig::Wireguard(crate::config::WireguardConfig {
+                peer: "imported".into(),
+                import_ref: Some("home".into()),
+                obfuscation: None,
+                family: "dual".into(),
+                endpoint: None,
+            }),
+        }];
+        check_refs(&dirs, &hops).expect("intact import passes preflight");
+        // Simulate the keyring loss: the namespace-independent file
+        // fallback dir holds the secret (keyring probes elsewhere in the
+        // suite are flaky under parallel load), so removing the files
+        // makes every store read miss — the restored-dir shape.
+        let secrets_dir = dirs.config_dir.join("secrets");
+        std::fs::remove_dir_all(&secrets_dir).expect("wipes fallback secrets");
+        let err = check_refs(&dirs, &hops).expect_err("missing secret fails preflight");
+        assert!(
+            err.reason.contains("home") && err.reason.contains("interface.private_key"),
+            "names import and secret: {err}"
+        );
+        let _ = std::fs::remove_dir_all(dirs.config_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn check_refs_still_names_unknown_import() {
+        // The original existence gate stays: an absent record file fails
+        // with the documented wording (not the new secret-probe wording).
+        let dirs = probe_dirs("unknown");
+        let hops = vec![crate::config::HopSpec {
+            id: "wg-0".into(),
+            config: crate::config::HopConfig::Wireguard(crate::config::WireguardConfig {
+                peer: "imported".into(),
+                import_ref: Some("no-such".into()),
+                obfuscation: None,
+                family: "dual".into(),
+                endpoint: None,
+            }),
+        }];
+        let err = check_refs(&dirs, &hops).expect_err("unknown import");
+        assert!(
+            err.reason.contains("no-such") && err.reason.contains("unknown import"),
+            "names ref: {err}"
+        );
+        let _ = std::fs::remove_dir_all(dirs.config_dir.parent().unwrap());
     }
 
     #[test]

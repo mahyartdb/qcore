@@ -36,6 +36,15 @@ pub async fn run(
     json: bool,
     dirs: &ProfileDirs,
 ) -> i32 {
+    // Transport must name a linked registry kind: a typo (`warrp`) would
+    // otherwise produce a seeded-empty scan and exit 4 "nothing reachable",
+    // which reads like a network verdict instead of the usage mistake it
+    // is. `warp` is accepted beside `wireguard` (it is the established
+    // scan/cache alias for the wireguard section of warp.toml).
+    if let Err(e) = validate_transport(transport) {
+        eprintln!("qcore: {e} (exit 6)");
+        return exit::USAGE;
+    }
     // Global --json selects the JSON document unless --output says otherwise.
     // `--json` guarantees exactly one JSON document on stdout: an explicit
     // `--output ndjson` with `--json` is a conflict (usage error), never
@@ -132,6 +141,25 @@ pub async fn run(
     exit::SUCCESS
 }
 
+/// Validate a scan transport against the linked registry kinds. `warp` is
+/// the accepted alias for `wireguard` (warp.toml section + winner-cache key
+/// all use it); everything else must be a registered kind. The error names
+/// the valid kinds so the usage error is actionable.
+pub fn validate_transport(transport: &str) -> Result<(), String> {
+    if transport == "warp" {
+        return Ok(());
+    }
+    let mut kinds = qcore_transports::linked_kinds();
+    kinds.sort_unstable();
+    if kinds.contains(&transport) {
+        return Ok(());
+    }
+    Err(format!(
+        "unknown transport `{transport}` (valid: {} or `warp` for wireguard)",
+        kinds.join(", ")
+    ))
+}
+
 fn candidate_json(c: &qcore_core::scan::EndpointCandidate) -> serde_json::Value {
     serde_json::json!({
         "address": c.address.to_string(),
@@ -226,6 +254,40 @@ mod tests {
         let d = test_dirs("bad-family");
         assert_eq!(
             run("warp", "balanced", "bogus", "table", false, &d).await,
+            exit::USAGE
+        );
+        let _ = std::fs::remove_dir_all(&d.config_dir);
+    }
+
+    #[test]
+    fn unknown_transport_is_usage_not_empty_scan() {
+        // A typo must be a usage error naming valid kinds, never a seeded
+        // empty scan that reports "nothing reachable" (exit 4).
+        let _ = qcore_transports::linked_kinds();
+        let err = validate_transport("warrp").unwrap_err();
+        assert!(
+            err.starts_with("unknown transport `warrp` (valid: "),
+            "{err}"
+        );
+        assert!(err.contains("wireguard"), "error names wireguard: {err}");
+        assert!(err.contains("`warp` for wireguard"), "{err}");
+        assert!(validate_transport("").is_err());
+    }
+
+    #[test]
+    fn linked_kinds_and_warp_alias_validate() {
+        let _ = qcore_transports::linked_kinds();
+        for kind in qcore_transports::linked_kinds() {
+            assert!(validate_transport(kind).is_ok(), "registry kind `{kind}`");
+        }
+        assert!(validate_transport("warp").is_ok(), "warp alias");
+    }
+
+    #[tokio::test]
+    async fn typo_transport_is_usage() {
+        let d = test_dirs("typo-transport");
+        assert_eq!(
+            run("warrp", "balanced", "dual", "table", false, &d).await,
             exit::USAGE
         );
         let _ = std::fs::remove_dir_all(&d.config_dir);

@@ -9,6 +9,14 @@
 //! indices 167–170); every other slot is an opaque placeholder so the
 //! layout stays correct without 200+ unused signatures.
 //!
+//! String conversion uses JNI *modified UTF-8* on both sides: Rust → Java
+//! re-encodes (NUL as `C0 80`, supplementary chars as CESU-8 surrogate
+//! pairs) before `NewStringUTF`, and Java → Rust decodes that encoding back
+//! to standard UTF-8. Standard UTF-8 passed raw corrupts emoji and other
+//! non-BMP characters. Allocation failures surface as a null return with a
+//! pending JVM exception — the JVM's own ExceptionCheck contract, which the
+//! Java caller observes on return into managed code.
+//!
 //! Java side (`com.qcore.Qcore`): `long engineNew(String configJsonOrNull)`,
 //! `String engineStart(long, String chain)`, `String engineStatusJson(long,
 //! String sessionId)`, `int engineStop(long, String sessionId)`,
@@ -39,10 +47,112 @@ pub struct JniTable {
         unsafe extern "system" fn(env: JniEnv, s: JString, chars: *const c_char),
 }
 
+/// Convert standard UTF-8 to JNI *modified UTF-8* (the encoding
+/// `NewStringUTF` actually expects): NUL becomes `C0 80`, and non-BMP
+/// scalar values become CESU-8 surrogate pairs instead of 4-byte UTF-8.
+/// Passing standard UTF-8 through raw corrupts emoji/supplementary
+/// characters and would mis-encode interior NULs. Invalid sequences are
+/// replaced (lossy) rather than panic — the JVM-visible string degrades
+/// but the call never faults.
+fn to_modified_utf8(s: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\0' => out.extend_from_slice(&[0xC0, 0x80]),
+            '\u{1}'..='\u{7F}' => out.push(c as u8),
+            c @ '\u{80}'..='\u{7FF}' => {
+                out.push(0xC0 | (c as u32 >> 6) as u8);
+                out.push(0x80 | (c as u32 & 0x3F) as u8);
+            }
+            c @ '\u{800}'..='\u{D7FF}' | c @ '\u{E000}'..='\u{FFFF}' => {
+                out.push(0xE0 | (c as u32 >> 12) as u8);
+                out.push(0x80 | ((c as u32 >> 6) & 0x3F) as u8);
+                out.push(0x80 | (c as u32 & 0x3F) as u8);
+            }
+            c @ '\u{10000}'..='\u{10FFFF}' => {
+                // CESU-8: encode the UTF-16 surrogate pair as two 3-byte
+                // sequences. Supplementary chars are always valid pairs.
+                let v = c as u32 - 0x1_0000;
+                let high = 0xD800 + (v >> 10);
+                let low = 0xDC00 + (v & 0x3FF);
+                for unit in [high, low] {
+                    out.push(0xE0 | (unit >> 12) as u8);
+                    out.push(0x80 | ((unit >> 6) & 0x3F) as u8);
+                    out.push(0x80 | (unit & 0x3F) as u8);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Convert JNI modified UTF-8 (CESU-8 with `C0 80` for NUL) back to
+/// standard UTF-8: re-joins surrogate pairs into scalar values and decodes
+/// `C0 80` as NUL. Invalid sequences are replaced lossily.
+fn from_modified_utf8(bytes: &[u8]) -> String {
+    let mut units: Vec<u16> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match b {
+            0x00 => {
+                // A real NUL byte cannot appear in C-string input, but
+                // handle it defensively as U+0000.
+                units.push(0);
+                i += 1;
+            }
+            0x01..=0x7F => {
+                units.push(b as u16);
+                i += 1;
+            }
+            0xC0..=0xDF if i + 1 < bytes.len() && (bytes[i + 1] & 0xC0) == 0x80 => {
+                units.push((((b & 0x1F) as u16) << 6) | (bytes[i + 1] & 0x3F) as u16);
+                i += 2;
+            }
+            0xE0..=0xEF
+                if i + 2 < bytes.len()
+                    && (bytes[i + 1] & 0xC0) == 0x80
+                    && (bytes[i + 2] & 0xC0) == 0x80 =>
+            {
+                units.push(
+                    (((b & 0x0F) as u16) << 12)
+                        | (((bytes[i + 1] & 0x3F) as u16) << 6)
+                        | (bytes[i + 2] & 0x3F) as u16,
+                );
+                i += 3;
+            }
+            _ => {
+                units.push(0xFFFD);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf16_lossy(&units)
+}
+
+/// Build a Java string from Rust text. Returns null when the table is
+/// missing or the JVM cannot allocate (pending OOM exception — surfaced by
+/// the JVM's ExceptionCheck on return into Java). Text is converted to JNI
+/// modified UTF-8 first: `NewStringUTF` consumes that encoding, not
+/// standard UTF-8 (supplementary chars / emoji corrupt otherwise).
+unsafe fn rust_to_j(env: JniEnv, s: &str) -> JString {
+    if env.is_null() || (*env).is_null() {
+        return std::ptr::null_mut();
+    }
+    let mut bytes = to_modified_utf8(s);
+    // SAFETY: same table-validity argument as `j_to_rust`; `bytes` is a
+    // valid modified-UTF-8 buffer (never interior-NUL — the encoder maps
+    // NUL to `C0 80`) and outlives the call, which reads it up to the
+    // terminator it requires.
+    bytes.push(0);
+    ((&**env).new_string_utf)(env, bytes.as_ptr().cast::<c_char>())
+}
+
 /// Read a Java string into Rust. Returns `None` on null input, a null
-/// table, a failed pin, or non-UTF-8 content (CESU-8 details aside, JVM
-/// strings convert losslessly here for the ASCII/UTF-8 range this API
-/// passes). The pin is always released before returning.
+/// table, a failed pin, or content that decodes to nothing. The pin is
+/// always released before returning. The JVM hands back modified UTF-8
+/// (CESU-8 + `C0 80`): it is decoded to standard UTF-8 here so emoji and
+/// supplementary characters survive the round trip.
 unsafe fn j_to_rust(env: JniEnv, s: JString) -> Option<String> {
     if s.is_null() || env.is_null() || (*env).is_null() {
         return None;
@@ -57,22 +167,15 @@ unsafe fn j_to_rust(env: JniEnv, s: JString) -> Option<String> {
     }
     // SAFETY: `chars` is a valid NUL-terminated buffer pinned by the pin
     // call above; it stays pinned until the paired release below.
-    let out = CStr::from_ptr(chars).to_str().ok().map(str::to_string);
+    let raw = CStr::from_ptr(chars).to_bytes();
+    let out = if raw.is_ascii() {
+        // Fast path: ASCII is identical in both encodings.
+        Some(String::from_utf8_lossy(raw).into_owned())
+    } else {
+        Some(from_modified_utf8(raw))
+    };
     (table.release_string_utf_chars)(env, s, chars);
     out
-}
-
-/// Build a Java string from Rust text. Returns null when the table is
-/// missing or the JVM cannot allocate (pending OOM exception).
-unsafe fn rust_to_j(env: JniEnv, s: &str) -> JString {
-    if env.is_null() || (*env).is_null() {
-        return std::ptr::null_mut();
-    }
-    let bytes = CString::new(s).unwrap_or_else(|_| CString::new("").unwrap());
-    // SAFETY: same table-validity argument as `j_to_rust`; `bytes` outlives
-    // the call. Interior NULs fall back to empty (engine strings are
-    // NUL-free JSON/ids).
-    ((&**env).new_string_utf)(env, bytes.as_ptr())
 }
 
 /// Reinterpret a handle integer as the engine pointer it came from.
@@ -463,5 +566,119 @@ mod tests {
         // Non-positive handle also fails closed without touching the engine.
         let rc2 = unsafe { Java_com_qcore_Qcore_engineStop(env, std::ptr::null_mut(), 0, bogus) };
         assert_eq!(rc2, -1, "non-positive handle must fail closed");
+    }
+
+    #[test]
+    fn modified_utf8_encodes_nul_and_bmp() {
+        assert_eq!(to_modified_utf8("abc"), b"abc".to_vec());
+        assert_eq!(to_modified_utf8("a\0b"), vec![b'a', 0xC0, 0x80, b'b']);
+        assert_eq!(to_modified_utf8("é"), vec![0xC3, 0xA9]);
+        // BMP astral-adjacent planes stay 3-byte CESU-8 (same as UTF-8).
+        assert_eq!(to_modified_utf8("€"), vec![0xE2, 0x82, 0xAC]);
+    }
+
+    #[test]
+    fn modified_utf8_encodes_supplementary_as_cesu8_pair() {
+        // U+1F600 (😀): standard UTF-8 is 4 bytes; modified UTF-8 is the
+        // surrogate pair D83D DE00 each 3-byte encoded. This is the defect
+        // the fix removes: passing the 4-byte form to NewStringUTF corrupts
+        // the Java string.
+        let std_utf8 = "\u{1F600}".as_bytes();
+        assert_eq!(std_utf8.len(), 4);
+        let got = to_modified_utf8("\u{1F600}");
+        assert_eq!(
+            got,
+            vec![0xED, 0xA0, 0xBD, 0xED, 0xB8, 0x80],
+            "CESU-8 surrogate pair, not 4-byte UTF-8"
+        );
+    }
+
+    #[test]
+    fn modified_utf8_round_trips_supplementary_and_nul() {
+        for s in [
+            "plain ascii",
+            "emoji \u{1F600} \u{1F9DF} path",
+            "nul\u{0}inside",
+            "mixed \u{10FFFF} top",
+        ] {
+            let decoded = from_modified_utf8(&to_modified_utf8(s));
+            assert_eq!(decoded, s, "round trip of {s:?}");
+        }
+    }
+
+    #[test]
+    fn from_modified_utf8_joins_surrogate_pairs() {
+        // The JVM-side encoding for 😀.
+        let cesu = [0xED, 0xA0, 0xBD, 0xED, 0xB8, 0x80];
+        assert_eq!(from_modified_utf8(&cesu), "\u{1F600}");
+        // `C0 80` decodes to NUL.
+        assert_eq!(from_modified_utf8(&[0xC0, 0x80]), "\0");
+        // Invalid lead byte degrades to U+FFFD, never panics.
+        assert_eq!(from_modified_utf8(&[0xFF]), "\u{FFFD}");
+    }
+
+    #[test]
+    fn rust_to_j_passes_modified_utf8_to_new_string_utf() {
+        // A recording JVM table: captures the bytes handed to NewStringUTF.
+        static CAPTURED: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+        unsafe extern "system" fn recording_new_string(
+            _env: JniEnv,
+            bytes: *const c_char,
+        ) -> JString {
+            let c = unsafe { CStr::from_ptr(bytes) };
+            CAPTURED.lock().unwrap().clear();
+            CAPTURED.lock().unwrap().extend_from_slice(c.to_bytes());
+            std::ptr::dangling_mut::<c_void>()
+        }
+        let table = JniTable {
+            _reserved_and_unused: [std::ptr::null(); 167],
+            new_string_utf: recording_new_string,
+            _get_string_utf_length: std::ptr::null(),
+            get_string_utf_chars: failing_chars,
+            release_string_utf_chars: noop_release,
+        };
+        let mut slot: *const JniTable = &table;
+        let env: JniEnv = &mut slot as *mut *const JniTable;
+        let emoji = "\u{1F600}";
+        let j = unsafe { rust_to_j(env, emoji) };
+        assert!(!j.is_null(), "allocation stub returned a token");
+        let captured = CAPTURED.lock().unwrap().clone();
+        assert_eq!(
+            captured,
+            vec![0xED, 0xA0, 0xBD, 0xED, 0xB8, 0x80],
+            "NewStringUTF receives modified UTF-8 (CESU-8), never 4-byte UTF-8"
+        );
+    }
+
+    #[test]
+    fn j_to_rust_decodes_cesu8_from_jvm() {
+        // A fake JVM table whose pin hands back modified UTF-8 bytes.
+        static CELLS: std::sync::Mutex<Vec<CString>> = std::sync::Mutex::new(Vec::new());
+        unsafe extern "system" fn cesu_chars(
+            _env: JniEnv,
+            _s: JString,
+            _is_copy: *mut u8,
+        ) -> *const c_char {
+            let cell = CString::new(vec![0xED, 0xA0, 0xBD, 0xED, 0xB8, 0x80]).unwrap();
+            let ptr = cell.as_ptr();
+            CELLS.lock().unwrap().push(cell);
+            ptr
+        }
+        let table = JniTable {
+            _reserved_and_unused: [std::ptr::null(); 167],
+            new_string_utf: null_new_string,
+            _get_string_utf_length: std::ptr::null(),
+            get_string_utf_chars: cesu_chars,
+            release_string_utf_chars: noop_release,
+        };
+        let mut slot: *const JniTable = &table;
+        let env: JniEnv = &mut slot as *mut *const JniTable;
+        let bogus: JString = std::ptr::dangling_mut::<c_void>();
+        let got = unsafe { j_to_rust(env, bogus) };
+        assert_eq!(
+            got.as_deref(),
+            Some("\u{1F600}"),
+            "CESU-8 decodes to the emoji"
+        );
     }
 }

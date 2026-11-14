@@ -78,7 +78,7 @@ fn awg_import_detects_format_and_params() {
 fn export_reproduces_parsed_equivalently() {
     for name in ["standard-wg.conf", "awg.conf"] {
         let a = ConfigImport::parse(&fixture(name)).expect("parses");
-        let text = export_plain(&a);
+        let text = export_plain(&a).expect("secrets present");
         let b = ConfigImport::parse_str(&text, std::path::Path::new(name)).expect("reparses");
         assert_eq!(b.verdict, ImportVerdict::Accepted, "{name}");
         assert_eq!(b.source_format, a.source_format, "{name}");

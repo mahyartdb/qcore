@@ -53,10 +53,14 @@ pub async fn serve_socks_via_dialer_with_policy(
     loop {
         // A transient accept error must not kill the proxy while the session
         // is still Up (contrast: the old `?` returned and left the session
-        // reporting Up with a dead proxy and no log).
+        // reporting Up with a dead proxy and no log). The sleep keeps a
+        // persistent failure from busy-spinning a core.
         let (socket, _) = match listener.accept().await {
             Ok(v) => v,
-            Err(_) => continue,
+            Err(_) => {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            }
         };
         let dialer = dialer.clone();
         let policy = policy.clone();

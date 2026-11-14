@@ -17,9 +17,10 @@ use qcore_transport_api::{
 };
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 struct TcpWrap(tokio::net::TcpStream);
@@ -182,4 +183,152 @@ async fn wg_loopback_throughput_and_handshake() {
     let mbs = TOTAL as f64 / 1048576.0 / dt.as_secs_f64();
     eprintln!("PROBE roundtrip {TOTAL} bytes in {dt:?} = {mbs:.1} MiB/s");
     hop.stop().await.unwrap();
+}
+
+/// Counting sink: receives datagrams addressed to it and counts every byte
+/// arrival (any packet — handshake retransmits, junk, anything).
+struct CountingSink {
+    pub arrivals: Arc<AtomicU32>,
+    addr: SocketAddr,
+    _task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for CountingSink {
+    fn drop(&mut self) {
+        self._task.abort();
+    }
+}
+
+impl CountingSink {
+    /// Bind a socket that never responds, counting received datagrams.
+    async fn spawn() -> std::io::Result<Self> {
+        let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+        let addr = udp.local_addr()?;
+        let arrivals = Arc::new(AtomicU32::new(0));
+        let counter = arrivals.clone();
+        let task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 65535];
+            while let Ok((_, _)) = udp.recv_from(&mut buf).await {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        Ok(CountingSink {
+            arrivals,
+            addr,
+            _task: task,
+        })
+    }
+}
+
+/// Carrier for a direct (OS-socket) bring-up: dials nothing, so the hop
+/// keeps its own OS UDP socket keyed to the dead endpoint.
+struct DeadPeerDirect;
+
+#[async_trait::async_trait]
+impl Dialer for DeadPeerDirect {
+    async fn dial_tcp(&self, _dst: SocketAddr) -> Result<Box<dyn ByteStream>, HopError> {
+        Err(HopError::transport("test-carrier", "no tcp in this probe"))
+    }
+
+    async fn dial_udp(&self, _dst: SocketAddr) -> Result<Box<dyn UdpFlow>, HopError> {
+        Err(HopError::transport("test-carrier", "no udp in this probe"))
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            accepts_tcp_carrier: true,
+            accepts_udp_carrier: true,
+            dials_tcp: true,
+            dials_udp: true,
+        }
+    }
+
+    fn nested_mtu(&self) -> Option<u16> {
+        None
+    }
+}
+
+/// Cancellation-safety contract (transport-api HopFactory): the engine
+/// races `build` with a timeout and DROPS the future. A dropped bring-up
+/// must leave no pump alive — no eternal retransmit loop, no orphaned
+/// socket. Pre-fix the spawned pump detached holding Arc<HopInner> + its
+/// own tx: the egress channel never closed and every 100 ms tick sent a
+/// handshake initiation to the peer FOREVER (one orphaned socket + one
+/// eternal task per timed-out dial, unbounded accumulation).
+#[tokio::test]
+async fn dropped_bring_up_future_leaves_no_pump_alive() {
+    let sink = CountingSink::spawn().await.expect("dead-peer sink binds");
+    let before = sink.arrivals.load(Ordering::Relaxed);
+
+    let (c_sk, _c_pk) = qcore_transport_wireguard::test_support::generate_keypair();
+    let (_s_sk, s_pk) = qcore_transport_wireguard::test_support::generate_keypair();
+    let mut cfg = HopConfig::new("wireguard");
+    cfg.fields.insert("hop_id".into(), "wg-cancel-0".into());
+    cfg.fields.insert("peer".into(), "warp".into());
+    cfg.fields.insert("endpoint".into(), sink.addr.to_string());
+    cfg.fields.insert("private_key".into(), hex(&c_sk));
+    cfg.fields.insert("peer_public_key".into(), hex(&s_pk));
+
+    // Start bring-up against the never-responding peer, then cancel it
+    // mid-handshake by dropping the polled future (spawn + abort = exactly
+    // the engine's timeout race, which drops the future mid-await).
+    let build = tokio::spawn(
+        qcore_transport_wireguard::WireguardFactory.build(cfg, Arc::new(DeadPeerDirect)),
+    );
+    // Let the pump spawn and send at least one initiation.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert!(
+        sink.arrivals.load(Ordering::Relaxed) > before,
+        "bring-up started transmitting (probe sanity)"
+    );
+    build.abort();
+    let _ = build.await;
+
+    // The guard must have aborted the pump; the Weak must starve any
+    // residual iteration. Over a window covering several 100 ms retransmit
+    // ticks, NOTHING further may arrive at the peer.
+    let settled = sink.arrivals.load(Ordering::Relaxed);
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    let after = sink.arrivals.load(Ordering::Relaxed);
+    assert_eq!(
+        after, settled,
+        "no handshake retransmits after the build future dropped (pump must be dead)"
+    );
+}
+
+/// Same contract on the engine-shaped path: racing build with a timeout and
+/// dropping it (tokio::time::timeout cancel) must not leak a pump either.
+#[tokio::test]
+async fn timed_out_bring_up_leaves_no_pump_alive() {
+    let sink = CountingSink::spawn().await.expect("dead-peer sink binds");
+    let before = sink.arrivals.load(Ordering::Relaxed);
+
+    let (c_sk, _c_pk) = qcore_transport_wireguard::test_support::generate_keypair();
+    let (_s_sk, s_pk) = qcore_transport_wireguard::test_support::generate_keypair();
+    let mut cfg = HopConfig::new("wireguard");
+    cfg.fields.insert("hop_id".into(), "wg-cancel-1".into());
+    cfg.fields.insert("peer".into(), "warp".into());
+    cfg.fields.insert("endpoint".into(), sink.addr.to_string());
+    cfg.fields.insert("private_key".into(), hex(&c_sk));
+    cfg.fields.insert("peer_public_key".into(), hex(&s_pk));
+
+    let _result: Result<std::sync::Arc<dyn qcore_transport_api::RunningHop>, HopError> =
+        tokio::time::timeout(
+            Duration::from_millis(300),
+            qcore_transport_wireguard::WireguardFactory.build(cfg, Arc::new(DeadPeerDirect)),
+        )
+        .await
+        .unwrap_or(Err(HopError::transport("probe", "cancelled")));
+
+    let settled = sink.arrivals.load(Ordering::Relaxed);
+    assert!(
+        settled > before,
+        "bring-up transmitted while alive (probe sanity)"
+    );
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert_eq!(
+        sink.arrivals.load(Ordering::Relaxed),
+        settled,
+        "no retransmits after the raced build future dropped (pump must be dead)"
+    );
 }

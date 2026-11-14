@@ -168,13 +168,20 @@ pub fn run(_args: Vec<String>) -> super::anyhow::Result<()> {
                     .to_string(),
             ));
         }
-        let clean = std::process::Command::new("git")
-            .args(["diff", "--quiet", "--", &format!("{FFI_DIR}/qcore.h")])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+        // Both worktree and index must be clean: `git diff --quiet` alone
+        // passes when drift is `git add`ed (staged but uncommitted), so the
+        // committed-diff gate checks both and fails closed on either.
+        let clean = ["", "--cached"].iter().all(|mode| {
+            let mut cmd = std::process::Command::new("git");
+            cmd.args(["diff", "--quiet"]);
+            if !mode.is_empty() {
+                cmd.arg(mode);
+            }
+            cmd.arg("--").arg(format!("{FFI_DIR}/qcore.h"));
+            cmd.status().map(|s| s.success()).unwrap_or(false)
+        });
         if clean {
-            println!("abi-diff: qcore.h committed diff empty");
+            println!("abi-diff: qcore.h committed diff empty (worktree + index)");
         } else {
             return Err(fail(
                 "qcore.h has uncommitted changes: regenerate via cbindgen or run with --allow-diff during a versioned ABI bump".to_string(),

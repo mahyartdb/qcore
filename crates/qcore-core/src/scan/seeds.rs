@@ -111,8 +111,16 @@ fn parse_warp_toml(text: &str) -> Result<WarpProfiles, String> {
     };
     let warp = load_transport("warp")?;
     let masque = load_transport("masque")?;
-    // v6 seeds must be v6 literals (a v4 seed under v6 silently selects
-    // nothing on v6 scans — fail at load instead).
+    // Family-literal validation, both directions: seeds must be v4 literals
+    // and v6_seeds must be v6 literals. A literal of the wrong family parses
+    // fine but silently selects nothing on that family's scan (`candidates_for`
+    // filters by family) — fail at load instead, naming the field.
+    for s in warp.seeds.iter().chain(masque.seeds.iter()) {
+        match s.parse::<IpAddr>() {
+            Ok(IpAddr::V4(_)) => {}
+            _ => return Err(format!("`seeds` entry `{s}` is not an IPv4 literal")),
+        }
+    }
     for s in warp.v6_seeds.iter().chain(masque.v6_seeds.iter()) {
         match s.parse::<IpAddr>() {
             Ok(IpAddr::V6(_)) => {}
@@ -318,5 +326,37 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&base);
         let _ = std::fs::remove_dir_all(&base2);
+    }
+
+    /// Family-literal validation is symmetric: a v6 literal under the v4
+    /// `seeds` list fails at load (it would silently select nothing on v4
+    /// scans), mirroring the v4-under-`v6_seeds` check.
+    #[test]
+    fn v4_seeds_reject_non_v4_literals() {
+        let bad = |seed: &str| {
+            format!(
+                "[warp]\nports = [2408]\nseeds = [\"{seed}\"]\nranges = []\nv6_ranges = []\nv6_seeds = []\n[masque]\nports = [443]\nseeds = []\nranges = []\nv6_ranges = []\nv6_seeds = []\n[defaults]\nscan_profile = \"balanced\"\n"
+            )
+        };
+        let err = parse_warp_toml(&bad("2606:4700:d0::1")).unwrap_err();
+        assert!(
+            err.contains("seeds") && err.contains("IPv4"),
+            "v6 literal under v4 seeds names the field: {err}"
+        );
+        let err = parse_warp_toml(&bad("not-an-ip")).unwrap_err();
+        assert!(
+            err.contains("seeds") && err.contains("IP literal"),
+            "garbage under v4 seeds fails closed: {err}"
+        );
+        // The mirror case (v4 under v6_seeds) stays rejected too.
+        let v6bad = "[warp]\nports = [2408]\nseeds = []\nranges = []\nv6_ranges = []\nv6_seeds = [\"162.159.192.1\"]\n[masque]\nports = [443]\nseeds = []\nranges = []\nv6_ranges = []\nv6_seeds = []\n[defaults]\nscan_profile = \"balanced\"\n";
+        let err = parse_warp_toml(v6bad).unwrap_err();
+        assert!(
+            err.contains("v6_seeds") && err.contains("IPv6"),
+            "v4 literal under v6_seeds names the field: {err}"
+        );
+        // Correct-family literals still load.
+        let ok = "[warp]\nports = [2408]\nseeds = [\"162.159.192.1\"]\nranges = []\nv6_ranges = []\nv6_seeds = [\"2606:4700:d0::1\"]\n[masque]\nports = [443]\nseeds = []\nranges = []\nv6_ranges = []\nv6_seeds = []\n[defaults]\nscan_profile = \"balanced\"\n";
+        parse_warp_toml(ok).expect("correct-family literals load");
     }
 }

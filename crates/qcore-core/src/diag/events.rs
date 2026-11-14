@@ -69,6 +69,10 @@ fn redact_json(key: &str, value: &mut serde_json::Value) -> bool {
 }
 
 /// Render one NDJSON line (no trailing newline; the sink delimits records).
+/// The envelope `hop_id` passes through the same `masked_value` masking as
+/// payload strings: a secret-shaped hop id is never emitted raw, so the
+/// envelope and the payload agree (a hop id that a provider echo filled
+/// with secret material gets `<redacted>` in both places).
 pub fn to_ndjson(event: DiagEvent<'_>) -> String {
     let (kind, hop_id, mut payload) = match event {
         DiagEvent::Hop(e) => (
@@ -93,6 +97,9 @@ pub fn to_ndjson(event: DiagEvent<'_>) -> String {
             "reason": "unclassifiable secret-like value; record dropped fail-closed",
         });
     }
+    // Envelope-level masking (value-shaped, not key-shaped): the hop id is
+    // masked iff it is itself secret-like, matching `masked_failure_line`.
+    let hop_id = hop_id.map(|id| crate::diag::redact::masked_value("hop_id", &id));
     serde_json::json!({
         "v": DIAG_STREAM_VERSION,
         "schema": SCHEMA_VERSION,
@@ -132,6 +139,35 @@ mod tests {
         assert_eq!(v["kind"], "hop");
         assert_eq!(v["hop_id"], "mock-0");
         assert!(v["ts_ms"].as_u64().is_some());
+    }
+
+    #[test]
+    fn secret_like_hop_id_is_masked_in_envelope() {
+        // FIX: the envelope `hop_id` reached the stream raw while the same
+        // string inside the payload got masked — inconsistent sinks. The
+        // envelope now masks with the same `masked_value` semantics.
+        let e = HopEvent::Started {
+            hop_id: "xT4vN7qW2zR5uY8iO1pA3sD6fG9hJ0kL2mN4bV6cX8dE0gH2==".into(),
+        };
+        let line = to_ndjson(DiagEvent::Hop(&e));
+        let v: serde_json::Value = serde_json::from_str(&line).expect("one JSON doc");
+        assert_eq!(v["hop_id"], "<redacted>", "envelope hop_id masked");
+        assert!(
+            !line.contains("xT4vN7qW"),
+            "secret-like hop_id leaked in envelope: {line}"
+        );
+        // Same semantics for the failure envelope.
+        let r = FailureReport::new(
+            FailureLayer::Transport,
+            "0123456789abcdef0123456789abcdef",
+            "refused",
+            "transport",
+        );
+        let line = to_ndjson(DiagEvent::Failure(&r));
+        assert!(
+            line.contains("\"hop_id\":\"<redacted>\""),
+            "failure envelope masks secret-like hop_id: {line}"
+        );
     }
 
     #[test]

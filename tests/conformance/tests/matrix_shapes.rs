@@ -1,6 +1,8 @@
-//! Generated matrix: every registered transport preflights its canonical
-//! spec, and per-target family modes parse. Real connect suites land per
-//! story; this gate guarantees no registered transport ships without one.
+//! Conformance matrix shapes: every registered transport preflights its
+//! canonical spec, and per-target family modes parse. Real connect suites
+//! land per story; this gate guarantees no registered transport ships
+//! without one. (Hand-maintained despite the old "generated" name — no
+//! generator exists; the file is named for what it checks.)
 
 use qcore_core::api::{Engine, EngineConfig};
 use qcore_core::registry::TransportRegistry;

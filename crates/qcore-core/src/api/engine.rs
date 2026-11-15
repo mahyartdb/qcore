@@ -233,15 +233,15 @@ impl Engine {
             ),
             _ => None,
         };
+        let exit_dialer = started.last().map(|h| h.hop.dialer());
         let mut handle = SessionHandle::bare(
             new_session_id(),
             exit_hop_id,
             crate::session::ChainSer::from(&chain),
-            started,
+            Vec::new(),
             self.events.clone(),
         );
-        handle.resolver = resolver;
-        self.lock_live().insert(handle.id.clone(), handle.clone());
+        handle.wire_exit(started, exit_dialer, resolver);
         // F2 watchdog: subscribe to the session bus; on any hop Failed it
         // degrades honestly and rebuilds through the same primitives with a
         // bounded budget. The abort handle rides the handle so `stop_all`
@@ -256,12 +256,19 @@ impl Engine {
                 timeout_secs: self.config.timeout_secs,
                 family: self.config.family.clone(),
                 prefer: self.config.prefer.clone(),
+                dns_resolver: self.config.dns_resolver,
                 ..Default::default()
             },
             self.live.clone(),
             stop_rx,
         );
         handle.watchdog = Some(wd_abort);
+        // Map entry lands only AFTER the handle is fully wired (stop signal
+        // + watchdog abort handle + live exits): the watchdog rebuild/give-up
+        // paths and `Engine::stop_session` read this entry's stop channel and
+        // abort handle — a pre-wired clone would carry a dead stop watch and
+        // no watchdog (R1.2).
+        self.lock_live().insert(handle.id.clone(), handle.clone());
         Ok(handle)
     }
 
@@ -1127,7 +1134,7 @@ mod tests {
             health_checks: std::sync::atomic::AtomicU64::new(0),
         };
         let (_events, _drain) = tokio::sync::broadcast::channel::<HopEvent>(8);
-        let mut handle = SessionHandle::bare(
+        let handle = SessionHandle::bare(
             "dying",
             "exit-die",
             ChainSer {
@@ -1137,7 +1144,7 @@ mod tests {
             Vec::new(),
             engine.events.clone(),
         );
-        handle.started.push(crate::session::lifecycle::StartedHop {
+        let started_hop = crate::session::lifecycle::StartedHop {
             hop_id: "die-0".to_string(),
             kind: "mock".to_string(),
             family: "ipv4".to_string(),
@@ -1150,10 +1157,11 @@ mod tests {
             congested_drops: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             keepalive: None,
             forwarder: None,
-        });
+        };
+        handle.wire_exit(vec![started_hop], None, None);
         // Bring-up read the health first: the hop started green.
         assert_eq!(
-            handle.started[0].hop.health(),
+            handle.started_hops()[0].hop.health(),
             qcore_transport_api::HopHealth::Healthy,
             "bring-up readiness probe sees a healthy hop"
         );

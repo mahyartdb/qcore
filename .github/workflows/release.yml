@@ -15,7 +15,7 @@ jobs:
   # list in `xtask/src/release.rs::run` triple-for-triple. The contract side
   # cannot drift: release.rs reads CONTRACT from targets.toml at compile
   # time, and publish's `cargo xtask release --allow-partial-matrix
-  # --skip-native-package --staged-artifacts` still names the 6 unproven
+  # --staged-artifacts` still names the 6 unproven
   # targets in its log instead of claiming them.
   # Expanding to all 9 is DEFERRED: removing/demoting targets needs a
   # constitution amendment, and the linux/android legs need runner capacity
@@ -84,3 +84,11 @@ jobs:
       - run: >-
           cargo xtask release --allow-partial-matrix
           --staged-artifacts staged-artifacts
+      # Upload the finalized dist set to the GitHub release for this tag.
+      # --clobber so a re-run of the publish job replaces instead of
+      # erroring on existing assets. gh is preinstalled on GitHub runners;
+      # GITHUB_TOKEN with contents:write (granted above) authorizes it.
+      - name: upload release artifacts
+        run: gh release upload "$GITHUB_REF_NAME" target/dist/* --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}

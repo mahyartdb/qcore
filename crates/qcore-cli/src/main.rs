@@ -999,6 +999,12 @@ async fn run_connect(o: ConnectOpts) -> i32 {
         report.active_scan_profile =
             Some(qcore_core::session::reconnect::default_scan_profile(&dirs));
     }
+    // Publish the shared report slot onto the handle (R1.5): the watchdog's
+    // publish_report writes degrade/reconnect fields into it, so STATUS over
+    // the control channel shows session_state:"degraded" during a rebuild
+    // instead of serving the stale start shape forever. Shared-state attach:
+    // reaches the watchdog even though it holds earlier handle clones.
+    handle.set_live_report(shared_report.clone());
 
     // Rendezvous for status/stop: durable records. The listener + control
     // file already exist for detached children (bound before identity); a
@@ -1081,36 +1087,92 @@ async fn run_connect(o: ConnectOpts) -> i32 {
             "qcore: proxy listening on {bound} (via hop {})",
             handle.exit_hop_id
         );
+        // Peer policy mirrors the bind gate: loopback binds serve loopback
+        // peers only; the explicit `--expose-lan` opt-in (which the bind
+        // gate required for a non-loopback bind) also opts the peer filter
+        // out — otherwise a LAN bind would refuse every LAN peer at accept
+        // time and the flag would be a no-op (R1.4).
+        let peers = if o.expose_lan {
+            qcore_core::session::proxy::PeerPolicy::Any
+        } else {
+            qcore_core::session::proxy::PeerPolicy::LoopbackOnly
+        };
+        // Per-connection egress read (R1.1): the serve loop captures ONE
+        // dialer for its lifetime, so it must be the live adapter — every
+        // dial delegates to the handle's CURRENT exit, and after a watchdog
+        // rebuild new connections dial the new chain without the CLI
+        // knowing about rebuilds. The resolver rides the same live dialer
+        // (its stored `Arc<dyn Dialer>` would otherwise pin the dead
+        // pre-rebuild exit for ATYP=domain targets).
         tokio::spawn(
             qcore_core::session::proxy::serve_socks_via_dialer_with_services(
                 binder,
-                handle.dialer(),
+                handle.live_dialer(),
                 // The session policy (not dual-default): `--family ipv4` refuses
                 // IPv6 CONNECT with 0x08 at the SOCKS layer instead of dialing.
                 session.family_policy.clone(),
-                // Loopback-only peers (P1 hardening); `--expose-lan` already
-                // gated the bind above.
-                qcore_core::session::proxy::PeerPolicy::LoopbackOnly,
-                // Tunnel-routed DNS for ATYP=domain targets; None keeps the
-                // fail-closed refusal (no OS resolver fallback).
-                handle.tunnel_resolver(),
+                peers,
+                // Tunnel-routed DNS for ATYP=domain targets over the LIVE
+                // egress; None keeps the fail-closed refusal (no OS
+                // resolver fallback).
+                dns_resolver
+                    .filter(|_| handle.dialer().capabilities().dials_udp)
+                    .map(|ip| {
+                        std::sync::Arc::new(qcore_core::session::resolver::TunnelResolver::new(
+                            handle.live_dialer(),
+                            ip,
+                        ))
+                    }),
             ),
         );
     }
 
-    // Serve control until STOP or Ctrl-C, then tear down closed. Detached
-    // children have been serving since before identity; the accept loop is
-    // owned here from now on either way.
+    // Serve control until STOP or Ctrl-C or the watchdog gives up, then
+    // tear down. Detached children have been serving since before identity;
+    // the accept loop is owned here from now on either way.
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(control::serve_control_shared(
         listener,
         token,
-        shared_report,
+        shared_report.clone(),
         stop_tx,
     ));
+    let mut give_up_rx = (*handle.give_up).clone();
     tokio::select! {
         _ = stop_rx => eprintln!("qcore: stop requested"),
         _ = tokio::signal::ctrl_c() => eprintln!("qcore: interrupted"),
+        // Watchdog give-up (R1.6): the session went terminal-Failed on its
+        // own (reconnect budget exhausted / flap cap). Idling here would
+        // hold session.lock with session.json=Failed and let a later start
+        // steal the live lock after the stale window — exit the process
+        // with the failure report (connect exit 3 semantics: the session
+        // Failed, the foreground/detached process must exit).
+        gave_up = give_up_rx.wait_for(|fired| *fired) => {
+            let _ = gave_up;
+            // The failure detail was published into the shared report slot
+            // (watchdog terminal path) before the signal fired.
+            let failure = shared_report
+                .read()
+                .await
+                .failure
+                .clone()
+                .unwrap_or_else(|| {
+                    qcore_transport_api::FailureReport::new(
+                        qcore_transport_api::FailureLayer::Transport,
+                        "-",
+                        "session gave up; reconnect budget exhausted",
+                        "reconnect-budget",
+                    )
+                });
+            eprintln!("qcore: session failed and could not be recovered");
+            let _ = handle.stop_all().await;
+            control::remove_control_file(&dirs);
+            // The record is already Failed (watchdog wrote it); release the
+            // lock so the next start is not blocked by a dead holder.
+            drop(session_lock);
+            drop(session);
+            return report::emit_failure(&failure);
+        }
     }
     let _ = handle.stop_all().await;
     session.state = SessionState::Stopped;

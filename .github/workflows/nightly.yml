@@ -32,4 +32,6 @@ jobs:
       - run: echo "live-network egress checks (non-blocking)"
       # Ignored-mode through nextest (not the bare test runner) so retries,
       # config, and per-test timeouts apply uniformly (T7 story 17).
-      - run: cargo nextest run -p tests-conformance --run-ignored ignored-only
+      # --profile nightly: retries ×3 + 60s per-test timeout from
+      # .config/nextest.toml (live-network legs are slow/flaky by nature).
+      - run: cargo nextest run -p tests-conformance --run-ignored ignored-only --profile nightly

@@ -9,6 +9,13 @@
 //! loopback stack, so the ratio isolates engine overhead. Under parallel
 //! CI load one median can jitter past the bar, so the ratio gate retries
 //! once (best of two) instead of failing the suite on a noisy neighbor.
+//!
+//! The ratio test is `#[ignore]`d in the PR gate (ci.yml nextest skips
+//! ignored tests by default): shared-runner jitter still produced flaky
+//! red PRs, and it now runs on the nightly ignored-only lane instead
+//! (nightly.yml `cargo nextest run --run-ignored ignored-only`, with
+//! retries). The setup-budget test below stays in the PR path — it asserts
+//! a wall-clock budget, not a machine-dependent ratio.
 
 use qcore_core::api::{Engine, EngineConfig};
 use std::net::SocketAddr;
@@ -80,6 +87,11 @@ fn median(mut v: Vec<Duration>) -> Duration {
     v[v.len() / 2]
 }
 
+// Nightly-only (nightly.yml runs `-p tests-conformance --run-ignored
+// ignored-only`): ratio gates need stable load, which PR runners do not
+// give. The in-test best-of-two retry was not enough under parallel CI
+// load (flaky reds blocking unrelated PRs).
+#[ignore = "nightly: throughput ratio is load-sensitive; runs on the nightly ignored-only lane (nightly.yml)"]
 #[tokio::test]
 async fn single_hop_throughput_within_15pct_of_direct() {
     // One retry (best of two): median jitter under parallel load is

@@ -33,9 +33,9 @@
 //! on this one path.
 
 use crate::config::profile_dir::ProfileDirs;
-use crate::session::lifecycle::{self, BringUpMaterials, StartedHop};
+use crate::session::lifecycle::{self, StartedHop};
 use crate::session::report::ConnectionReport;
-use crate::session::{Session, SessionHandle, SessionState};
+use crate::session::{LiveExit, Session, SessionHandle, SessionState};
 use qcore_transport_api::{FailureLayer, FailureReport, HopEvent};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -110,6 +110,10 @@ pub struct WatchdogConfig {
     pub backoff_secs: Vec<u64>,
     pub budget: Duration,
     pub attempt_timeout: Duration,
+    /// DNS resolver address the session was started with (`EngineConfig::
+    /// dns_resolver`): a post-rebuild exit re-wires the tunnel resolver over
+    /// the NEW exit's UDP egress so ATYP=domain targets keep resolving.
+    pub dns_resolver: Option<std::net::IpAddr>,
 }
 
 impl Default for WatchdogConfig {
@@ -124,6 +128,7 @@ impl Default for WatchdogConfig {
             backoff_secs: tuning::REBUILD_BACKOFF_SECS.to_vec(),
             budget: tuning::REBUILD_BUDGET,
             attempt_timeout: tuning::REBUILD_ATTEMPT_TIMEOUT,
+            dns_resolver: None,
         }
     }
 }
@@ -133,11 +138,16 @@ impl WatchdogConfig {
     /// fail-closed helpers): imports, obfuscation, identities. A rebuild is
     /// a fresh bring-up of the same specs, so it re-reads stored material —
     /// a renewed identity or a newer winner-cache entry flows in here too.
+    ///
+    /// The maps come back owned ([`OwnedMaterials`]): the caller takes the
+    /// borrowed view for the `bring_up` await and drops the owned maps with
+    /// the attempt — secrets (identity `Zeroizing` keys) drop with the
+    /// attempt instead of leaking per rebuild (R1.3).
     fn resolve_materials(
         &self,
         registry: &crate::registry::TransportRegistry,
         hops: &[crate::config::HopSpec],
-    ) -> Result<BringUpMaterials<'static>, FailureReport> {
+    ) -> Result<crate::session::lifecycle::OwnedMaterials, FailureReport> {
         let imports = crate::config::import::materialize(&self.dirs, hops).map_err(|e| {
             FailureReport::new(
                 FailureLayer::Validation,
@@ -158,12 +168,10 @@ impl WatchdogConfig {
         let identities = crate::identity::inject::materials_for_chain(&self.dirs, hops).map_err(
             |(hop_id, msg)| FailureReport::new(FailureLayer::Validation, hop_id, msg, "identity"),
         )?;
-        // Leaked for the 'static borrow, same shape the lifecycle tests use:
-        // the maps live exactly as long as the attempt that consumes them.
-        Ok(BringUpMaterials {
-            imports: Box::leak(Box::new(imports)),
-            obfuscation: Box::leak(Box::new(obfuscation)),
-            identities: Box::leak(Box::new(identities)),
+        Ok(crate::session::lifecycle::OwnedMaterials {
+            imports: Arc::new(imports),
+            obfuscation: Arc::new(obfuscation),
+            identities: Arc::new(identities),
         })
     }
 }
@@ -240,7 +248,7 @@ impl Watchdog {
                 "chain",
             ));
         };
-        if failed_idx >= entry.started.len() {
+        if failed_idx >= entry.started_hops().len() {
             return Err(FailureReport::new(
                 FailureLayer::Chain,
                 "-",
@@ -248,8 +256,12 @@ impl Watchdog {
                 "chain",
             ));
         }
-        lifecycle::unwind(&entry.started[failed_idx..]).await;
-        let kept: Vec<StartedHop> = entry.started[..failed_idx].to_vec();
+        // Snapshot the current hops: unwind the failed segment, keep the
+        // prefix (both the watchdog task and every handle holder see the
+        // same shared vec — this clone is the working copy for this attempt).
+        let current = entry.started_hops();
+        lifecycle::unwind(&current[failed_idx..]).await;
+        let kept: Vec<StartedHop> = current[..failed_idx].to_vec();
 
         // Ring first: rewrite the failed hop's spec with a fresher verified
         // endpoint when the cache has one; otherwise the specs rebuild as
@@ -279,13 +291,15 @@ impl Watchdog {
             .map(|s| s.hop_id.clone())
             .unwrap_or_else(|| "root".to_string());
         let registry = crate::registry::TransportRegistry::global();
-        let materials = self.cfg.resolve_materials(&registry, &hops)?;
+        let owned_materials = self.cfg.resolve_materials(&registry, &hops)?;
         let deadline = Instant::now() + self.cfg.attempt_timeout;
         let events = entry.events.clone();
         let chain = crate::chain::Chain {
             hops,
             max_depth: entry.chain.max_depth,
         };
+        // The borrow lives exactly for this await; `owned_materials` (and
+        // the identity secrets in it) drop when the attempt ends.
         let segment = lifecycle::bring_up(
             &chain,
             carrier,
@@ -294,7 +308,7 @@ impl Watchdog {
             deadline,
             lifecycle::DepthContext {
                 registry: &registry,
-                materials,
+                materials: owned_materials.borrow(),
                 depth_offset: kept.len() as u32,
                 carrier_label: &carrier_label,
             },
@@ -434,7 +448,7 @@ pub(crate) async fn publish_report(
     let Some(entry) = lock_entry(live, session_id) else {
         return;
     };
-    let Some(slot) = entry.live_report.clone() else {
+    let Some(slot) = entry.live_report_slot() else {
         return;
     };
     let mut fresh = ConnectionReport::new(entry.hop_reports(), entry.exit_hop_id.clone());
@@ -528,7 +542,7 @@ async fn run_watchdog(
         let Some(entry) = lock_entry(&live, &handle.id) else {
             break;
         };
-        let Some(failed_idx) = entry.started.iter().position(|s| s.hop_id == hop_id) else {
+        let Some(failed_idx) = entry.started_hops().iter().position(|s| s.hop_id == hop_id) else {
             // Stale or foreign event (hop already rebuilt away).
             continue;
         };
@@ -560,7 +574,7 @@ async fn run_watchdog(
                 // status/stop see a session that is observably gone.
                 fail_record(&wd.cfg.dirs, &report, wd.reconnects);
                 if let Some(entry) = lock_entry(&live, &handle.id) {
-                    if let Some(slot) = entry.live_report.clone() {
+                    if let Some(slot) = entry.live_report_slot() {
                         let mut fresh =
                             ConnectionReport::new(entry.hop_reports(), entry.exit_hop_id.clone());
                         {
@@ -571,23 +585,73 @@ async fn run_watchdog(
                         fresh.failure = Some(report.clone());
                         *slot.write().await = fresh;
                     }
-                    lifecycle::unwind(&entry.started).await;
+                    let started = entry.started_hops();
+                    lifecycle::unwind(&started).await;
+                    // The hops are stopped: drop them from the shared vec
+                    // so no holder keeps stopped hops alive.
+                    *entry
+                        .started
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Vec::new();
+                    *entry
+                        .exit
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = LiveExit::default();
                 }
                 lock_map(&live).remove(&handle.id);
+                // Fire the give-up signal BEFORE clearing the degraded
+                // flag: the serving CLI observes terminal-ness while the
+                // session bus is still alive, and exits with the failure.
+                let _ = handle.give_up_sender().send(true);
                 handle
                     .degraded
                     .store(false, std::sync::atomic::Ordering::SeqCst);
                 break;
             }
             WatchOutcome::Rebuilt(outcome) => {
-                // Swap the rebuilt segment into the live entry under the
-                // map lock (kept prefix + segment; hop ids unchanged).
+                // Swap the rebuilt segment into the live entry (kept prefix
+                // + segment; hop ids unchanged) and refresh the shared
+                // egress so proxy connections opened after the rebuild dial
+                // the NEW exit — the CLI's handle clone shares this state.
+                let mut started = outcome.kept;
+                started.extend(outcome.segment);
                 {
                     let mut map = lock_map(&live);
                     if let Some(h) = map.get_mut(&handle.id) {
-                        let mut started = outcome.kept;
-                        started.extend(outcome.segment);
-                        h.started = started;
+                        // Same shared vec (Arc): the write through the map
+                        // entry's handle reaches every holder.
+                        *h.started
+                            .write()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = started.clone();
+                        // Refresh the egress: the rebuilt exit's dialer (so
+                        // handle reads — the CLI's live adapter resolves
+                        // through this — dial the NEW chain).
+                        h.exit
+                            .write()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .dialer = Some(
+                            started
+                                .last()
+                                .expect("rebuilt segment has at least one hop")
+                                .hop
+                                .dialer(),
+                        );
+                        // Re-wire the tunnel resolver over the rebuilt exit
+                        // when the session had one (domain targets keep
+                        // resolving post-rebuild; the resolver address is
+                        // the engine's, unchanged by a rebuild).
+                        if h.tunnel_resolver().is_some() {
+                            if let (Some(ip), Some(exit)) = (wd.cfg.dns_resolver, started.last()) {
+                                if exit.hop.dialer().capabilities().dials_udp {
+                                    h.set_resolver(std::sync::Arc::new(
+                                        crate::session::resolver::TunnelResolver::new(
+                                            exit.hop.dialer(),
+                                            ip,
+                                        ),
+                                    ));
+                                }
+                            }
+                        }
                     }
                 }
                 handle
@@ -823,7 +887,9 @@ mod tests {
     /// Hop double mirroring the mock transport's
     /// `fail_after_first_health_check`: first `health()` call Healthy
     /// (bring-up readiness passes), later ones Failed. `stops` counts
-    /// `stop()` calls so the unwind is observable.
+    /// `stop()` calls so the unwind is observable. Each instance registers
+    /// its counter in [`HOP_REG`] so tests can tell WHICH hop instance was
+    /// stopped (rebuilt vs pre-rebuild).
     struct RecoverHop {
         #[allow(dead_code)] // carried for symmetry with the mock transport
         hop_id: String,
@@ -831,6 +897,28 @@ mod tests {
         health_checks: AtomicU64,
         events: tokio::sync::broadcast::Sender<HopEvent>,
         stops: Arc<AtomicU64>,
+        /// Stable per-instance dialer: `dialer()` hands out the SAME Arc on
+        /// every call (the real transports do), so egress identity is
+        /// observable across rebuilds.
+        dialer: Arc<dyn Dialer>,
+    }
+
+    /// Per-instance stop counters, push-ordered by build. Index = build
+    /// number (0 = initial, 1+ = rebuilds).
+    static HOP_REG: std::sync::LazyLock<std::sync::Mutex<Vec<Arc<AtomicU64>>>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+
+    fn hop_reg_reset() {
+        HOP_REG.lock().unwrap().clear();
+    }
+
+    fn hop_stops(build: usize) -> u64 {
+        HOP_REG
+            .lock()
+            .unwrap()
+            .get(build)
+            .map(|c| c.load(Ordering::SeqCst))
+            .unwrap_or(0)
     }
 
     #[async_trait::async_trait]
@@ -839,7 +927,7 @@ mod tests {
             &RECOVER_DESC
         }
         fn dialer(&self) -> Arc<dyn Dialer> {
-            Arc::new(StubDialer)
+            self.dialer.clone()
         }
         fn health(&self) -> HopHealth {
             if self.fail_after_first && self.health_checks.fetch_add(1, Ordering::SeqCst) >= 1 {
@@ -874,8 +962,6 @@ mod tests {
     /// nextest runs each test in its own process (same isolation the
     /// lifecycle tests rely on).
     static RECOVER_BUILDS: AtomicU64 = AtomicU64::new(0);
-    static RECOVER_STOPS: std::sync::LazyLock<Arc<AtomicU64>> =
-        std::sync::LazyLock::new(|| Arc::new(AtomicU64::new(0)));
 
     struct RecoverFactory;
 
@@ -891,12 +977,15 @@ mod tests {
         ) -> Result<Arc<dyn RunningHop>, HopError> {
             let n = RECOVER_BUILDS.fetch_add(1, Ordering::SeqCst);
             hold_if_armed().await;
+            let stops = Arc::new(AtomicU64::new(0));
+            HOP_REG.lock().unwrap().push(stops.clone());
             Ok(Arc::new(RecoverHop {
                 hop_id: cfg.get("hop_id").unwrap_or("wdog-0").to_string(),
                 fail_after_first: n == 0,
                 health_checks: AtomicU64::new(0),
                 events: tokio::sync::broadcast::channel(16).0,
-                stops: RECOVER_STOPS.clone(),
+                stops,
+                dialer: Arc::new(StubDialer),
             }))
         }
     }
@@ -939,6 +1028,7 @@ mod tests {
                 health_checks: AtomicU64::new(0),
                 events: tokio::sync::broadcast::channel(16).0,
                 stops: Arc::new(AtomicU64::new(0)),
+                dialer: Arc::new(StubDialer),
             }))
         }
     }
@@ -981,6 +1071,7 @@ mod tests {
                 health_checks: AtomicU64::new(0),
                 events: tokio::sync::broadcast::channel(16).0,
                 stops: Arc::new(AtomicU64::new(0)),
+                dialer: Arc::new(StubDialer),
             }))
         }
     }
@@ -1105,11 +1196,11 @@ mod tests {
         }
     }
 
-    fn empty_materials() -> BringUpMaterials<'static> {
-        BringUpMaterials {
-            imports: Box::leak(Box::default()),
-            obfuscation: Box::leak(Box::default()),
-            identities: Box::leak(Box::default()),
+    fn empty_materials() -> lifecycle::OwnedMaterials {
+        lifecycle::OwnedMaterials {
+            imports: Arc::default(),
+            obfuscation: Arc::default(),
+            identities: Arc::default(),
         }
     }
 
@@ -1127,7 +1218,7 @@ mod tests {
             events,
             &keepalive,
             Instant::now() + Duration::from_secs(5),
-            lifecycle::DepthContext::root(&registry, empty_materials()),
+            lifecycle::DepthContext::root(&registry, empty_materials().borrow()),
         )
         .await
         .expect("initial bring-up succeeds")
@@ -1148,7 +1239,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dying_hop_degrades_then_rebuilds_to_up() {
         RECOVER_BUILDS.store(0, Ordering::SeqCst);
-        RECOVER_STOPS.store(0, Ordering::SeqCst);
+        hop_reg_reset();
         let f = fixture("recover", "wdog-hop");
         let (bus_tx, _bus_drain) = tokio::sync::broadcast::channel::<HopEvent>(256);
         let started = initial_bring_up(
@@ -1162,10 +1253,10 @@ mod tests {
         .await;
         // The handle's own bus is what the keepalive emits onto and what the
         // watchdog consumes — one channel, same wiring as engine.start.
-        let handle = reinsert(&f, |h| SessionHandle {
-            started,
-            events: bus_tx.clone(),
-            ..h
+        let handle = reinsert(&f, |mut h| {
+            h.events = bus_tx.clone();
+            h.wire_exit(started, None, None);
+            h
         });
         let cfg = test_watchdog_cfg(&f.dirs);
         // Park the first rebuild build so the Degraded record state is
@@ -1227,12 +1318,12 @@ mod tests {
             "initial build + one rebuild"
         );
         assert!(
-            RECOVER_STOPS.load(Ordering::SeqCst) >= 1,
-            "rebuild unwinds the failed hop"
+            hop_stops(0) >= 1,
+            "rebuild unwinds the failed hop (per-instance counter)"
         );
         // The live entry now carries the rebuilt (healthy) hop.
         let entry = lock_entry(&f.live, &handle.id).expect("entry alive");
-        assert_eq!(entry.started.len(), 1, "one rebuilt hop");
+        assert_eq!(entry.started_hops().len(), 1, "one rebuilt hop");
         assert_eq!(
             entry.reconnects.load(Ordering::SeqCst),
             1,
@@ -1273,10 +1364,10 @@ mod tests {
         // deterministically observable (poll-based, no sleeps). Arming
         // comes AFTER the initial bring-up so only the rebuild parks.
         arm_hold();
-        let handle = reinsert(&f, |h| SessionHandle {
-            live_report: Some(slot.clone()),
-            started,
-            ..h
+        let handle = reinsert(&f, |h| {
+            h.set_live_report(slot.clone());
+            h.wire_exit(started, None, None);
+            h
         });
         let cfg = test_watchdog_cfg(&f.dirs);
         let abort = spawn(handle.clone(), cfg, f.live.clone(), f.stop_rx.clone());
@@ -1349,7 +1440,10 @@ mod tests {
             },
         )
         .await;
-        let handle = reinsert(&f, |h| SessionHandle { started, ..h });
+        let handle = reinsert(&f, |h| {
+            h.wire_exit(started, None, None);
+            h
+        });
         let cfg = test_watchdog_cfg(&f.dirs);
         let abort = spawn(handle.clone(), cfg, f.live.clone(), f.stop_rx.clone());
         handle
@@ -1396,7 +1490,7 @@ mod tests {
         // Every build healthy (rebuild always succeeds) so five full
         // death→rebuild cycles fit inside the test budget.
         RECOVER_BUILDS.store(u64::MAX - 3, Ordering::SeqCst);
-        RECOVER_STOPS.store(0, Ordering::SeqCst);
+        hop_reg_reset();
         let f = fixture("flap-e2e", "wdog-hop");
         let started = initial_bring_up(
             "wdog-hop",
@@ -1407,7 +1501,10 @@ mod tests {
             },
         )
         .await;
-        let handle = reinsert(&f, |h| SessionHandle { started, ..h });
+        let handle = reinsert(&f, |h| {
+            h.wire_exit(started, None, None);
+            h
+        });
         let cfg = test_watchdog_cfg(&f.dirs);
         let abort = spawn(handle.clone(), cfg, f.live.clone(), f.stop_rx.clone());
 
@@ -1476,7 +1573,10 @@ mod tests {
             },
         )
         .await;
-        let handle = reinsert(&f, |h| SessionHandle { started, ..h });
+        let handle = reinsert(&f, |h| {
+            h.wire_exit(started, None, None);
+            h
+        });
         // Production clocks: the hung build would eat the 30 s attempt
         // timeout — the stop must land long before that.
         let cfg = WatchdogConfig {
@@ -1548,5 +1648,321 @@ mod tests {
         );
         abort.abort();
         let _ = std::fs::remove_dir_all(&f.dirs.config_dir);
+    }
+
+    /// (R1.1) After a successful rebuild, a handle captured BEFORE the
+    /// rebuild serves the NEW exit dialer: the CLI's serve path captured
+    /// `handle.dialer()` (or the live adapter resolves through it) once,
+    /// so the swap must reach the shared handle state — not only the map
+    /// entry. Without this, every SOCKS CONNECT after a rebuild dials the
+    /// dead pre-rebuild tunnel while STATUS reports Up.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rebuild_refreshes_the_captured_handle_egress() {
+        RECOVER_BUILDS.store(0, Ordering::SeqCst);
+        hop_reg_reset();
+        let f = fixture("live-exit", "wdog-hop");
+        let started = initial_bring_up(
+            "wdog-hop",
+            &f.handle.events,
+            crate::session::net::KeepalivePolicy {
+                enabled: false,
+                interval_secs: 1,
+            },
+        )
+        .await;
+        let handle = reinsert(&f, |h| {
+            h.wire_exit(started, None, None);
+            h
+        });
+        // The pre-rebuild egress the CLI would have captured: the exit
+        // dialer of build 0 (each RecoverHop hands out a fresh StubDialer,
+        // so rebuild N+1's dialer is a distinct Arc).
+        let pre = handle.dialer();
+        // Fat-pointer data address (thin cast first; the vtable part is
+        // irrelevant — each build's StubDialer is a distinct allocation).
+        let pre_ptr = Arc::as_ptr(&pre) as *const u8 as usize;
+        let cfg = test_watchdog_cfg(&f.dirs);
+        let abort = spawn(handle.clone(), cfg, f.live.clone(), f.stop_rx.clone());
+        handle
+            .events
+            .send(HopEvent::Failed {
+                hop_id: "h-0".into(),
+                cause: "injected death".into(),
+            })
+            .expect("session bus send");
+        let rebuilt = poll_until(Instant::now() + Duration::from_secs(10), || {
+            Session::load(&f.dirs)
+                .ok()
+                .and_then(|s| (s.state == SessionState::Up && s.reconnects == 1).then_some(()))
+        })
+        .await;
+        assert!(rebuilt.is_some(), "rebuild completed");
+        // Same handle object (no re-read of the map): the current egress is
+        // the rebuilt exit's dialer — a different Arc than the captured one.
+        let post = handle.dialer();
+        assert_ne!(
+            Arc::as_ptr(&post) as *const u8 as usize,
+            pre_ptr,
+            "the captured handle must serve the NEW exit dialer after a rebuild"
+        );
+        abort.abort();
+        handle.stop_all().await.expect("teardown");
+        let _ = std::fs::remove_dir_all(&f.dirs.config_dir);
+    }
+
+    /// (R1.2) stop_all after a rebuild tears down the REBUILT hops, not the
+    /// pre-rebuild ones: the shared started vec drives teardown, so the
+    /// recording stubs see exactly the rebuilt hop count.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_all_after_rebuild_stops_the_rebuilt_hops() {
+        RECOVER_BUILDS.store(0, Ordering::SeqCst);
+        hop_reg_reset();
+        let f = fixture("stop-rebuilt", "wdog-hop");
+        hop_reg_reset();
+        let started = initial_bring_up(
+            "wdog-hop",
+            &f.handle.events,
+            crate::session::net::KeepalivePolicy {
+                enabled: false,
+                interval_secs: 1,
+            },
+        )
+        .await;
+        let handle = reinsert(&f, |h| {
+            h.wire_exit(started, None, None);
+            h
+        });
+        let cfg = test_watchdog_cfg(&f.dirs);
+        let abort = spawn(handle.clone(), cfg, f.live.clone(), f.stop_rx.clone());
+        handle
+            .events
+            .send(HopEvent::Failed {
+                hop_id: "h-0".into(),
+                cause: "injected death".into(),
+            })
+            .expect("session bus send");
+        let rebuilt = poll_until(Instant::now() + Duration::from_secs(10), || {
+            Session::load(&f.dirs)
+                .ok()
+                .and_then(|s| (s.state == SessionState::Up && s.reconnects == 1).then_some(()))
+        })
+        .await;
+        assert!(rebuilt.is_some(), "rebuild completed");
+        // Build 0 (initial) was stopped exactly once — by the rebuild's
+        // unwind. Build 1 (the rebuilt hop) is still running.
+        assert_eq!(
+            hop_stops(0),
+            1,
+            "the rebuild unwound the initial hop exactly once"
+        );
+        assert_eq!(hop_stops(1), 0, "the rebuilt hop is still up");
+        // Teardown: the handle stops whatever hops are CURRENT (the rebuilt
+        // one), so the REBUILT instance receives the stop.
+        handle.stop_all().await.expect("teardown");
+        assert_eq!(
+            hop_stops(1),
+            1,
+            "stop_all tears down the REBUILT hop (shared vec), not the stale pre-rebuild one"
+        );
+        assert_eq!(
+            hop_stops(0),
+            1,
+            "the initial hop is not stopped a second time"
+        );
+        abort.abort();
+        let _ = std::fs::remove_dir_all(&f.dirs.config_dir);
+    }
+
+    /// (R1.2/R1.6) `Engine::stop_session` aborts the watchdog task through
+    /// the (now fully wired) map entry: the task ends instead of lingering
+    /// on the session bus after the session is gone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn engine_stop_session_aborts_the_watchdog_task() {
+        // Healthy builds only (the initial hop must not die on its own
+        // during the test window).
+        RECOVER_BUILDS.store(u64::MAX - 3, Ordering::SeqCst);
+        let d = dirs("stop-session");
+        d.ensure_dirs().unwrap();
+        let engine = crate::api::Engine::new(crate::api::EngineConfig {
+            dirs: d.clone(),
+            ..Default::default()
+        });
+        // `wdog-hop` is registered in this test binary (test double): the
+        // engine goes through the REAL start path — wiring, map insert,
+        // watchdog spawn.
+        let specs = engine.parse_chain("wdog-hop").expect("chain parses");
+        let handle = engine.start(specs).await.expect("engine start");
+        let mut give_up = (*handle.give_up).clone();
+        let wd = handle.watchdog.clone().expect("start wires the watchdog");
+        engine.stop_session(&handle.id).await.expect("stop_session");
+        // Pre-R1.2 the map entry carried `watchdog: None` (cloned before
+        // wiring), so stop_all could not abort the task; the fully wired
+        // entry does.
+        let aborted = poll_until(Instant::now() + Duration::from_secs(2), || {
+            wd.is_finished().then_some(())
+        })
+        .await;
+        assert!(
+            aborted.is_some(),
+            "watchdog task must be aborted by stop_session"
+        );
+        assert!(
+            engine.session_report(&handle.id).is_none(),
+            "stop_session removed the map entry"
+        );
+        // The give-up signal stays silent on a user stop (a stop is not a
+        // failure).
+        assert!(
+            !*give_up.borrow_and_update(),
+            "user stop must not fire the give-up signal"
+        );
+        let _ = std::fs::remove_dir_all(&d.config_dir);
+    }
+
+    /// (R1.3) Rebuild materials are owned per attempt: `resolve_materials`
+    /// returns owned maps (no `Box::leak`d 'static borrow), and the maps —
+    /// carrying the identity `Zeroizing` keys — drop when the attempt ends.
+    /// A rebuild loop of 5 failed attempts (always-failing factory) then
+    /// exercises the production path end to end.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rebuild_materials_drop_with_the_attempt() {
+        FLAKY_BUILDS.store(0, Ordering::SeqCst);
+        let d = dirs("leak");
+        d.ensure_dirs().unwrap();
+        let wd_cfg = WatchdogConfig {
+            dirs: d.clone(),
+            attempts: 5,
+            backoff_secs: vec![0, 0, 0, 0],
+            budget: Duration::from_secs(10),
+            attempt_timeout: Duration::from_secs(2),
+            ..WatchdogConfig::default()
+        };
+        let mut wd = Watchdog::new(wd_cfg);
+        // Direct probe of the ownership contract: the resolved material is
+        // owned (Arc maps) and drops when the attempt scope ends.
+        let hops = vec![plugin_spec("wdog-flaky", "h-0")];
+        let registry = crate::registry::TransportRegistry::global();
+        let owned = wd
+            .cfg
+            .resolve_materials(&registry, &hops)
+            .expect("plugin hops resolve to empty material");
+        let weak_imports = Arc::downgrade(&owned.imports);
+        let weak_ids = Arc::downgrade(&owned.identities);
+        drop(owned);
+        assert!(
+            weak_imports.upgrade().is_none(),
+            "import map dropped with the attempt (no 'static leak)"
+        );
+        assert!(
+            weak_ids.upgrade().is_none(),
+            "identity map (Zeroizing keys) dropped with the attempt"
+        );
+        // Production path: 5 failed rebuild attempts conclude, each
+        // resolving + dropping its own material set.
+        let f = fixture("leak-map", "wdog-flaky");
+        let started = initial_bring_up(
+            "wdog-flaky",
+            &f.handle.events,
+            crate::session::net::KeepalivePolicy {
+                enabled: false,
+                interval_secs: 1,
+            },
+        )
+        .await;
+        let handle = reinsert(&f, |h| {
+            h.wire_exit(started, None, None);
+            h
+        });
+        for attempt in 1..=5 {
+            let outcome = wd.on_failed(&f.live, &handle.id, 0, "leak probe").await;
+            assert!(
+                matches!(outcome, WatchOutcome::GaveUp(_)),
+                "attempt {attempt} concludes (flaky factory never rebuilds)"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&d.config_dir);
+        let _ = std::fs::remove_dir_all(&f.dirs.config_dir);
+    }
+
+    /// (R1.5) The CLI attaches the shared report slot AFTER `Engine::start`
+    /// returned — on its own clone. The attach must reach the watchdog (and
+    /// the map entry), which hold clones created before the attach: the
+    /// Option lives in Arc-shared state, so `publish_report` through ANY
+    /// clone sees it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_report_attach_reaches_pre_existing_clones() {
+        let f = fixture("attach", "wdog-hop");
+        // A clone created BEFORE the attach (the shape the watchdog and the
+        // map entry hold).
+        let early = f.handle.clone();
+        let slot = Arc::new(tokio::sync::RwLock::new(ConnectionReport::new(
+            Vec::new(),
+            "<starting>".to_string(),
+        )));
+        f.handle.set_live_report(slot.clone());
+        // Every pre-existing clone now resolves the slot.
+        assert!(
+            early.live_report_slot().is_some(),
+            "attach reaches clones made before it"
+        );
+        // And the map entry too (fixture inserted the handle at build time).
+        let entry = lock_entry(&f.live, &f.handle.id).expect("entry alive");
+        assert!(
+            entry.live_report_slot().is_some(),
+            "attach reaches the live map entry"
+        );
+        let _ = std::fs::remove_dir_all(&f.dirs.config_dir);
+    }
+
+    /// (R1.6b) `attach_session_id` refuses to stamp a lock that no longer
+    /// carries our token (stolen/replaced): the previous owner cannot
+    /// truncate the new owner's lock line.
+    #[test]
+    fn attach_session_id_refuses_a_stolen_lock() {
+        use crate::session::{session_lock_path, SessionLock};
+        let (root, dirs) = fresh_dirs_mod("stolen");
+        let lock = SessionLock::acquire(&dirs).expect("acquire");
+        // Simulate a theft: another owner's token line replaces ours.
+        std::fs::write(session_lock_path(&dirs), "thief-token\ns-theirs").expect("steal the lock");
+        let err = lock
+            .attach_session_id("s-mine")
+            .expect_err("a stolen lock must not be stamped");
+        assert!(
+            err.contains("another process"),
+            "error names the theft: {err}"
+        );
+        let content = std::fs::read_to_string(session_lock_path(&dirs)).expect("lock readable");
+        assert!(
+            content.starts_with("thief-token"),
+            "the thief's line survives untouched"
+        );
+        // Our own lock still stamps fine.
+        let lock2 = SessionLock::acquire(&dirs).expect_err("the lock is still held");
+        assert!(lock2.contains("session.lock"), "{lock2}");
+        std::fs::write(
+            session_lock_path(&dirs),
+            format!("{}\ns-mine", lock.token()),
+        )
+        .expect("restore our token");
+        lock.attach_session_id("s-mine-2").expect("own lock stamps");
+        let content = std::fs::read_to_string(session_lock_path(&dirs)).expect("lock readable");
+        assert!(content.ends_with("s-mine-2"), "id recorded: {content}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn fresh_dirs_mod(tag: &str) -> (std::path::PathBuf, ProfileDirs) {
+        let root = std::env::temp_dir().join(format!(
+            "qcore-wdog-lock-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let dirs = ProfileDirs {
+            config_dir: root.join("config"),
+            profile_dir: root.join("profiles"),
+        };
+        (root, dirs)
     }
 }

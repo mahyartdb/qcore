@@ -49,6 +49,13 @@ jobs:
         run: cargo xtask abi-diff
       - name: supply chain (cargo-deny)
         run: cargo deny --config denylist.toml check
+      # Denylist policy sync: proves every `skip` entry still matches a
+      # duplicate and every duplicate has a skip (H3.11a) — the same line
+      # local `cargo xtask ci` runs, so CI and local cannot drift here.
+      - name: denylist policy sync (deny-sync)
+        run: cargo run -q -p xtask -- deny-sync
+      - name: third-party notices
+        run: cargo run -q -p xtask -- notices --check
       # Runner disk is ~14GB: clippy+nextest+conformance target/ plus the
       # dual baseline/current rustdoc builds below exceed it (ENOSPC kill).
       # Everything before this point is done; wipe build artifacts and the

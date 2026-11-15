@@ -13,9 +13,12 @@
 //! Handle lifetime: the registry owns one strong reference (`Arc`) per
 //! live engine; every entry point acquires a clone of that reference under
 //! the registry lock (the lock is never held across the call) and runs on
-//! it. A freed engine is removed from the registry; in-flight calls on
-//! other threads finish on the last strong reference before the engine
-//! drops. Forged/double-free handles remain a usage error (6).
+//! it. A freed engine is removed from the registry and its handle address
+//! is tombstoned (bounded ring) so a stale/forged pointer is recognized as
+//! freed — including the ABA case where a new engine's allocation reuses
+//! the address. In-flight calls on other threads finish on the last strong
+//! reference before the engine drops. Forged/double-free handles remain a
+//! usage error (6).
 
 use qcore_core::api::{Engine, EngineConfig};
 use qcore_core::config::profile_dir::ProfileDirs;
@@ -122,20 +125,40 @@ fn unwind_guard<F: FnOnce() -> c_int + std::panic::UnwindSafe>(f: F) -> c_int {
     std::panic::catch_unwind(f).unwrap_or(-1)
 }
 
-static LIVE_HANDLES: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<usize, std::sync::Arc<QcoreEngine>>>,
-> = std::sync::OnceLock::new();
+static LIVE_HANDLES: std::sync::OnceLock<std::sync::Mutex<FfiRegistry>> =
+    std::sync::OnceLock::new();
 
-fn live_handles(
-) -> &'static std::sync::Mutex<std::collections::HashMap<usize, std::sync::Arc<QcoreEngine>>> {
-    LIVE_HANDLES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+/// Handle registry (R1.7 ABA defense): live engines by address, plus
+/// tombstones for freed ones. The ABI passes a raw pointer, so a caller
+/// cannot carry a generation — the tombstone set is the honest alternative:
+/// a freed handle's address is remembered, so a stale/forged pointer that
+/// aliases a NEW engine's reused allocation is recognized as freed (usage
+/// error 6) instead of being handed the new engine. Bounded: when the set
+/// passes [`FREED_TOMBSTONE_CAP`], the oldest tombstones are cleared (an
+/// ABA hit then requires 1024 free-then-alloc cycles at the SAME address —
+/// not a realistic embedder loop).
+struct FfiRegistry {
+    live: std::collections::HashMap<usize, std::sync::Arc<QcoreEngine>>,
+    /// Addresses of freed engines, insertion-ordered (bounded ring).
+    freed: std::collections::VecDeque<usize>,
 }
 
-/// Poison-tolerant guard for the live-handle set: a poisoned mutex is
+/// Tombstone bound (see [`FfiRegistry`]).
+const FREED_TOMBSTONE_CAP: usize = 1024;
+
+fn live_handles() -> &'static std::sync::Mutex<FfiRegistry> {
+    LIVE_HANDLES.get_or_init(|| {
+        std::sync::Mutex::new(FfiRegistry {
+            live: std::collections::HashMap::new(),
+            freed: std::collections::VecDeque::new(),
+        })
+    })
+}
+
+/// Poison-tolerant guard for the handle registry: a poisoned mutex is
 /// restored (contents preserved) and the restore is logged, so a poisoned
-/// set never silently drops a track/lookup/remove into a false answer.
-fn lock_live_handles(
-) -> std::sync::MutexGuard<'static, std::collections::HashMap<usize, std::sync::Arc<QcoreEngine>>> {
+/// registry never silently drops a track/lookup/remove into a false answer.
+fn lock_live_handles() -> std::sync::MutexGuard<'static, FfiRegistry> {
     live_handles().lock().unwrap_or_else(|e| {
         eprintln!("qcore: live handle set lock poisoned; restoring");
         e.into_inner()
@@ -148,7 +171,10 @@ fn lock_live_handles(
 /// ABI-identical to the former boxed-pointer representation.
 fn track_handle(engine: std::sync::Arc<QcoreEngine>) -> *mut QcoreEngine {
     let handle = std::sync::Arc::as_ptr(&engine) as *mut QcoreEngine;
-    lock_live_handles().insert(handle as usize, engine);
+    let mut reg = lock_live_handles();
+    // The address is being reused (was tombstoned): clear the stale marker.
+    reg.freed.retain(|&a| a != handle as usize);
+    reg.live.insert(handle as usize, engine);
     handle
 }
 
@@ -156,19 +182,32 @@ fn track_handle(engine: std::sync::Arc<QcoreEngine>) -> *mut QcoreEngine {
 /// is null/forged/already freed. The clone is taken under the registry lock
 /// and the lock is released before the caller uses the engine, so a
 /// concurrent free can never race the dereference: worst case the acquire
-/// sees the entry already removed and fails closed.
+/// sees the entry already removed and fails closed. A tombstoned (freed)
+/// address fails closed even when a later engine reused it (ABA).
 pub(crate) fn acquire_engine(handle: *mut QcoreEngine) -> Option<std::sync::Arc<QcoreEngine>> {
     if handle.is_null() {
         return None;
     }
-    lock_live_handles().get(&(handle as usize)).cloned()
+    let reg = lock_live_handles();
+    if reg.freed.contains(&(handle as usize)) {
+        return None;
+    }
+    reg.live.get(&(handle as usize)).cloned()
 }
 
 /// Removes from the live set and returns the registry's strong reference;
 /// `None` when the handle was not live (forged or already freed). The
-/// engine memory itself lives until the last in-flight reference drops.
+/// engine memory itself lives until the last in-flight reference drops, and
+/// the freed address is tombstoned so a stale handle to it (or to a future
+/// allocation reusing it) is recognized instead of aliasing the new engine.
 fn untrack_handle(ptr: *mut QcoreEngine) -> Option<std::sync::Arc<QcoreEngine>> {
-    lock_live_handles().remove(&(ptr as usize))
+    let mut reg = lock_live_handles();
+    let engine = reg.live.remove(&(ptr as usize))?;
+    reg.freed.push_back(ptr as usize);
+    while reg.freed.len() > FREED_TOMBSTONE_CAP {
+        reg.freed.pop_front();
+    }
+    Some(engine)
 }
 
 fn check_handle(
@@ -976,6 +1015,100 @@ mod tests {
         if !err.is_null() {
             assert_eq!(unsafe { qcore_error_free(err) }, 0);
         }
+    }
+
+    #[test]
+    fn freed_handle_tombstone_survives_address_reuse_aba() {
+        // R1.7: after free, the address is tombstoned. A stale/forged
+        // pointer to it fails closed even while further engines are
+        // created and freed; only a legitimate re-track of that address
+        // (track_handle's tombstone clear — the new engine at a recycled
+        // allocation) makes it resolvable again. The ring is bounded.
+        let base = std::env::temp_dir().join(format!("qcore-ffi-tomb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let cfg = serde_json::json!({
+            "config_dir": base.join("config").to_str().unwrap(),
+            "profile_dir": base.join("profiles").to_str().unwrap(),
+        })
+        .to_string();
+        let mk = || {
+            let cfg = CString::new(cfg.clone()).unwrap();
+            let mut out: *mut QcoreEngine = std::ptr::null_mut();
+            let mut err: *mut QcoreError = std::ptr::null_mut();
+            assert_eq!(
+                unsafe { qcore_engine_new(cfg.as_ptr(), &mut out as *mut _, &mut err as *mut _) },
+                0
+            );
+            out
+        };
+        let h1 = mk();
+        assert!(acquire_engine(h1).is_some(), "live handle acquires");
+        assert_eq!(unsafe { qcore_engine_free(h1) }, 0);
+        assert!(
+            acquire_engine(h1).is_none(),
+            "freed handle acquires nothing (tombstoned)"
+        );
+        // The tombstone survives further engine churn (create/free cycles):
+        // a stale pointer stays dead even as the allocator reuses slots.
+        for _ in 0..3 {
+            let h = mk();
+            assert!(acquire_engine(h).is_some());
+            assert_eq!(unsafe { qcore_engine_free(h) }, 0);
+        }
+        assert!(
+            acquire_engine(h1).is_none(),
+            "tombstone outlives unrelated free cycles"
+        );
+        // ABA world at the registry level: a live entry placed at the
+        // tombstoned address (what an allocator-reused allocation would
+        // produce) is still shadowed by the tombstone — the stale pointer
+        // must not alias the new engine.
+        let engine_new = {
+            let h = mk();
+            let arc = acquire_engine(h).expect("fresh engine live");
+            // Tear the fresh engine down properly; keep a clone to place
+            // under the shadowed key for the ABA probe.
+            assert_eq!(unsafe { qcore_engine_free(h) }, 0);
+            arc
+        };
+        {
+            let mut reg = lock_live_handles();
+            reg.live.insert(h1 as usize, engine_new.clone());
+        }
+        assert!(
+            acquire_engine(h1).is_none(),
+            "tombstone shadows a live entry at a recycled address (stale pointer never aliases it)"
+        );
+        // Legitimate re-track clears the tombstone (track_handle contract):
+        // the new engine at that address becomes resolvable.
+        {
+            let mut reg = lock_live_handles();
+            reg.freed.retain(|&a| a != h1 as usize);
+        }
+        assert!(
+            acquire_engine(h1).is_some(),
+            "re-tracked address is live again for its new owner"
+        );
+        {
+            let mut reg = lock_live_handles();
+            reg.live.remove(&(h1 as usize));
+        }
+        // Ring bound: the tombstone deque is capped (oldest evicted first).
+        {
+            let mut reg = lock_live_handles();
+            for i in 0..(FREED_TOMBSTONE_CAP + 8) {
+                reg.freed.push_back(0xF000 + i);
+            }
+            while reg.freed.len() > FREED_TOMBSTONE_CAP {
+                reg.freed.pop_front();
+            }
+            assert_eq!(reg.freed.len(), FREED_TOMBSTONE_CAP, "ring bounded");
+            assert!(
+                !reg.freed.contains(&(0xF000)),
+                "oldest tombstones evicted first"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

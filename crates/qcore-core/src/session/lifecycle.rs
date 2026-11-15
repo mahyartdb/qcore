@@ -67,6 +67,30 @@ pub struct BringUpMaterials<'a> {
         &'a std::collections::HashMap<String, crate::identity::inject::IdentityMaterial>,
 }
 
+/// Owned counterpart of [`BringUpMaterials`]: the maps the watchdog
+/// resolves per rebuild attempt, held by value so they (and the identity
+/// secrets inside) drop with the attempt. `borrow` yields the borrowed view
+/// `bring_up` consumes; the borrow lives exactly as long as the `Arc`s the
+/// caller holds across the await — no `'static` leak.
+pub struct OwnedMaterials {
+    pub imports: Arc<std::collections::HashMap<String, crate::config::import::ImportMaterial>>,
+    pub obfuscation:
+        Arc<std::collections::HashMap<String, crate::config::obfuscation::ObfApplication>>,
+    pub identities:
+        Arc<std::collections::HashMap<String, crate::identity::inject::IdentityMaterial>>,
+}
+
+impl OwnedMaterials {
+    /// Borrowed view for [`bring_up`]; valid while `self` is alive.
+    pub fn borrow(&self) -> BringUpMaterials<'_> {
+        BringUpMaterials {
+            imports: &self.imports,
+            obfuscation: &self.obfuscation,
+            identities: &self.identities,
+        }
+    }
+}
+
 /// Aggregate of the per-attempt context [`bring_up`] needs, keeping the
 /// function at a reviewable arity (the F2 watchdog passes the same values
 /// a fresh start does; a fresh chain passes `DepthContext::root()`).
@@ -703,12 +727,13 @@ mod tests {
         }
     }
 
-    fn materials() -> BringUpMaterials<'static> {
-        // Empty material maps, leaked for the 'static borrow (test-only).
-        BringUpMaterials {
-            imports: Box::leak(Box::new(std::collections::HashMap::new())),
-            obfuscation: Box::leak(Box::new(std::collections::HashMap::new())),
-            identities: Box::leak(Box::new(std::collections::HashMap::new())),
+    fn materials() -> OwnedMaterials {
+        // Empty material maps, owned by the helper (no leak; the borrow is
+        // taken at each call site).
+        OwnedMaterials {
+            imports: Default::default(),
+            obfuscation: Default::default(),
+            identities: Default::default(),
         }
     }
 
@@ -723,7 +748,7 @@ mod tests {
             &events,
             &KeepalivePolicy::default(),
             Instant::now() + std::time::Duration::from_secs(5),
-            DepthContext::root(reg, materials()),
+            DepthContext::root(reg, materials().borrow()),
         )
         .await
     }
@@ -777,7 +802,7 @@ mod tests {
                 &events,
                 &KeepalivePolicy::default(),
                 Instant::now() + std::time::Duration::from_millis(200),
-                DepthContext::root(&reg, materials()),
+                DepthContext::root(&reg, materials().borrow()),
             )
             .await,
             "pending build times out",
@@ -837,7 +862,7 @@ mod tests {
                 &events,
                 &KeepalivePolicy::default(),
                 Instant::now() - std::time::Duration::from_millis(1),
-                DepthContext::root(&reg, materials()),
+                DepthContext::root(&reg, materials().borrow()),
             )
             .await,
             "past deadline fails closed",

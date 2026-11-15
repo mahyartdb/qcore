@@ -20,7 +20,9 @@ use crate::config::profile_dir::ProfileDirs;
 use crate::session::lifecycle::StartedHop;
 use crate::session::net::FamilyPolicy;
 use crate::session::report::{health_status, HopReport};
-use qcore_transport_api::{Dialer, FailureReport, HopEvent};
+use qcore_transport_api::{
+    ByteStream, Capabilities, Dialer, FailureReport, HopError, HopEvent, UdpFlow,
+};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -229,6 +231,13 @@ fn converge_dead(dirs: &ProfileDirs, session: &Session) {
 /// Handle to a live session (US1 lifecycle populates running hops).
 /// Cloneable so the engine can track live sessions while callers hold one.
 ///
+/// The mutable session surfaces are shared state, not per-clone copies:
+/// the engine, the CLI, and the watchdog all hold clones of one handle, and
+/// the F2 watchdog swaps hops/exits on rebuild — every holder must observe
+/// the swap. `started` and `exit` are therefore `Arc<RwLock<..>>` and the
+/// accessors (`dialer`, `tunnel_resolver`, `hop_reports`, `stop_all`) read
+/// the CURRENT contents at call time.
+///
 /// F2 fields (all additive, defaulted via [`SessionHandle::bare`]):
 /// - `stop_signal`: the session's stop broadcast, selected by the watchdog
 ///   so `stop()` interrupts a rebuild promptly (watch → abort).
@@ -239,23 +248,39 @@ fn converge_dead(dirs: &ProfileDirs, session: &Session) {
 ///   engine's own reporting path never needs the record file.
 /// - `watchdog`: abort handle owned like the per-hop watcher handles —
 ///   teardown aborts before stopping hops.
+/// - `give_up`: watchdog terminal signal (watch, `true` = gave up); the
+///   serving CLI selects on it and exits the process with the failure
+///   report instead of idling on a Failed session holding the lock.
 #[derive(Clone)]
 pub struct SessionHandle {
     pub id: String,
     pub exit_hop_id: String,
     pub chain: ChainSer,
-    pub started: Vec<StartedHop>,
+    /// Current hops, shared across handle clones: the watchdog replaces the
+    /// contents after unwind+rebuild, so `stop_all`/reports/egress always
+    /// see whatever hops are live right now. A std lock is deliberate: the
+    /// critical sections only clone/swap a `Vec<Arc<..>>` (no await, no IO
+    /// while held), and every consumer — engine reports, FFI, the CLI proxy
+    /// serve loop — is sync or must not block on the runtime.
+    pub(crate) started: Arc<std::sync::RwLock<Vec<StartedHop>>>,
+    /// Current egress (exit dialer + tunnel resolver), refreshed by the
+    /// watchdog on rebuild so a CLI proxy that captured this handle serves
+    /// new connections through the rebuilt exit without learning about
+    /// rebuilds. `None` dialer = fall back to the live exit hop (the
+    /// bare/embedder shape where no swap can occur).
+    pub(crate) exit: Arc<std::sync::RwLock<LiveExit>>,
     pub events: tokio::sync::broadcast::Sender<HopEvent>,
-    /// Tunnel-routed DNS resolver over the exit hop's UDP egress
-    /// (`None` when no resolver address is configured or the exit hop
-    /// cannot carry UDP — domain targets then refuse fail-closed).
-    pub resolver: Option<Arc<crate::session::resolver::TunnelResolver>>,
     /// Stop broadcast (`watch`): flipped by the session's stop path; the
     /// watchdog selects on it. `false` = running.
     pub stop_signal: Arc<tokio::sync::watch::Sender<bool>>,
     /// Live report slot served by the control channel (`None` for
-    /// embedders whose status reads the engine map directly).
-    pub live_report: Option<Arc<tokio::sync::RwLock<report::ConnectionReport>>>,
+    /// embedders whose status reads the engine map directly). Shared-state
+    /// holder: the CLI attaches the slot AFTER `Engine::start` returned
+    /// (the slot's content is built from the started hops), and the attach
+    /// must reach the watchdog — which holds earlier handle clones — so the
+    /// Option lives inside an Arc the clones share (`set_live_report`).
+    pub(crate) live_report:
+        Arc<std::sync::RwLock<Option<Arc<tokio::sync::RwLock<report::ConnectionReport>>>>>,
     /// Successful watchdog rebuilds so far (0 until the first one).
     pub reconnects: Arc<std::sync::atomic::AtomicU32>,
     /// True while the watchdog is rebuilding (degraded window).
@@ -263,14 +288,61 @@ pub struct SessionHandle {
     /// Watchdog abort handle, set once the engine spawns the task.
     /// Same ownership rule as keepalive/forwarder: teardown aborts.
     pub(crate) watchdog: Option<tokio::task::AbortHandle>,
+    /// Watchdog give-up signal (`true` = terminal Failed, hops unwound,
+    /// entry removed). The serving CLI selects on it to exit the process.
+    pub give_up: Arc<tokio::sync::watch::Receiver<bool>>,
+    /// Sender half of [`SessionHandle::give_up`] (watchdog terminal path).
+    /// Held by the handle so the receiver never reads `Closed`.
+    pub(crate) give_up_tx: Arc<tokio::sync::watch::Sender<bool>>,
+}
+
+/// The current egress of a session: what new proxy connections dial through.
+/// The watchdog swaps both fields after a successful rebuild; the initial
+/// value is set by `Engine::start` from the freshly brought-up exit hop.
+#[derive(Clone, Default)]
+pub struct LiveExit {
+    pub dialer: Option<Arc<dyn Dialer>>,
+    pub resolver: Option<Arc<crate::session::resolver::TunnelResolver>>,
+}
+
+/// Egress adapter that stays live across watchdog rebuilds (R1.1): the proxy
+/// serve path captures ONE dialer for the session's lifetime, so it must
+/// consult the handle's CURRENT exit per dial — a once-evaluated `Arc<dyn
+/// Dialer>` pins the pre-rebuild tunnel and every CONNECT after a successful
+/// rebuild would fail against the dead exit while STATUS reports Up.
+/// Delegation is per-call (each CONNECT dials once through `dialer()`);
+/// capabilities read the current exit too (family gating follows the live
+/// chain, not a dead one).
+struct LiveDialer {
+    handle: SessionHandle,
+}
+
+#[async_trait::async_trait]
+impl Dialer for LiveDialer {
+    async fn dial_tcp(&self, dst: std::net::SocketAddr) -> Result<Box<dyn ByteStream>, HopError> {
+        self.handle.dialer().dial_tcp(dst).await
+    }
+
+    async fn dial_udp(&self, dst: std::net::SocketAddr) -> Result<Box<dyn UdpFlow>, HopError> {
+        self.handle.dialer().dial_udp(dst).await
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        self.handle.dialer().capabilities()
+    }
+
+    fn nested_mtu(&self) -> Option<u16> {
+        self.handle.dialer().nested_mtu()
+    }
 }
 
 impl std::fmt::Debug for SessionHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let started = self.started_hops();
         f.debug_struct("SessionHandle")
             .field("id", &self.id)
             .field("exit_hop_id", &self.exit_hop_id)
-            .field("resolver", &self.resolver.is_some())
+            .field("resolver", &self.tunnel_resolver().is_some())
             .field(
                 "degraded",
                 &self.degraded.load(std::sync::atomic::Ordering::SeqCst),
@@ -281,11 +353,7 @@ impl std::fmt::Debug for SessionHandle {
             )
             .field(
                 "hops",
-                &self
-                    .started
-                    .iter()
-                    .map(|s| s.hop_id.clone())
-                    .collect::<Vec<_>>(),
+                &started.iter().map(|s| s.hop_id.clone()).collect::<Vec<_>>(),
             )
             .finish()
     }
@@ -303,38 +371,133 @@ impl SessionHandle {
         events: tokio::sync::broadcast::Sender<HopEvent>,
     ) -> Self {
         let (stop_tx, _) = tokio::sync::watch::channel(false);
+        let (give_up_tx, give_up_rx) = tokio::sync::watch::channel(false);
         SessionHandle {
             id: id.into(),
             exit_hop_id: exit_hop_id.into(),
             chain,
-            started,
+            started: Arc::new(std::sync::RwLock::new(started)),
+            exit: Arc::new(std::sync::RwLock::new(LiveExit::default())),
             events,
-            resolver: None,
             stop_signal: Arc::new(stop_tx),
-            live_report: None,
+            live_report: Arc::new(std::sync::RwLock::new(None)),
             reconnects: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             degraded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             watchdog: None,
+            give_up: Arc::new(give_up_rx),
+            give_up_tx: Arc::new(give_up_tx),
         }
     }
 
-    /// Egress of the exit (last) hop.
-    pub fn dialer(&self) -> Arc<dyn Dialer> {
+    /// Snapshot of the current hops (post-any-rebuild). Short std lock:
+    /// clones the `Vec<Arc<..>>` out, never held across an await.
+    pub fn started_hops(&self) -> Vec<StartedHop> {
         self.started
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Set the initial (pre-watchdog) hops and egress. Called once by
+    /// `Engine::start` after bring-up; later swaps belong to the watchdog.
+    pub(crate) fn wire_exit(
+        &self,
+        started: Vec<StartedHop>,
+        dialer: Option<Arc<dyn Dialer>>,
+        resolver: Option<Arc<crate::session::resolver::TunnelResolver>>,
+    ) {
+        *self.write_started() = started;
+        *self.write_exit() = LiveExit { dialer, resolver };
+    }
+
+    /// Re-wire the tunnel resolver (watchdog post-rebuild path).
+    pub(crate) fn set_resolver(&self, resolver: Arc<crate::session::resolver::TunnelResolver>) {
+        self.write_exit().resolver = Some(resolver);
+    }
+
+    /// Sender half of the give-up signal (watchdog terminal path).
+    pub(crate) fn give_up_sender(&self) -> Arc<tokio::sync::watch::Sender<bool>> {
+        self.give_up_tx.clone()
+    }
+
+    /// A dialer that stays live across watchdog rebuilds (R1.1): every dial
+    /// delegates to the CURRENT exit dialer. The proxy serve path captures
+    /// one dialer for the session's lifetime — a once-evaluated `Arc<dyn
+    /// Dialer>` would pin the pre-rebuild tunnel and every CONNECT after a
+    /// successful rebuild would fail against the dead exit while STATUS
+    /// reports Up.
+    pub fn live_dialer(&self) -> Arc<dyn Dialer> {
+        Arc::new(LiveDialer {
+            handle: self.clone(),
+        })
+    }
+
+    /// Attach the control-channel report slot. Reaches every handle clone
+    /// (the watchdog's included — the Option is shared through an Arc), so
+    /// a CLI attaching the slot after `start` still gets watchdog
+    /// degrade/reconnect publishes on it (R1.5).
+    pub fn set_live_report(&self, slot: Arc<tokio::sync::RwLock<report::ConnectionReport>>) {
+        *self
+            .live_report
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(slot);
+    }
+
+    /// The attached report slot, if any (watchdog publish path).
+    pub fn live_report_slot(&self) -> Option<Arc<tokio::sync::RwLock<report::ConnectionReport>>> {
+        self.live_report
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Poison-tolerant write guard (same restore policy as the live map).
+    fn write_started(&self) -> std::sync::RwLockWriteGuard<'_, Vec<StartedHop>> {
+        self.started
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn write_exit(&self) -> std::sync::RwLockWriteGuard<'_, LiveExit> {
+        self.exit
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Egress of the CURRENT exit hop (fresh Arc per call): after a watchdog
+    /// rebuild this is the rebuilt exit, so per-connection reads in the
+    /// proxy serve path always dial the live chain.
+    pub fn dialer(&self) -> Arc<dyn Dialer> {
+        if let Some(d) = self
+            .exit
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .dialer
+            .clone()
+        {
+            return d;
+        }
+        self.started_hops()
             .last()
             .expect("session has at least one hop")
             .hop
             .dialer()
     }
 
-    /// Tunnel resolver, if one was wired for this session.
+    /// Tunnel resolver over the CURRENT exit hop's UDP egress, if one was
+    /// wired (and re-wired by the watchdog after rebuilds).
     pub fn tunnel_resolver(&self) -> Option<Arc<crate::session::resolver::TunnelResolver>> {
-        self.resolver.clone()
+        self.exit
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .resolver
+            .clone()
     }
 
-    /// Per-hop family/endpoint/status/nesting/obfuscation/drops in declared order.
+    /// Per-hop family/endpoint/status/nesting/obfuscation/drops in declared
+    /// order (of the CURRENT hops — post-rebuild after a swap).
     pub fn hop_reports(&self) -> Vec<HopReport> {
-        self.started
+        self.started_hops()
             .iter()
             .map(|s| HopReport {
                 hop_id: s.hop_id.clone(),
@@ -357,6 +520,8 @@ impl SessionHandle {
     /// watchdog selects out of a rebuild promptly — a stop never waits out
     /// the reconnect budget — and the watchdog task itself aborts with the
     /// other watchers.
+    /// The CURRENT hop set is torn down (the shared vec: a rebuilt session
+    /// stops the rebuilt hops, not the pre-rebuild ones).
     /// Best effort like `unwind`: a failing exit hop must not abandon inner
     /// hops still running.
     pub async fn stop_all(&self) -> Result<(), qcore_transport_api::HopError> {
@@ -367,7 +532,10 @@ impl SessionHandle {
         if let Some(wd) = &self.watchdog {
             wd.abort();
         }
-        for s in self.started.iter() {
+        // The CURRENT hop set (shared vec): a post-rebuild teardown stops
+        // the rebuilt hops, not the pre-rebuild ones (R1.2).
+        let started = self.started_hops();
+        for s in started.iter() {
             if let Some(keepalive) = &s.keepalive {
                 keepalive.abort();
             }
@@ -376,7 +544,7 @@ impl SessionHandle {
             }
         }
         tokio::task::yield_now().await;
-        for s in self.started.iter().rev() {
+        for s in started.iter().rev() {
             if let Err(e) = s.hop.stop().await {
                 if first_err.is_none() {
                     first_err = Some(e);
@@ -750,9 +918,19 @@ impl SessionLock {
     }
 
     /// Record the engine-assigned session id for diagnostics and for the
-    /// next starter's blocker message. The token line stays first.
+    /// next starter's blocker message. The token line stays first. The
+    /// overwrite is owner-checked: if the lock file no longer carries our
+    /// token (stolen by another starter), fail instead of truncating the
+    /// new owner's lock (R1.6).
     pub fn attach_session_id(&self, session_id: &str) -> Result<(), String> {
         use std::io::Write as _;
+        // Read-modify-write under an ownership check: a plain truncate-open
+        // would clobber a thief's token line between the read and the write.
+        let content = std::fs::read_to_string(&self.path)
+            .map_err(|e| format!("session lock update failed: {e}"))?;
+        if content.lines().next() != Some(self.token.as_str()) {
+            return Err("session lock is held by another process; id not recorded".to_string());
+        }
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .truncate(true)

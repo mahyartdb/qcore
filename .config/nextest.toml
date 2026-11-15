@@ -1,0 +1,11 @@
+# Repo-wide nextest config (auto-detected from .config/nextest.toml).
+# Kept minimal: one global per-test timeout so a hung test fails the run
+# with a named test instead of wedging CI until the runner timeout, and a
+# nightly profile for the ignored-only lane (live-network tests are slow
+# and flaky by nature, so retries are on there only).
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 2 }
+
+[profile.nightly]
+retries = 3
+slow-timeout = { period = "60s", terminate-after = 2 }

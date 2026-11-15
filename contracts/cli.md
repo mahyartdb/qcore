@@ -2,9 +2,7 @@
 
 **Status: normative.** This file is the single source the code cites
 (`contracts/cli.md` is referenced from doc comments across `qcore-core`
-and `qcore-cli` — grep for the exact count, it moves with edits; one
-citation in `identity/store.rs` points at `contracts/profiles.md`, which
-does not exist — dangling pointer owned by the core wave — and citations
+and `qcore-cli` — grep for the exact count, it moves with edits; citations
 also live in `tests/conformance`). The constants in `crates/qcore-core/src/session/report.rs`
 (`EXIT_*`) and their re-exports in `crates/qcore-cli/src/exit.rs` implement
 this contract; when this file and the code disagree, it is a bug in one of

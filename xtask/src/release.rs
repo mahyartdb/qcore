@@ -695,24 +695,38 @@ fn finalize_staged(staged: &Path) -> Result<(), String> {
     std::fs::write(dist.join("SHA256SUMS"), &sums).map_err(|e| fail(format!("sums: {e}")))?;
     println!("release finalize: SHA256SUMS ({} files)", files.len());
 
-    // Keyless signature when cosign is present; otherwise a loud stop (the
-    // workflow installs cosign before this runs — order is enforced there).
-    if shell_ok("cosign version") {
-        if !shell_ok(&format!(
-            "cosign sign-blob --yes {}/SHA256SUMS --output-signature {}/SHA256SUMS.sig",
-            dist.display(),
-            dist.display()
-        )) {
-            return Err(fail("cosign sign-blob failed".to_string()));
-        }
-        println!("release finalize: cosign keyless signature written");
-    } else {
-        println!("release finalize: cosign not installed — publish requires `cosign sign-blob` + SLSA attestation on CI");
-    }
+    // Keyless signature when cosign is present; otherwise fail closed in
+    // finalize mode — this function is the publish path (the workflow
+    // installs cosign before calling it, but a missing install must never
+    // degrade into an unsigned release that `gh release upload` ships
+    // anyway). The lenient print stays only for local `package` runs.
+    // `sign_sums` is a seam so tests can pin the cosign-presence decision;
+    // production always uses the real probe.
+    sign_sums(&dist, &mut shell_ok).map_err(fail)?;
+    println!("release finalize: cosign keyless signature written");
     println!(
         "release finalize: complete for qcore {ver}; upload {}/* to the GitHub release",
         dist.display()
     );
+    Ok(())
+}
+
+/// Sign SHA256SUMS via `cosign sign-blob`. `probe` answers "is cosign
+/// available"; finalize treats a missing cosign as a hard error (fail
+/// closed), not a degraded success.
+fn sign_sums(dist: &Path, probe: &mut dyn FnMut(&str) -> bool) -> Result<(), String> {
+    if !probe("cosign version") {
+        return Err(
+            "cosign not installed; finalize would produce an unsigned release. Install cosign (workflow uses sigstore/cosign-installer) and re-run".to_string(),
+        );
+    }
+    if !probe(&format!(
+        "cosign sign-blob --yes {}/SHA256SUMS --output-signature {}/SHA256SUMS.sig",
+        dist.display(),
+        dist.display()
+    )) {
+        return Err("cosign sign-blob failed".to_string());
+    }
     Ok(())
 }
 
@@ -1167,6 +1181,62 @@ mod tests {
         assert!(
             !bytes.windows(8).any(|w| w == b"old run"),
             "stale stage files must not leak into the archive"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn sign_sums_fails_closed_without_cosign() {
+        // Finalize is the publish path: a missing cosign must be a hard
+        // error, never the degraded Ok that let an unsigned release ship.
+        let base = std::env::temp_dir().join(format!(
+            "qcore-xtask-signsums-nocosign-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let dist = base.join("dist");
+        std::fs::create_dir_all(&dist).unwrap();
+
+        let mut no_cosign = |cmd: &str| -> bool {
+            // `cosign version` absent; a later sign-blob probe would only
+            // fire after the presence check, so keep a named stub for it.
+            if cmd == "cosign version" {
+                false
+            } else {
+                assert!(cmd.contains("cosign sign-blob"), "unexpected probe: {cmd}");
+                true
+            }
+        };
+        let err = super::sign_sums(&dist, &mut no_cosign)
+            .expect_err("missing cosign must fail finalize closed");
+        assert!(
+            err.contains("cosign not installed"),
+            "error names the missing dependency: {err}"
+        );
+        assert!(
+            !dist.join("SHA256SUMS.sig").exists(),
+            "no signature file on the failure path"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn sign_sums_signing_failure_is_an_error() {
+        // cosign present but sign-blob failing must not degrade to Ok either.
+        let base = std::env::temp_dir().join(format!(
+            "qcore-xtask-signsums-signfail-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let dist = base.join("dist");
+        std::fs::create_dir_all(&dist).unwrap();
+
+        let mut failing_sign = |cmd: &str| -> bool { cmd == "cosign version" };
+        let err = super::sign_sums(&dist, &mut failing_sign)
+            .expect_err("failed sign-blob must fail finalize");
+        assert!(
+            err.contains("cosign sign-blob failed"),
+            "error names the failed step: {err}"
         );
         let _ = std::fs::remove_dir_all(&base);
     }

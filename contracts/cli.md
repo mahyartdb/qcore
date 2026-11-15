@@ -63,6 +63,16 @@ Mapping rules (enforced by `exit_code_for_failure` in
   fail closed, never a false green, never a false "no session".
 - control answers with a valid report → `live`, report on stdout, exit 0.
 
+Degraded sessions (F2 auto-reconnect watchdog): while the watchdog rebuilds
+after a hop failure, the session is honest about it. `session.json` reads
+`state: "degraded"` and the live report carries the additive fields
+`session_state: "degraded"` + `reconnects` (`<n>` successful rebuilds so
+far); both serialize only while degraded — the Up-shape report JSON stays
+byte-identical to the pre-F2 contract (absent fields = Up). Status still
+exits 0 while degraded (the control channel answers), and the durable
+`reconnects` counter survives into the terminal record on give-up (Failed
+with a cause naming the attempts or the flap).
+
 `stop`: a refused control connection converges the records (control.json
 removed, session marked stopped) so a later `status` reports `dead` instead
 of stale-up. An explicit `ERR bad token` reply also converges to exit 0 and

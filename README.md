@@ -44,6 +44,11 @@ qcore status                          # session report
 qcore stop                            # tear down
 ```
 
+`--bind` serves a loopback SOCKS5 proxy through the exit hop; hostname
+targets resolve via tunnel-routed DNS (default resolver 1.1.1.1 inside the
+tunnel, override with `--dns <ip>`) so domain names never reach the OS
+resolver.
+
 ### Exit codes
 
 | Code | Meaning |

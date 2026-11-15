@@ -51,7 +51,7 @@ uint32_t qcore_abi_version(void);
 
 /**
  * Optional JSON engine config:
- * `{"config_dir","profile_dir","family","prefer","max_depth","timeout_secs","worker_threads"}`.
+ * `{"config_dir","profile_dir","family","prefer","max_depth","timeout_secs","worker_threads","dns_resolver"}`.
  * Null selects defaults. Transports linked are the FFI defaults (same set
  * the CLI links, including tor; `qcore-transports` is built with the `tor`
  * feature for both surfaces).
@@ -67,6 +67,11 @@ uint32_t qcore_abi_version(void);
  * 1). Clamped to 1..=32, default 2 (unchanged behavior when absent).
  * Non-integer/zero values fall back to the default (never an error: sizing
  * is advisory, not validation).
+ *
+ * `dns_resolver` (optional string IP) is the DNS server reachable from
+ * inside the tunnel, used for SOCKS5 domain targets so domain names never
+ * reach the OS resolver. Absent = no resolver (domain targets refuse
+ * fail-closed), mirroring the engine default.
  *
  * # Safety
  * `config_json` must be null or point to valid NUL-terminated UTF-8;

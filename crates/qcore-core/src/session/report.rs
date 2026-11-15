@@ -75,6 +75,20 @@ pub struct ConnectionReport {
     pub active_scan_profile: Option<String>,
     pub active_obfuscation: Option<String>,
     pub failure: Option<FailureReport>,
+    /// Session state while not Up (F2): `"degraded"` during a watchdog
+    /// rebuild window. `None`/absent = Up (the stable shape — the JSON
+    /// stays byte-identical to pre-F2 reports on the happy path).
+    /// Additive fields: pre-F2 readers that reject unknown keys don't exist
+    /// (serde default derive shape is structural), and the CLI contract
+    /// treats absent as Up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_state: Option<String>,
+    /// Successful watchdog reconnects so far (F2). Serialized only when
+    /// nonzero-then-reset... kept simple: serialized when Some, set
+    /// alongside `session_state = "degraded"` and after a rebuild so the
+    /// count is observable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconnects: Option<u32>,
 }
 
 impl ConnectionReport {
@@ -86,6 +100,8 @@ impl ConnectionReport {
             active_scan_profile: None,
             active_obfuscation: None,
             failure: None,
+            session_state: None,
+            reconnects: None,
         }
     }
 }
@@ -118,6 +134,8 @@ fn encode_fallback() -> String {
         "secret_redaction": true,
         "active_scan_profile": null,
         "active_obfuscation": null,
+        "session_state": null,
+        "reconnects": null,
         "failure": {
             "layer": "Config",
             "hop_id": "",
@@ -361,5 +379,37 @@ mod tests {
             "fallback must not look like success"
         );
         assert!(!back.exit_hop_id.is_empty());
+    }
+
+    #[test]
+    fn happy_path_report_json_is_stable_without_f2_fields() {
+        // The F2 additive fields serialize only when set: the Up-shape
+        // document stays byte-identical to pre-F2 reports (JSON contract
+        // stability, F2 constraint "keep JSON stable").
+        let r = ConnectionReport::new(vec![], "wg-0");
+        let doc = to_json(&r);
+        assert!(
+            !doc.contains("session_state") && !doc.contains("reconnects"),
+            "Up-shape report must not carry F2 fields: {doc}"
+        );
+    }
+
+    #[test]
+    fn degraded_report_carries_state_and_reconnects() {
+        let mut r = ConnectionReport::new(vec![], "wg-0");
+        r.session_state = Some("degraded".to_string());
+        r.reconnects = Some(2);
+        let doc = to_json(&r);
+        assert!(doc.contains("\"session_state\":\"degraded\""), "{doc}");
+        assert!(doc.contains("\"reconnects\":2"), "{doc}");
+        let back: ConnectionReport = serde_json::from_str(&doc).expect("round-trips");
+        assert_eq!(back.session_state.as_deref(), Some("degraded"));
+        assert_eq!(back.reconnects, Some(2));
+        // Absent in the wire shape still parses (serde default): a pre-F2
+        // document never rejects on a new reader.
+        let old: ConnectionReport =
+            serde_json::from_str("{\"ordered_chain\":[],\"exit_hop_id\":\"x\",\"secret_redaction\":true,\"active_scan_profile\":null,\"active_obfuscation\":null,\"failure\":null}").expect("legacy doc parses");
+        assert_eq!(old.session_state, None);
+        assert_eq!(old.reconnects, None);
     }
 }

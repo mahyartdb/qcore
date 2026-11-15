@@ -17,7 +17,7 @@ Rust workspace (edition 2021, pinned toolchain `1.97.1` via `rust-toolchain.toml
 - Binaries/tests must call `qcore_transports::linked_kinds()` once at startup, or static-archive GC drops `register_plugin!` submissions and the registry is empty.
 - Features: `qcore-transports` default = `wireguard,masque,relay,psiphon,mock`; `tor` is opt-in. FFI links `tor` too.
 - `profiles/` is data, not code: `scan.toml` (`turbo|balanced|stealth`), `obfuscation.toml`, `compositions.toml` (presets `gool` = 2× `wireguard peer=warp`, `mim` = 2× `masque alpn=h3`, `tor-warp`). Chain depth default 3, hard limit 5 (`--max-depth 1..=5`).
-- `crates/qcore-core/src/`: `api/` (Engine) · `chain/` (grammar/preset/validate; single `allowed_fields()` table) · `config/` · `session/` (lifecycle, control channel, proxy) · `scan/` · `identity/` · `diag/` (redaction).
+- `crates/qcore-core/src/`: `api/` (Engine) · `chain/` (grammar/preset/validate; single `allowed_fields()` table) · `config/` · `session/` (lifecycle, watchdog: Failed→Degraded→rebuild×3→Failed; keepalive default 25s, `--keepalive off`, tunnel DNS resolver for SOCKS5 domain targets, control channel, proxy) · `scan/` · `identity/` · `diag/` (redaction).
 
 ## Gotchas / contracts
 

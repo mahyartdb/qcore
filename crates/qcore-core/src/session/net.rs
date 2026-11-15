@@ -353,9 +353,13 @@ impl DnsPolicy {
 /// Advisory keepalive interval when keepalive is enabled (~25 s per T044).
 pub const ADVISORY_KEEPALIVE_SECS: u64 = 25;
 
-/// Per-hop keepalive policy (T044): configurable, default off. A tick observes
-/// hop health; a non-healthy hop emits `HopEvent::Failed` on the session bus
-/// so the session degrades/fails honestly instead of idling on a dead hop.
+/// Per-hop keepalive policy (T044, F2 default flip): ON by default at 25 s —
+/// the session watchdog (`crate::session::watchdog`) only acts on failures it
+/// can observe, so a dead exit hop must be noticed without the CLI opting in.
+/// `--keepalive off` disables the watcher (exit-hop death then surfaces only
+/// through the transport's own events). A tick observes hop health; a
+/// non-healthy hop emits `HopEvent::Failed` on the session bus so the session
+/// degrades and rebuilds honestly instead of idling on a dead hop.
 #[derive(Debug, Clone)]
 pub struct KeepalivePolicy {
     pub enabled: bool,
@@ -365,8 +369,25 @@ pub struct KeepalivePolicy {
 impl Default for KeepalivePolicy {
     fn default() -> Self {
         KeepalivePolicy {
-            enabled: false,
+            enabled: true,
             interval_secs: ADVISORY_KEEPALIVE_SECS,
+        }
+    }
+}
+
+impl KeepalivePolicy {
+    /// Parse the `--keepalive <secs|off>` value (F2): `off` disables, a
+    /// number sets the interval in seconds (1 clamps to the fastest sane
+    /// tick; the parse error names the accepted forms).
+    pub fn parse(value: &str) -> Result<Option<u64>, String> {
+        if value == "off" {
+            return Ok(None);
+        }
+        match value.parse::<u64>() {
+            Ok(secs) if secs >= 1 => Ok(Some(secs)),
+            _ => Err(format!(
+                "invalid --keepalive `{value}` (expected seconds ≥ 1 or `off`)"
+            )),
         }
     }
 }
@@ -468,10 +489,21 @@ mod tests {
     }
 
     #[test]
-    fn keepalive_defaults_off_with_advisory_interval() {
+    fn keepalive_defaults_on_with_advisory_interval() {
+        // F2 default flip: the watchdog can only rebuild what it can see, so
+        // the watcher ships enabled at the advisory 25 s tick.
         let p = KeepalivePolicy::default();
-        assert!(!p.enabled);
+        assert!(p.enabled);
         assert_eq!(p.interval_secs, ADVISORY_KEEPALIVE_SECS);
+    }
+
+    #[test]
+    fn keepalive_parse_accepts_secs_and_off_only() {
+        assert_eq!(KeepalivePolicy::parse("off"), Ok(None));
+        assert_eq!(KeepalivePolicy::parse("25"), Ok(Some(25)));
+        assert_eq!(KeepalivePolicy::parse("1"), Ok(Some(1)));
+        assert!(KeepalivePolicy::parse("0").is_err(), "0 is not a tick");
+        assert!(KeepalivePolicy::parse("bogus").is_err());
     }
 
     #[test]

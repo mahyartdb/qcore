@@ -12,10 +12,12 @@ use crate::identity::report::report_for_error as to_report;
 use crate::registry::TransportRegistry;
 use crate::session::lifecycle;
 use crate::session::net::{root_dialer, FamilyPolicy, KeepalivePolicy};
+use crate::session::resolver::TunnelResolver;
 use crate::session::SessionHandle;
 use qcore_transport_api::{FailureLayer, FailureReport, HopEvent};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 /// Engine configuration.
@@ -27,6 +29,12 @@ pub struct EngineConfig {
     pub prefer: String,
     pub timeout_secs: u64,
     pub keepalive: KeepalivePolicy,
+    /// DNS resolver address reachable from inside the tunnel (used for
+    /// SOCKS5 ATYP=domain targets so domain names never hit the OS
+    /// resolver). `None` keeps domain targets refused (fail closed). The
+    /// CLI defaults this to the WARP resolver for the warp/wireguard
+    /// family; see [`crate::session::resolver::DEFAULT_DNS_RESOLVER`].
+    pub dns_resolver: Option<std::net::IpAddr>,
 }
 
 impl Default for EngineConfig {
@@ -38,6 +46,7 @@ impl Default for EngineConfig {
             prefer: "ipv4".into(),
             timeout_secs: 30,
             keepalive: KeepalivePolicy::default(),
+            dns_resolver: None,
         }
     }
 }
@@ -60,11 +69,13 @@ pub struct EnsureWarp {
 }
 
 /// The engine. Owns config + registry; sessions are built per start.
+/// `live` is `Arc`-shared with the F2 watchdog so a rebuild can swap the
+/// live entry (and a give-up remove it) under the same lock.
 pub struct Engine {
     config: EngineConfig,
     registry: TransportRegistry,
     events: tokio::sync::broadcast::Sender<HopEvent>,
-    live: std::sync::Mutex<HashMap<String, SessionHandle>>,
+    live: crate::session::watchdog::LiveMap,
 }
 
 impl Engine {
@@ -84,7 +95,7 @@ impl Engine {
             config,
             registry: TransportRegistry::global(),
             events,
-            live: std::sync::Mutex::new(HashMap::new()),
+            live: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -193,31 +204,64 @@ impl Engine {
                 },
             )?;
         let started = lifecycle::bring_up(
-            &self.registry,
             &chain,
             carrier,
             &self.events,
             &self.config.keepalive,
             deadline,
-            lifecycle::BringUpMaterials {
-                imports: &imports,
-                obfuscation: &obfuscation,
-                identities: &identities,
-            },
+            lifecycle::DepthContext::root(
+                &self.registry,
+                lifecycle::BringUpMaterials {
+                    imports: &imports,
+                    obfuscation: &obfuscation,
+                    identities: &identities,
+                },
+            ),
         )
         .await?;
         let exit_hop_id = chain
             .exit()
             .map(|h| h.id.clone())
             .unwrap_or_else(|| "-".to_string());
-        let handle = SessionHandle {
-            id: new_session_id(),
-            exit_hop_id,
-            chain: crate::session::ChainSer::from(&chain),
-            started,
-            events: self.events.clone(),
+        // Tunnel resolver for ATYP=domain targets (FR-013c): built only when
+        // the EXIT hop's runtime dialer can actually carry the DNS datagram
+        // (capability read, never a kind match). No resolver + a domain
+        // target keeps the fail-closed refusal in the proxy.
+        let resolver = match (&self.config.dns_resolver, started.last()) {
+            (Some(ip), Some(exit)) if exit.hop.dialer().capabilities().dials_udp => Some(
+                std::sync::Arc::new(TunnelResolver::new(exit.hop.dialer(), *ip)),
+            ),
+            _ => None,
         };
+        let mut handle = SessionHandle::bare(
+            new_session_id(),
+            exit_hop_id,
+            crate::session::ChainSer::from(&chain),
+            started,
+            self.events.clone(),
+        );
+        handle.resolver = resolver;
         self.lock_live().insert(handle.id.clone(), handle.clone());
+        // F2 watchdog: subscribe to the session bus; on any hop Failed it
+        // degrades honestly and rebuilds through the same primitives with a
+        // bounded budget. The abort handle rides the handle so `stop_all`
+        // (CLI stop, engine stop, FFI free) interrupts it first.
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        handle.stop_signal = Arc::new(stop_tx);
+        let wd_abort = crate::session::watchdog::spawn(
+            handle.clone(),
+            crate::session::watchdog::WatchdogConfig {
+                dirs: self.config.dirs.clone(),
+                keepalive: self.config.keepalive.clone(),
+                timeout_secs: self.config.timeout_secs,
+                family: self.config.family.clone(),
+                prefer: self.config.prefer.clone(),
+                ..Default::default()
+            },
+            self.live.clone(),
+            stop_rx,
+        );
+        handle.watchdog = Some(wd_abort);
         Ok(handle)
     }
 
@@ -251,10 +295,16 @@ impl Engine {
         if self_dead(&reports) {
             self.lock_live().remove(id);
         }
-        Some(crate::session::report::ConnectionReport::new(
-            reports,
-            handle.exit_hop_id.clone(),
-        ))
+        let mut report =
+            crate::session::report::ConnectionReport::new(reports, handle.exit_hop_id.clone());
+        // F2 honesty: a degraded (rebuild-in-flight) session reports the
+        // state + reconnect count; the Up shape stays field-free (stable
+        // JSON contract — see report.rs additive-field pins).
+        if handle.degraded.load(std::sync::atomic::Ordering::SeqCst) {
+            report.session_state = Some("degraded".to_string());
+            report.reconnects = Some(handle.reconnects.load(std::sync::atomic::Ordering::SeqCst));
+        }
+        Some(report)
     }
 
     /// Tear down one live session by id.
@@ -690,16 +740,16 @@ mod tests {
 
     fn dummy_handle(id: &str) -> SessionHandle {
         let (events, _) = tokio::sync::broadcast::channel(8);
-        SessionHandle {
-            id: id.to_string(),
-            exit_hop_id: "exit-0".to_string(),
-            chain: ChainSer {
+        SessionHandle::bare(
+            id.to_string(),
+            "exit-0",
+            ChainSer {
                 hops: Vec::new(),
                 max_depth: 3,
             },
-            started: Vec::new(),
+            Vec::new(),
             events,
-        }
+        )
     }
 
     /// Poison `engine.live` by panicking while holding the guard. The guard
@@ -873,14 +923,14 @@ mod tests {
         stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> SessionHandle {
         let (events, _) = tokio::sync::broadcast::channel(8);
-        SessionHandle {
-            id: id.to_string(),
-            exit_hop_id: "exit-f".to_string(),
-            chain: ChainSer {
+        SessionHandle::bare(
+            id.to_string(),
+            "exit-f",
+            ChainSer {
                 hops: Vec::new(),
                 max_depth: 3,
             },
-            started: vec![crate::session::lifecycle::StartedHop {
+            vec![crate::session::lifecycle::StartedHop {
                 hop_id: id.to_string(),
                 kind: "failing-stop".to_string(),
                 family: "ipv4".to_string(),
@@ -895,7 +945,7 @@ mod tests {
                 forwarder: None,
             }],
             events,
-        }
+        )
     }
 
     /// Hop whose health is a fixed, configurable value (reaping tests).
@@ -959,14 +1009,14 @@ mod tests {
 
     fn handle_with_health(id: &str, health: qcore_transport_api::HopHealth) -> SessionHandle {
         let (events, _) = tokio::sync::broadcast::channel(8);
-        SessionHandle {
-            id: id.to_string(),
-            exit_hop_id: "exit-d".to_string(),
-            chain: ChainSer {
+        SessionHandle::bare(
+            id.to_string(),
+            "exit-d",
+            ChainSer {
                 hops: Vec::new(),
                 max_depth: 3,
             },
-            started: vec![crate::session::lifecycle::StartedHop {
+            vec![crate::session::lifecycle::StartedHop {
                 hop_id: "h-0".to_string(),
                 kind: "static-health".to_string(),
                 family: "ipv4".to_string(),
@@ -981,7 +1031,7 @@ mod tests {
                 forwarder: None,
             }],
             events,
-        }
+        )
     }
 
     #[test]
@@ -1077,16 +1127,16 @@ mod tests {
             health_checks: std::sync::atomic::AtomicU64::new(0),
         };
         let (_events, _drain) = tokio::sync::broadcast::channel::<HopEvent>(8);
-        let mut handle = SessionHandle {
-            id: "dying".to_string(),
-            exit_hop_id: "exit-die".to_string(),
-            chain: ChainSer {
+        let mut handle = SessionHandle::bare(
+            "dying",
+            "exit-die",
+            ChainSer {
                 hops: Vec::new(),
                 max_depth: 3,
             },
-            started: Vec::new(),
-            events: engine.events.clone(),
-        };
+            Vec::new(),
+            engine.events.clone(),
+        );
         handle.started.push(crate::session::lifecycle::StartedHop {
             hop_id: "die-0".to_string(),
             kind: "mock".to_string(),

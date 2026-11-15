@@ -124,6 +124,7 @@ async fn connect_status_stop_round_trip() {
         state: qcore_core::session::SessionState::Up,
         started_at: 0,
         failure: None,
+        reconnects: 0,
     };
     session.save(&dirs).expect("saves session record");
     let (stopped_tx, stopped_rx) = tokio::sync::oneshot::channel();

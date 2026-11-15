@@ -231,7 +231,7 @@ unsafe fn opt_c_str(ptr: *const c_char) -> Result<Option<String>, String> {
 }
 
 /// Optional JSON engine config:
-/// `{"config_dir","profile_dir","family","prefer","max_depth","timeout_secs","worker_threads"}`.
+/// `{"config_dir","profile_dir","family","prefer","max_depth","timeout_secs","worker_threads","dns_resolver"}`.
 /// Null selects defaults. Transports linked are the FFI defaults (same set
 /// the CLI links, including tor; `qcore-transports` is built with the `tor`
 /// feature for both surfaces).
@@ -247,6 +247,11 @@ unsafe fn opt_c_str(ptr: *const c_char) -> Result<Option<String>, String> {
 /// 1). Clamped to 1..=32, default 2 (unchanged behavior when absent).
 /// Non-integer/zero values fall back to the default (never an error: sizing
 /// is advisory, not validation).
+///
+/// `dns_resolver` (optional string IP) is the DNS server reachable from
+/// inside the tunnel, used for SOCKS5 domain targets so domain names never
+/// reach the OS resolver. Absent = no resolver (domain targets refuse
+/// fail-closed), mirroring the engine default.
 ///
 /// # Safety
 /// `config_json` must be null or point to valid NUL-terminated UTF-8;
@@ -300,12 +305,29 @@ pub unsafe extern "C" fn qcore_engine_new(
         let timeout = Duration::from_secs(timeout_secs.max(1));
         // Host links the transports it embeds (FR-003g scoping lives here).
         let _ = qcore_transports::linked_kinds();
+        // Tunnel-side DNS resolver for SOCKS5 domain targets (optional
+        // string IP; absent = None = domain targets refuse fail-closed).
+        // An unparseable value fails closed naming the field (6).
+        let dns_resolver = match str_field("dns_resolver") {
+            Some(s) => match s.parse::<std::net::IpAddr>() {
+                Ok(ip) => Some(ip),
+                Err(_) => {
+                    return fail(
+                        err_out,
+                        6,
+                        format!("dns_resolver invalid: `{s}` is not an IP address"),
+                    )
+                }
+            },
+            None => None,
+        };
         let engine = Engine::new(EngineConfig {
             dirs,
             max_depth,
             family: str_field("family").unwrap_or_else(|| "dual".to_string()),
             prefer: str_field("prefer").unwrap_or_else(|| "ipv4".to_string()),
             timeout_secs,
+            dns_resolver,
             ..Default::default()
         });
         let rt = match tokio::runtime::Builder::new_multi_thread()

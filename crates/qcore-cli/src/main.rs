@@ -210,6 +210,17 @@ enum Commands {
         /// Obfuscation profile chain-default (hops without explicit key inherit).
         #[arg(long = "obfuscation", short = 'O')]
         obfuscation: Option<String>,
+        /// DNS resolver address for SOCKS5 domain targets, reachable from
+        /// inside the tunnel (default: the WARP resolver 1.1.1.1; parse
+        /// failure is exit 6).
+        #[arg(long)]
+        dns: Option<String>,
+        /// Keepalive probe interval seconds, or `off` to disable the
+        /// per-hop health watcher (default 25). The auto-reconnect watchdog
+        /// only acts on failures it can observe, so `off` also disables
+        /// in-place hop rebuilds.
+        #[arg(long)]
+        keepalive: Option<String>,
     },
     /// Tear down the current session (alias: down).
     #[command(alias = "down")]
@@ -474,6 +485,8 @@ async fn async_main(cli: Cli) -> i32 {
             child,
             no_scan,
             obfuscation,
+            dns,
+            keepalive,
         } => {
             // Discovery is default-on; `--no-scan` is the only switch (the
             // old `--scan` flag was declared `default_value_t = true` with
@@ -494,6 +507,8 @@ async fn async_main(cli: Cli) -> i32 {
                 child,
                 scan: !no_scan,
                 obfuscation,
+                dns,
+                keepalive,
                 globals_max_depth: globals.max_depth,
                 globals_timeout: globals.timeout_secs,
                 globals_quiet: globals.quiet,
@@ -534,6 +549,14 @@ struct ConnectOpts {
     scan: bool,
     /// Obfuscation profile chain-default.
     obfuscation: Option<String>,
+    /// Tunnel-side DNS resolver address for SOCKS5 domain targets
+    /// (`None` = engine default resolution: WARP resolver for the
+    /// warp/wireguard family). Raw argv form; parsed in `run_connect`
+    /// (exit 6 on failure).
+    dns: Option<String>,
+    /// Keepalive argv form (`secs` | `off`); parsed in `run_connect`
+    /// (exit 6 on failure). `None` = engine default (25 s, on).
+    keepalive: Option<String>,
     /// Validated globals (T083).
     globals_max_depth: Option<u32>,
     globals_timeout: u64,
@@ -610,6 +633,8 @@ async fn run_shortcut(
                 // Match `connect` default: discovery on unless --no-scan.
                 scan: true,
                 obfuscation: None,
+                dns: None,
+                keepalive: None,
                 globals_max_depth: Some(max_depth),
                 globals_timeout: globals.timeout_secs,
                 globals_quiet: globals.quiet,
@@ -709,6 +734,44 @@ async fn run_connect(o: ConnectOpts) -> i32 {
         }
     }
 
+    // Tunnel-side DNS resolver for SOCKS5 domain targets: explicit --dns
+    // wins; otherwise the WARP resolver (the documented resolver of the
+    // warp/wireguard exit family, reachable only from inside the tunnel).
+    // A malformed address is a usage error (exit 6), like --bind. Parsing
+    // happens before the detach re-spawn so a bad value never spawns a child.
+    let dns_resolver = match &o.dns {
+        Some(raw) => match raw.parse::<std::net::IpAddr>() {
+            Ok(ip) => Some(ip),
+            Err(_) => {
+                exit::diag_exit(
+                    exit::USAGE,
+                    &format!("invalid --dns `{raw}` (expected an IP address)"),
+                );
+                return exit::USAGE;
+            }
+        },
+        None => Some(qcore_core::session::resolver::DEFAULT_DNS_RESOLVER),
+    };
+
+    // Keepalive policy (F2): `secs` sets the watcher interval, `off`
+    // disables the watcher (and with it the auto-reconnect watchdog — it
+    // only acts on failures it can observe). Usage error (exit 6) like the
+    // other malformed value flags; parsed before the detach re-spawn.
+    let keepalive_secs = match &o.keepalive {
+        Some(raw) => match qcore_core::session::net::KeepalivePolicy::parse(raw) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                exit::diag_exit(exit::USAGE, &e);
+                return exit::USAGE;
+            }
+        },
+        None => Some(qcore_core::session::net::ADVISORY_KEEPALIVE_SECS),
+    };
+    let keepalive = qcore_core::session::net::KeepalivePolicy {
+        enabled: keepalive_secs.is_some(),
+        interval_secs: keepalive_secs.unwrap_or(qcore_core::session::net::ADVISORY_KEEPALIVE_SECS),
+    };
+
     // Detached parent: re-spawn self as the session process, wait for UP.
     if o.detach && !o.child {
         return spawn_detached(o).await;
@@ -775,7 +838,8 @@ async fn run_connect(o: ConnectOpts) -> i32 {
         // Explicit --max-depth wins over the chain file; default 3.
         max_depth: o.globals_max_depth.or(file_depth).unwrap_or(3),
         timeout_secs: o.globals_timeout,
-        ..Default::default()
+        dns_resolver,
+        keepalive,
     });
 
     // Detached child rendezvous comes UP FIRST: the control listener binds
@@ -986,6 +1050,8 @@ async fn run_connect(o: ConnectOpts) -> i32 {
         state: SessionState::Validating,
         started_at: now_ms(),
         failure: None,
+        // The watchdog mutates this through its own record reads/writes.
+        reconnects: 0,
     };
     let _ = session.transition(SessionState::Starting);
     let _ = session.transition(SessionState::Up);
@@ -1016,12 +1082,18 @@ async fn run_connect(o: ConnectOpts) -> i32 {
             handle.exit_hop_id
         );
         tokio::spawn(
-            qcore_core::session::proxy::serve_socks_via_dialer_with_policy(
+            qcore_core::session::proxy::serve_socks_via_dialer_with_services(
                 binder,
                 handle.dialer(),
                 // The session policy (not dual-default): `--family ipv4` refuses
                 // IPv6 CONNECT with 0x08 at the SOCKS layer instead of dialing.
                 session.family_policy.clone(),
+                // Loopback-only peers (P1 hardening); `--expose-lan` already
+                // gated the bind above.
+                qcore_core::session::proxy::PeerPolicy::LoopbackOnly,
+                // Tunnel-routed DNS for ATYP=domain targets; None keeps the
+                // fail-closed refusal (no OS resolver fallback).
+                handle.tunnel_resolver(),
             ),
         );
     }
@@ -1187,6 +1259,12 @@ async fn spawn_detached(o: ConnectOpts) -> i32 {
     }
     if let Some(ref profile) = o.obfuscation {
         cmd.arg("--obfuscation").arg(profile);
+    }
+    if let Some(ref ip) = o.dns {
+        cmd.arg("--dns").arg(ip);
+    }
+    if let Some(ref ka) = o.keepalive {
+        cmd.arg("--keepalive").arg(ka);
     }
     // Detached child writes the report itself; forward so --detach keeps
     // the same --report-out contract as foreground connect.
@@ -1739,6 +1817,8 @@ mod tests {
                 child: false,
                 no_scan: true,
                 obfuscation: None,
+                dns: None,
+                keepalive: None,
             },
             false,
         );

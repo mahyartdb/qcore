@@ -12,6 +12,8 @@ pub mod net;
 pub mod proxy;
 pub mod reconnect;
 pub mod report;
+pub mod resolver;
+pub mod watchdog;
 
 use crate::chain::Chain;
 use crate::config::profile_dir::ProfileDirs;
@@ -61,6 +63,11 @@ impl std::error::Error for TransitionError {}
 
 /// Durable session record (`session.json`). Never contains secrets: the chain
 /// carries only `import_ref`s, never keys.
+///
+/// `reconnects` is additive (#serde default): records written before F2 read
+/// back with `0`, and future readers ignore unknown fields — an old binary
+/// reading a new record is fine (serde deny-unknown is NOT set here for this
+/// reason, pinned by the round-trip test below).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
@@ -69,6 +76,10 @@ pub struct Session {
     pub state: SessionState,
     pub started_at: u64,
     pub failure: Option<FailureReport>,
+    /// Successful in-place hop rebuilds by the watchdog (F2). Monotonic per
+    /// session; `0` for records predating the watchdog (serde default).
+    #[serde(default)]
+    pub reconnects: u32,
 }
 
 /// Serializable chain summary stored in the session record.
@@ -96,6 +107,7 @@ impl Session {
             state: SessionState::Validating,
             started_at: now,
             failure: None,
+            reconnects: 0,
         }
     }
 
@@ -216,6 +228,17 @@ fn converge_dead(dirs: &ProfileDirs, session: &Session) {
 
 /// Handle to a live session (US1 lifecycle populates running hops).
 /// Cloneable so the engine can track live sessions while callers hold one.
+///
+/// F2 fields (all additive, defaulted via [`SessionHandle::bare`]):
+/// - `stop_signal`: the session's stop broadcast, selected by the watchdog
+///   so `stop()` interrupts a rebuild promptly (watch → abort).
+/// - `live_report`: the control-channel report slot the CLI publishes into;
+///   the watchdog refreshes it on degrade/rebuild (state string
+///   `"degraded"` + reconnect count) — the listener itself is untouched.
+/// - `reconnects`/`degraded`: atomic mirrors of the watchdog state so the
+///   engine's own reporting path never needs the record file.
+/// - `watchdog`: abort handle owned like the per-hop watcher handles —
+///   teardown aborts before stopping hops.
 #[derive(Clone)]
 pub struct SessionHandle {
     pub id: String,
@@ -223,6 +246,23 @@ pub struct SessionHandle {
     pub chain: ChainSer,
     pub started: Vec<StartedHop>,
     pub events: tokio::sync::broadcast::Sender<HopEvent>,
+    /// Tunnel-routed DNS resolver over the exit hop's UDP egress
+    /// (`None` when no resolver address is configured or the exit hop
+    /// cannot carry UDP — domain targets then refuse fail-closed).
+    pub resolver: Option<Arc<crate::session::resolver::TunnelResolver>>,
+    /// Stop broadcast (`watch`): flipped by the session's stop path; the
+    /// watchdog selects on it. `false` = running.
+    pub stop_signal: Arc<tokio::sync::watch::Sender<bool>>,
+    /// Live report slot served by the control channel (`None` for
+    /// embedders whose status reads the engine map directly).
+    pub live_report: Option<Arc<tokio::sync::RwLock<report::ConnectionReport>>>,
+    /// Successful watchdog rebuilds so far (0 until the first one).
+    pub reconnects: Arc<std::sync::atomic::AtomicU32>,
+    /// True while the watchdog is rebuilding (degraded window).
+    pub degraded: Arc<std::sync::atomic::AtomicBool>,
+    /// Watchdog abort handle, set once the engine spawns the task.
+    /// Same ownership rule as keepalive/forwarder: teardown aborts.
+    pub(crate) watchdog: Option<tokio::task::AbortHandle>,
 }
 
 impl std::fmt::Debug for SessionHandle {
@@ -230,6 +270,15 @@ impl std::fmt::Debug for SessionHandle {
         f.debug_struct("SessionHandle")
             .field("id", &self.id)
             .field("exit_hop_id", &self.exit_hop_id)
+            .field("resolver", &self.resolver.is_some())
+            .field(
+                "degraded",
+                &self.degraded.load(std::sync::atomic::Ordering::SeqCst),
+            )
+            .field(
+                "reconnects",
+                &self.reconnects.load(std::sync::atomic::Ordering::SeqCst),
+            )
             .field(
                 "hops",
                 &self
@@ -243,6 +292,32 @@ impl std::fmt::Debug for SessionHandle {
 }
 
 impl SessionHandle {
+    /// Test/embedder-facing constructor defaulting every F2 field (fresh
+    /// stop signal, no report slot, zero reconnects, no watchdog yet).
+    /// Production builds handles through [`crate::api::Engine::start`].
+    pub fn bare(
+        id: impl Into<String>,
+        exit_hop_id: impl Into<String>,
+        chain: ChainSer,
+        started: Vec<StartedHop>,
+        events: tokio::sync::broadcast::Sender<HopEvent>,
+    ) -> Self {
+        let (stop_tx, _) = tokio::sync::watch::channel(false);
+        SessionHandle {
+            id: id.into(),
+            exit_hop_id: exit_hop_id.into(),
+            chain,
+            started,
+            events,
+            resolver: None,
+            stop_signal: Arc::new(stop_tx),
+            live_report: None,
+            reconnects: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            degraded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            watchdog: None,
+        }
+    }
+
     /// Egress of the exit (last) hop.
     pub fn dialer(&self) -> Arc<dyn Dialer> {
         self.started
@@ -250,6 +325,11 @@ impl SessionHandle {
             .expect("session has at least one hop")
             .hop
             .dialer()
+    }
+
+    /// Tunnel resolver, if one was wired for this session.
+    pub fn tunnel_resolver(&self) -> Option<Arc<crate::session::resolver::TunnelResolver>> {
+        self.resolver.clone()
     }
 
     /// Per-hop family/endpoint/status/nesting/obfuscation/drops in declared order.
@@ -273,13 +353,20 @@ impl SessionHandle {
 
     /// Tear down all hops reverse-order (exit first). Keepalive watchers and
     /// event forwarders are aborted before their hops stop (same ownership
-    /// rule as `unwind`).
+    /// rule as `unwind`). The session stop signal flips FIRST so the F2
+    /// watchdog selects out of a rebuild promptly — a stop never waits out
+    /// the reconnect budget — and the watchdog task itself aborts with the
+    /// other watchers.
     /// Best effort like `unwind`: a failing exit hop must not abandon inner
     /// hops still running.
     pub async fn stop_all(&self) -> Result<(), qcore_transport_api::HopError> {
         let mut first_err = None;
-        // Abort all watchers first, yield so aborts land, then stop hops:
-        // same anti-race phasing as `unwind`.
+        // Signal + abort the watchdog and every per-hop watcher first, yield
+        // so aborts land, then stop hops: same anti-race phasing as `unwind`.
+        let _ = self.stop_signal.send(true);
+        if let Some(wd) = &self.watchdog {
+            wd.abort();
+        }
         for s in self.started.iter() {
             if let Some(keepalive) = &s.keepalive {
                 keepalive.abort();
@@ -357,6 +444,7 @@ fn corrupt_placeholder() -> Session {
         state: SessionState::Up,
         started_at: 0,
         failure: None,
+        reconnects: 0,
     }
 }
 
@@ -1107,19 +1195,19 @@ mod tests {
     async fn stop_all_continues_past_exit_failure() {
         let inner_stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let exit_stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let handle = SessionHandle {
-            id: "s-stop".to_string(),
-            exit_hop_id: "exit".to_string(),
-            chain: ChainSer {
+        let handle = SessionHandle::bare(
+            "s-stop",
+            "exit",
+            ChainSer {
                 hops: vec![],
                 max_depth: 3,
             },
-            started: vec![
+            vec![
                 started_probe("inner", false, inner_stopped.clone()),
                 started_probe("exit", true, exit_stopped.clone()),
             ],
-            events: tokio::sync::broadcast::channel(8).0,
-        };
+            tokio::sync::broadcast::channel(8).0,
+        );
         let err = handle.stop_all().await.expect_err("exit error surfaces");
         assert!(err.message.contains("exit boom"), "got: {err:?}");
         assert!(

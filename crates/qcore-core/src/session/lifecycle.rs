@@ -67,17 +67,53 @@ pub struct BringUpMaterials<'a> {
         &'a std::collections::HashMap<String, crate::identity::inject::IdentityMaterial>,
 }
 
+/// Aggregate of the per-attempt context [`bring_up`] needs, keeping the
+/// function at a reviewable arity (the F2 watchdog passes the same values
+/// a fresh start does; a fresh chain passes `DepthContext::root()`).
+pub struct DepthContext<'a> {
+    /// Registry to build factories from.
+    pub registry: &'a TransportRegistry,
+    /// Per-hop materials (imports/obfuscation/identities), resolved by the
+    /// caller exactly like `Engine::start` does.
+    pub materials: BringUpMaterials<'a>,
+    /// Kept-prefix length for mid-chain rebuilds: layered-MTU reporting
+    /// starts at this depth (a fresh chain passes 0).
+    pub depth_offset: u32,
+    /// Carrier label for the segment's first hop (`via` reporting; "root"
+    /// for a fresh chain, the kept carrier hop's id for a rebuild).
+    pub carrier_label: &'a str,
+}
+
+impl<'a> DepthContext<'a> {
+    /// Fresh-chain context (depth 0, root carrier label).
+    pub fn root(registry: &'a TransportRegistry, materials: BringUpMaterials<'a>) -> Self {
+        DepthContext {
+            registry,
+            materials,
+            depth_offset: 0,
+            carrier_label: "root",
+        }
+    }
+}
+
 /// Bring up every hop in declared order before `deadline`
 /// (CONNECTION_TIMEOUT_SECONDS budget, enforced per hop and overall).
+///
+/// `ctx.depth_offset` and `ctx.carrier_label` support mid-chain rebuilds
+/// (F2 watchdog): a rebuild of hops `n..end` passes the kept prefix's
+/// length so layered-MTU reporting stays honest, and the carrier hop's id
+/// as the `via` label for the segment's first hop. Data-plane wiring is
+/// unchanged: the caller hands in the carrier dialer the segment's first
+/// hop dials through.
 pub async fn bring_up(
-    registry: &TransportRegistry,
     chain: &Chain,
     mut carrier: Arc<dyn Dialer>,
     events: &tokio::sync::broadcast::Sender<HopEvent>,
     keepalive: &KeepalivePolicy,
     deadline: Instant,
-    materials: BringUpMaterials<'_>,
+    ctx: DepthContext<'_>,
 ) -> Result<Vec<StartedHop>, FailureReport> {
+    let registry = ctx.registry;
     let mut started: Vec<StartedHop> = Vec::new();
     for (depth, spec) in chain.hops.iter().enumerate() {
         if Instant::now() >= deadline {
@@ -91,14 +127,14 @@ pub async fn bring_up(
         }
         let nested = carrier.nested_mtu().is_some();
         let via = if depth == 0 {
-            "root".to_string()
+            ctx.carrier_label.to_string()
         } else {
             started
                 .last()
                 .map(|s: &StartedHop| s.hop_id.clone())
-                .unwrap_or_else(|| "root".to_string())
+                .unwrap_or_else(|| ctx.carrier_label.to_string())
         };
-        let inner_mtu = layer_mtu(depth as u32);
+        let inner_mtu = layer_mtu(depth as u32 + ctx.depth_offset);
         let kind = spec.config.kind();
         let Some(factory) = registry.factory(kind) else {
             unwind(&started).await;
@@ -122,7 +158,7 @@ pub async fn bring_up(
         };
         fcfg.fields.insert("hop_id".into(), spec.id.clone());
         // US2: explicit chain values win; import material fills the rest.
-        if let Some(material) = materials.imports.get(&spec.id) {
+        if let Some(material) = ctx.materials.imports.get(&spec.id) {
             for (k, v) in &material.fields {
                 fcfg.fields.entry(k.clone()).or_insert_with(|| v.clone());
             }
@@ -130,7 +166,7 @@ pub async fn bring_up(
         // 002: registered identity + cached endpoint material fills
         // whatever is still unset (endpoint/keys for warp hops, endpoint
         // for masque hops); chain and imports still win.
-        if let Some(material) = materials.identities.get(&spec.id) {
+        if let Some(material) = ctx.materials.identities.get(&spec.id) {
             for (k, v) in &material.fields {
                 fcfg.fields
                     .entry(k.clone())
@@ -139,7 +175,7 @@ pub async fn bring_up(
         }
         // US5: profile params fill whatever is still unset; the active name
         // rides along for reporting.
-        let active_obfuscation = materials.obfuscation.get(&spec.id).map(|a| {
+        let active_obfuscation = ctx.materials.obfuscation.get(&spec.id).map(|a| {
             for (k, v) in &a.fields {
                 fcfg.fields.entry(k.clone()).or_insert_with(|| v.clone());
             }
@@ -246,7 +282,10 @@ fn spawn_forwarder(
 /// watchers first, yield so aborts land, then stop hops: aborting is the only
 /// stop signal for watcher tasks, and stopping the socket immediately used
 /// to race the watcher into emitting a spurious post-stop `Failed`.
-async fn unwind(started: &[StartedHop]) {
+/// `pub(crate)`: the F2 watchdog reuses it for sub-chain teardown before a
+/// rebuild (same abort-before-stop phasing — a spurious post-teardown
+/// `Failed` must not re-trigger the watchdog it raced).
+pub(crate) async fn unwind(started: &[StartedHop]) {
     for s in started.iter() {
         if let Some(keepalive) = &s.keepalive {
             keepalive.abort();
@@ -679,13 +718,12 @@ mod tests {
     ) -> Result<Vec<StartedHop>, FailureReport> {
         let (events, _rx) = tokio::sync::broadcast::channel::<HopEvent>(64);
         bring_up(
-            reg,
             chain,
             Arc::new(StubDialer),
             &events,
             &KeepalivePolicy::default(),
             Instant::now() + std::time::Duration::from_secs(5),
-            materials(),
+            DepthContext::root(reg, materials()),
         )
         .await
     }
@@ -734,13 +772,12 @@ mod tests {
         let (events, _rx) = tokio::sync::broadcast::channel::<HopEvent>(64);
         let err = expect_fail(
             bring_up(
-                &reg,
                 &chain,
                 Arc::new(StubDialer),
                 &events,
                 &KeepalivePolicy::default(),
                 Instant::now() + std::time::Duration::from_millis(200),
-                materials(),
+                DepthContext::root(&reg, materials()),
             )
             .await,
             "pending build times out",
@@ -795,13 +832,12 @@ mod tests {
         // build starts.
         let err = expect_fail(
             bring_up(
-                &reg,
                 &chain,
                 Arc::new(StubDialer),
                 &events,
                 &KeepalivePolicy::default(),
                 Instant::now() - std::time::Duration::from_millis(1),
-                materials(),
+                DepthContext::root(&reg, materials()),
             )
             .await,
             "past deadline fails closed",

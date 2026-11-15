@@ -5,8 +5,12 @@
 //! `session/net.rs`): net owns family/DNS policy, this owns the
 //! SOCKS-over-abstract-egress server. UDP ASSOCIATE is refused in US1 (TCP
 //! proxy scope); chains with UDP egress use the exit dialer directly.
+//! ATYP=domain targets resolve through the session-scoped
+//! [`TunnelResolver`] (tunnel-routed DNS — the domain name never reaches
+//! the OS resolver); without a resolver they refuse fail-closed.
 
 use super::net::{FamilyMode, FamilyPolicy};
+use super::resolver::{ResolverError, TunnelResolver};
 use qcore_transport_api::Dialer;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
@@ -75,7 +79,8 @@ pub async fn serve_socks_via_dialer_with_policy(
     dialer: Arc<dyn Dialer>,
     policy: FamilyPolicy,
 ) -> std::io::Result<()> {
-    serve_socks(listener, dialer, policy, PeerPolicy::default()).await
+    serve_socks_via_dialer_with_services(listener, dialer, policy, PeerPolicy::default(), None)
+        .await
 }
 
 /// [`serve_socks_via_dialer_with_policy`] plus an explicit [`PeerPolicy`].
@@ -84,6 +89,21 @@ pub async fn serve_socks(
     dialer: Arc<dyn Dialer>,
     policy: FamilyPolicy,
     peers: PeerPolicy,
+) -> std::io::Result<()> {
+    serve_socks_via_dialer_with_services(listener, dialer, policy, peers, None).await
+}
+
+/// The full serve path: dialer + family policy + peer filter + optional
+/// [`TunnelResolver`]. `resolver = None` keeps the fail-closed refusal for
+/// ATYP=domain targets (no OS fallback — the domain name must not leak
+/// around the tunnel); the engine wires a resolver when the exit hop has
+/// UDP egress.
+pub async fn serve_socks_via_dialer_with_services(
+    listener: tokio::net::TcpListener,
+    dialer: Arc<dyn Dialer>,
+    policy: FamilyPolicy,
+    peers: PeerPolicy,
+    resolver: Option<Arc<TunnelResolver>>,
 ) -> std::io::Result<()> {
     let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     loop {
@@ -104,6 +124,7 @@ pub async fn serve_socks(
         }
         let dialer = dialer.clone();
         let policy = policy.clone();
+        let resolver = resolver.clone();
         // Unbounded spawn is a task-exhaustion primitive: shed load by
         // closing the socket when every slot is busy.
         let Ok(permit) = slots.clone().try_acquire_owned() else {
@@ -112,7 +133,9 @@ pub async fn serve_socks(
         };
         tokio::spawn(async move {
             let _permit = permit;
-            handle_connect(socket, &*dialer, &policy).await.ok();
+            handle_connect(socket, &*dialer, &policy, resolver.as_deref())
+                .await
+                .ok();
         });
     }
 }
@@ -121,6 +144,7 @@ async fn handle_connect(
     mut socket: tokio::net::TcpStream,
     dialer: &dyn Dialer,
     policy: &FamilyPolicy,
+    resolver: Option<&TunnelResolver>,
 ) -> std::io::Result<()> {
     let mut hdr = [0u8; 2];
     read_exact_timeout(&mut socket, &mut hdr).await?;
@@ -153,8 +177,36 @@ async fn handle_connect(
     let target = match read_addr(&mut socket, req[3], policy).await {
         Ok(t) => t,
         Err(e) => {
-            write_reply(&mut socket, 0x08).await.ok();
+            write_reply(&mut socket, reply_for(&e)).await.ok();
             return Err(e);
+        }
+    };
+    // A domain target is resolved through the tunnel resolver — never the
+    // OS resolver (the domain name must not leak around the tunnel). No
+    // resolver wired (the exit hop has no UDP egress, or none was built) or
+    // the resolution itself failing both refuse before any dial; the reply
+    // code distinguishes capability (0x08) from resolution failure (0x01).
+    let target = match target {
+        SocksTarget::Ip(addr) => addr,
+        SocksTarget::Domain(host, port) => {
+            let Some(resolver) = resolver else {
+                write_reply(&mut socket, 0x08).await.ok();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "domain CONNECT targets refused (no tunnel resolver wired; use a literal IP)",
+                ));
+            };
+            match resolver.resolve(&host, policy).await {
+                Ok(ip) => SocketAddr::new(ip, port),
+                Err(e) => {
+                    let rep = reply_for_resolver(&e);
+                    write_reply(&mut socket, rep).await.ok();
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("domain target `{host}` did not resolve: {e}"),
+                    ));
+                }
+            }
         }
     };
     // A dial failure must still answer (RFC 1928): the client cannot tell a
@@ -186,11 +238,39 @@ async fn handle_connect(
     Ok(())
 }
 
+/// A parsed SOCKS5 CONNECT target: literal IP or a domain name to resolve.
+enum SocksTarget {
+    Ip(SocketAddr),
+    Domain(String, u16),
+}
+
+/// SOCKS reply for a target-read failure. Protocol/shape problems answer
+/// 0x08 (TTL/ACL-equivalent refusal, matching the family-policy refusals);
+/// only an out-of-range port is a hard client error (0x01).
+fn reply_for(e: &std::io::Error) -> u8 {
+    if e.kind() == std::io::ErrorKind::InvalidInput {
+        0x01
+    } else {
+        0x08
+    }
+}
+
+/// SOCKS reply for a resolver failure. 0x08 marks capability problems (the
+/// transport cannot carry the DNS datagram); every name-level failure
+/// (NXDOMAIN, ServFail, timeout, malformed answer) is a general failure
+/// (0x01) — the response message distinguishes them in logs.
+fn reply_for_resolver(e: &ResolverError) -> u8 {
+    match e {
+        ResolverError::NoUdpEgress(_) => 0x08,
+        _ => 0x01,
+    }
+}
+
 async fn read_addr(
     socket: &mut tokio::net::TcpStream,
     atyp: u8,
     policy: &FamilyPolicy,
-) -> std::io::Result<SocketAddr> {
+) -> std::io::Result<SocksTarget> {
     match atyp {
         0x01 => {
             let mut b = [0u8; 6];
@@ -201,10 +281,10 @@ async fn read_addr(
                     "IPv4 CONNECT targets refused by family policy (mode=ipv6)",
                 ));
             }
-            Ok(SocketAddr::new(
+            Ok(SocksTarget::Ip(SocketAddr::new(
                 IpAddr::V4(Ipv4Addr::new(b[0], b[1], b[2], b[3])),
                 u16::from_be_bytes([b[4], b[5]]),
-            ))
+            )))
         }
         0x04 => {
             let mut b = [0u8; 18];
@@ -217,22 +297,41 @@ async fn read_addr(
             }
             let mut ip = [0u8; 16];
             ip.copy_from_slice(&b[..16]);
-            Ok(SocketAddr::new(
+            Ok(SocksTarget::Ip(SocketAddr::new(
                 IpAddr::V6(Ipv6Addr::from(ip)),
                 u16::from_be_bytes([b[16], b[17]]),
-            ))
+            )))
         }
-        // Domain names stay refused until a tunnel resolver exists: resolving
-        // via the OS here would leak DNS around the tunnel.
+        // ATYP=domain: consumed here, resolved later through the tunnel
+        // resolver (see `handle_connect`) — never via the OS resolver,
+        // which would leak DNS around the tunnel on censored networks.
+        // Family policy defers to resolution: a v4/v6-only session filters
+        // the resolved address by dialing with the session policy applied
+        // inside `TunnelResolver::resolve` (single-stack modes query only
+        // their family, so the answer always fits the mode).
         0x03 => {
             let mut len = [0u8; 1];
             read_exact_timeout(socket, &mut len).await?;
             let mut rest = vec![0u8; len[0] as usize + 2];
             read_exact_timeout(socket, &mut rest).await?;
-            Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "domain CONNECT targets refused (no tunnel resolver; use a literal IP)",
-            ))
+            let host_len = len[0] as usize;
+            let host = match String::from_utf8(rest[..host_len].to_vec()) {
+                Ok(h) => h,
+                Err(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "domain target is not valid UTF-8 (RFC 1928 requires a name)",
+                    ))
+                }
+            };
+            if host.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "domain target is empty",
+                ));
+            }
+            let port = u16::from_be_bytes([rest[host_len], rest[host_len + 1]]);
+            Ok(SocksTarget::Domain(host, port))
         }
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -516,5 +615,229 @@ mod tests {
         let mut hdr = [0u8; 10];
         c.read_exact(&mut hdr).await.unwrap();
         assert_eq!(hdr[1], 0x00, "loopback peer passes the default filter");
+    }
+
+    // --- ATYP=domain through the tunnel resolver ---------------------------
+
+    /// UDP flow over an OS socket for the proxy tests (same shape as
+    /// `net::SocketUdpFlow`; inlined so the test owns no production paths).
+    struct ProxyUdpFlow {
+        inner: tokio::net::UdpSocket,
+    }
+
+    #[async_trait::async_trait]
+    impl UdpFlow for ProxyUdpFlow {
+        async fn send_to(&self, buf: &[u8], dst: SocketAddr) -> Result<(), HopError> {
+            self.inner
+                .send_to(buf, dst)
+                .await
+                .map(|_| ())
+                .map_err(HopError::from)
+        }
+
+        async fn recv_from(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr), HopError> {
+            self.inner.recv_from(buf).await.map_err(HopError::from)
+        }
+
+        fn local_addr(&self) -> Result<SocketAddr, HopError> {
+            self.inner.local_addr().map_err(HopError::from)
+        }
+    }
+
+    /// Minimal fake DNS server (canned A answers) + test dialer shared with
+    /// `resolver.rs` tests; here it proves the PROXY half: the domain name
+    /// from the SOCKS request is resolved through the tunnel and the dial
+    /// lands on the RESOLVED address.
+    struct ProxyDialer;
+
+    #[async_trait::async_trait]
+    impl Dialer for ProxyDialer {
+        async fn dial_tcp(&self, dst: SocketAddr) -> Result<Box<dyn ByteStream>, HopError> {
+            let s = tokio::net::TcpStream::connect(dst)
+                .await
+                .map_err(HopError::from)?;
+            Ok(Box::new(DirectStream { inner: s }))
+        }
+
+        async fn dial_udp(&self, dst: SocketAddr) -> Result<Box<dyn UdpFlow>, HopError> {
+            let bind = qcore_transport_api::unspecified_bind(&dst);
+            let socket = tokio::net::UdpSocket::bind(bind)
+                .await
+                .map_err(HopError::from)?;
+            socket.connect(dst).await.map_err(HopError::from)?;
+            Ok(Box::new(ProxyUdpFlow { inner: socket }))
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                accepts_tcp_carrier: true,
+                accepts_udp_carrier: true,
+                dials_tcp: true,
+                dials_udp: true,
+            }
+        }
+    }
+
+    /// Echo server bound to a SPECIFIC loopback address the fake DNS names,
+    /// so the assertion "the proxy dialed the RESOLVED addr" is meaningful
+    /// (the request itself carries only a name).
+    async fn echo_on(ip: IpAddr) -> SocketAddr {
+        let l = tokio::net::TcpListener::bind(SocketAddr::new(ip, 0))
+            .await
+            .unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = l.accept().await.unwrap();
+            let (mut r, mut w) = s.split();
+            tokio::io::copy(&mut r, &mut w).await.ok();
+        });
+        addr
+    }
+
+    /// One canned-A fake DNS server (same wire shape the resolver tests use,
+    /// inlined here to keep the proxy test self-contained).
+    async fn fake_dns(name: &str, answer: IpAddr) -> SocketAddr {
+        use std::sync::atomic::AtomicU64;
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        let name = name.to_string();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            loop {
+                let Ok((n, from)) = socket.recv_from(&mut buf).await else {
+                    break;
+                };
+                if n < 17 {
+                    continue;
+                }
+                let id = u16::from_be_bytes([buf[0], buf[1]]);
+                let mut q = &buf[12..n];
+                let mut labels = Vec::new();
+                while let Some(&len) = q.first() {
+                    if len == 0 {
+                        break;
+                    }
+                    let Some(label) = q.get(1..1 + len as usize) else {
+                        break;
+                    };
+                    labels.push(String::from_utf8_lossy(label).into_owned());
+                    q = &q[1 + len as usize..];
+                }
+                if labels.join(".") != name {
+                    continue;
+                }
+                let mut r = Vec::new();
+                r.extend_from_slice(&id.to_be_bytes());
+                r.push(0x80); // QR=1
+                r.push(0x00); // rcode 0, no TC
+                r.extend_from_slice(&[0x00, 0x01]); // QDCOUNT
+                r.extend_from_slice(&[0x00, 0x01]); // ANCOUNT
+                r.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+                for label in name.split('.') {
+                    r.push(label.len() as u8);
+                    r.extend_from_slice(label.as_bytes());
+                }
+                r.push(0);
+                r.extend_from_slice(&[0x00, 0x01]); // QTYPE A
+                r.extend_from_slice(&[0x00, 0x01]); // QCLASS IN
+                r.extend_from_slice(&[0xC0, 0x0C]); // owner pointer
+                r.extend_from_slice(&[0x00, 0x01]); // TYPE A
+                r.extend_from_slice(&[0x00, 0x01]); // CLASS IN
+                r.extend_from_slice(&[0x00, 0x00, 0x00, 0x3C]); // TTL
+                r.extend_from_slice(&[0x00, 0x04]); // RDLENGTH
+                if let IpAddr::V4(v4) = answer {
+                    r.extend_from_slice(&v4.octets());
+                }
+                let _ = socket.send_to(&r, from).await;
+            }
+        });
+        let _ = AtomicU64::new(0); // shape guard: no counter needed here
+        addr
+    }
+
+    async fn socks_request_domain(
+        c: &mut tokio::net::TcpStream,
+        host: &str,
+        port: u16,
+    ) -> [u8; 10] {
+        c.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut m = [0u8; 2];
+        c.read_exact(&mut m).await.unwrap();
+        assert_eq!(m, [0x05, 0x00]);
+        let mut req = vec![0x05u8, 0x01, 0x00, 0x03, host.len() as u8];
+        req.extend_from_slice(host.as_bytes());
+        req.extend_from_slice(&port.to_be_bytes());
+        c.write_all(&req).await.unwrap();
+        let mut hdr = [0u8; 10];
+        c.read_exact(&mut hdr).await.unwrap();
+        hdr
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn domain_target_resolves_through_tunnel_and_dials_resolved_addr() {
+        // The resolved address must be an address the REQUEST never carries:
+        // 127.0.0.2 (loopback, but distinct from the default 127.0.0.1 the
+        // SOCKS test traffic uses elsewhere).
+        let target_ip = IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 2));
+        let echo_addr = echo_on(target_ip).await;
+        let dns = fake_dns("example.internal", target_ip).await;
+        let resolver = Arc::new(TunnelResolver::with_server(Arc::new(ProxyDialer), dns));
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        tokio::spawn(serve_socks_via_dialer_with_services(
+            proxy,
+            Arc::new(ProxyDialer),
+            FamilyPolicy::default(),
+            PeerPolicy::default(),
+            Some(resolver),
+        ));
+
+        let mut c = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        let hdr = socks_request_domain(&mut c, "example.internal", echo_addr.port()).await;
+        assert_eq!(hdr[1], 0x00, "domain CONNECT succeeds via tunnel DNS");
+        // The relay is live end-to-end: bytes traverse proxy → resolved addr.
+        c.write_all(b"resolved").await.unwrap();
+        let mut back = [0u8; 8];
+        c.read_exact(&mut back).await.unwrap();
+        assert_eq!(&back, b"resolved");
+        assert_eq!(
+            echo_addr.ip(),
+            target_ip,
+            "the echo that answered sits on the RESOLVED address"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn domain_target_without_resolver_refuses_08() {
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        tokio::spawn(serve_socks_via_dialer(proxy, Arc::new(ProxyDialer)));
+
+        let mut c = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        let hdr = socks_request_domain(&mut c, "no-resolver.test", 443).await;
+        assert_eq!(
+            hdr[1], 0x08,
+            "no tunnel resolver wired: fail-closed 0x08, never OS resolution"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn domain_target_unresolvable_refuses_01() {
+        // Resolver wired but the name answers NXDOMAIN: general failure.
+        let dns = fake_dns("known.test", IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)).await;
+        let resolver = Arc::new(TunnelResolver::with_server(Arc::new(ProxyDialer), dns));
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        tokio::spawn(serve_socks_via_dialer_with_services(
+            proxy,
+            Arc::new(ProxyDialer),
+            FamilyPolicy::default(),
+            PeerPolicy::default(),
+            Some(resolver),
+        ));
+
+        let mut c = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        let hdr = socks_request_domain(&mut c, "unknown.test", 443).await;
+        assert_eq!(hdr[1], 0x01, "NXDOMAIN maps to general failure 0x01");
     }
 }

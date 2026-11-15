@@ -14,3 +14,6 @@ quinn = { workspace = true }
 rustls = { workspace = true }
 rustls-native-certs = { workspace = true }
 tokio = { workspace = true }
+
+[dev-dependencies]
+rcgen = { workspace = true }

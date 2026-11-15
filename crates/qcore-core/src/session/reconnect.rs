@@ -19,9 +19,11 @@ pub struct Identity {
 
 /// Ensure the identity file exists, creating it on first run. Corrupt
 /// records are backed up (`identity.toml.corrupt`) instead of silently
-/// clobbered, the id is unpredictable (not pid+millis), the write is atomic
-/// (temp + rename), and concurrent cold starts converge: first writer wins,
-/// losers re-read the winner instead of flapping the id.
+/// clobbered, the id is unpredictable (not pid+millis), the write is an
+/// exclusive-create `write_all` into the final path, and concurrent cold
+/// starts converge: first writer wins, losers re-read the winner instead
+/// of flapping the id. A torn file (crash/disk-full tear) is backed up and
+/// recreated on next read.
 pub fn ensure_identity(dirs: &ProfileDirs) -> std::io::Result<Identity> {
     let path = dirs.identity_file();
     for _ in 0..3 {

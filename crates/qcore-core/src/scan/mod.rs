@@ -3,17 +3,31 @@
 //! Full `Scanner::scan` implementation lands in US4 (T066); types live here so
 //! the session reconnect sink (US1 T048) can consume candidates.
 //!
-//! Probe honesty: the data-plane probe is a TCP connect+echo exchange, so
-//! data-plane verification covers TCP-probeable transports only (a
-//! transport whose descriptor sets `Capabilities::accepts_tcp_carrier` —
-//! its endpoint terminates a TCP stream). Endpoints of transports that ride
-//! UDP only can never pass a TCP probe; they are verified by successful
-//! session bring-up instead. The winner cache honors this: a cached winner
-//! of a non-TCP-probeable transport misses WITHOUT eviction on the fast-path
-//! re-verify (`cache::verify_winner_first`), so a TCP refusal can never
-//! destroy a healthy UDP winner. Eviction on probe failure stays for
-//! TCP-probeable transports.
+//! Probe honesty (review wave C1): a transport declares what protocol its
+//! *endpoint address* speaks via `HopFactory::endpoint_probe`
+//! (`qcore_transport_api::EndpointProbe`, default `None`). Only a declared
+//! contract opens endpoint sockets: `TcpEcho` runs the connect+nonce-echo
+//! data-plane probe; `None` means the scanner has no valid assumption about
+//! the endpoint's protocol, so the pipeline skips data-plane probing
+//! entirely and reports candidates in the honest `uncertain` tier (never
+//! `Verified`, never promoted to last-known-good; see `run_scan_request`).
+//! The old derivation from `Capabilities::accepts_tcp_carrier` was wrong:
+//! that is a nesting property (hop data plane rides TCP), not an endpoint
+//! property — WireGuard declares a TCP carrier while its endpoints speak
+//! UDP only, so probing them over TCP always failed (empty exit-4 scans
+//! and winner-cache eviction of healthy endpoints). A `None`-contract
+//! endpoint is verified by successful session bring-up instead. The winner
+//! cache honors the same contract: a cached winner of a non-probeable
+//! transport skips the fast path entirely (no probe attempt, no eviction —
+//! `cache::verify_winner_first`); eviction on probe failure stays for
+//! `TcpEcho` transports.
+//!
+//! `Scanner::scan` itself stays protocol-agnostic (it runs whatever sieve
+//! its request asks for; loopback conformance doubles drive it directly);
+//! the endpoint-contract gate lives in [`run_scan_request`], the shared
+//! CLI/FFI pipeline.
 
+use crate::registry::TransportRegistry;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 
@@ -428,6 +442,16 @@ impl Scanner {
 /// Canonical scan family: exactly `ipv4`, `ipv6`, `dual`.
 pub const SCAN_FAMILIES: &[&str] = &["ipv4", "ipv6", "dual"];
 
+/// The endpoint-probe contract `transport` declares (review wave C1).
+/// Unregistered kinds have no contract (`None`): fail closed, like every
+/// other registry lookup in the scan path.
+fn endpoint_probe_contract(transport: &str) -> qcore_transport_api::EndpointProbe {
+    match TransportRegistry::global().factory(transport) {
+        Some(f) => f.endpoint_probe(),
+        None => qcore_transport_api::EndpointProbe::None,
+    }
+}
+
 fn family_of(addr: SocketAddr) -> String {
     if addr.is_ipv4() {
         "ipv4".to_string()
@@ -528,8 +552,15 @@ fn rand8() -> [u8; 8] {
 /// verify, persist/evict — called by both CLI `scan` and FFI `qcore_scan`
 /// so identical inputs give identical results and cache effects.
 ///
+/// - Endpoint-probe contract first (review wave C1): only a transport whose
+///   factory declares `EndpointProbe::TcpEcho` gets endpoint sockets probed;
+///   any other transport (including the `warp` alias when unregistered, and
+///   every undeclared real transport) yields the honest unverified tier —
+///   candidates reported Uncertain without any probe socket, no cache
+///   eviction, no legacy-LKG write — because a TCP refusal at an endpoint
+///   whose protocol is undeclared proves nothing.
 /// - Per-transport winner re-verify (fast path — full scan skipped while
-///   the cached winner answers);
+///   the cached winner answers; skipped entirely for non-probeable kinds);
 /// - else full scan over legacy LKG + warp.toml seeds + scan.toml
 ///   discovery seeds; winners cached per transport (and legacy LKG).
 ///
@@ -552,6 +583,14 @@ pub async fn run_scan_request(
             "scan family `{family}` is unknown: family must be one of ipv4|ipv6|dual"
         ));
     }
+    let t0 = std::time::Instant::now();
+    // Endpoint-probe contract (review wave C1): only a transport that
+    // declares an endpoint protocol may have endpoint sockets opened. An
+    // undeclared contract means no valid probe exists for those addresses —
+    // probing them anyway (the old behavior, keyed off the nesting
+    // capability `accepts_tcp_carrier`) reported honest-looking verdicts
+    // that no real endpoint could ever pass.
+    let probe_contract = endpoint_probe_contract(transport);
     let budget = std::time::Duration::from_millis(profile.rtt_budget_ms.clamp(1, 5000));
     if let Some((addr, latency_ms)) =
         cache::verify_winner_first(dirs, transport, family, budget).await
@@ -603,6 +642,39 @@ pub async fn run_scan_request(
     // F4: scan-wide ceiling (reuses the seeded bound) — the scanner truncates
     // again defensively, this keeps the pre-scan sort/dedup bounded too.
     candidates.truncate(seeds::MAX_SEEDED_CANDIDATES);
+    // No declared endpoint contract (review wave C1): the sieve has no
+    // protocol it may speak to those endpoints, so nothing here may be
+    // Verified and no socket may be opened. The honest outcome is the
+    // unverified tier: every candidate reported as Uncertain with no
+    // latency measurement (`latency_ms: 0`), zero probe sockets, zero
+    // failures — and no cache mutation, because nothing was tested (a
+    // connect-refusal at an endpoint whose protocol is undeclared proves
+    // nothing, so winners and the legacy field keep their state). The
+    // reachability field has no `Unknown` variant (CLI/FFI shape), so the
+    // unverified tier reuses the handshake spelling: Passed + Uncertain
+    // reads "listed, not traffic-validated". Such endpoints are verified by
+    // successful session bring-up instead.
+    if probe_contract != qcore_transport_api::EndpointProbe::TcpEcho {
+        let ranked = candidates
+            .into_iter()
+            .map(|addr| EndpointCandidate {
+                address: addr,
+                family: family_of(addr),
+                latency_ms: 0,
+                reachability: Reachability::Passed,
+                confidence: Confidence::Uncertain,
+                last_known_good: false,
+            })
+            .collect();
+        return Ok(ScanReport {
+            transport: transport.to_string(),
+            profile: profile.name,
+            family: family.to_string(),
+            ranked,
+            failed: 0,
+            elapsed_ms: t0.elapsed().as_millis() as u64,
+        });
+    }
     let report = Scanner::scan(ScanRequest {
         transport: transport.to_string(),
         profile,
@@ -638,7 +710,11 @@ pub async fn run_scan_request(
 /// Persist the top verified candidate as last-known-good (FR-017). Returns
 /// the cached address, or `None` when nothing verified exists — uncertain
 /// results are never promoted. Reader half is the T048 reconnect sink.
-/// Blocking; async callers use [`persist_verified_async`].
+/// The legacy top-level field serves wireguard-family readers (reconnect,
+/// import materialize, discovery gate), so a non-wireguard-family scan's
+/// verified endpoint is only reported, never written into it (review wave
+/// C1: a masque address in the legacy field poisons every wireguard
+/// reader). Blocking; async callers use [`persist_verified_async`].
 pub fn persist_verified(
     dirs: &crate::config::profile_dir::ProfileDirs,
     report: &ScanReport,
@@ -652,8 +728,11 @@ pub fn persist_verified(
     };
     dirs.ensure_dirs().map_err(|e| e.to_string())?;
     // Locked RMW in `cache` (preserves sibling transports' winners — the old
-    // whole-file rewrite wiped them on every scan).
-    cache::persist_last_known_good(dirs, top.address)?;
+    // whole-file rewrite wiped them on every scan). Legacy-field scoping:
+    // only wireguard-family transports feed it.
+    if cache::feeds_legacy_lkg(&report.transport) {
+        cache::persist_last_known_good(dirs, top.address)?;
+    }
     Ok(Some(top.address))
 }
 
@@ -671,7 +750,9 @@ pub async fn persist_verified_async(
         return Ok(None);
     };
     dirs.ensure_dirs().map_err(|e| e.to_string())?;
-    cache::persist_last_known_good_async(dirs, top.address).await?;
+    if cache::feeds_legacy_lkg(&report.transport) {
+        cache::persist_last_known_good_async(dirs, top.address).await?;
+    }
     Ok(Some(top.address))
 }
 
@@ -822,8 +903,11 @@ mod tests {
         }
     }
 
-    /// F1: an empty warp scan evicts only warp — masque survives with a live
-    /// legacy LKG, and the file is deleted only when fully empty.
+    /// F1: an empty warp scan evicts only warp — masque survives, and the
+    /// file is deleted only when fully empty. Wave C1: the surviving masque
+    /// winner does not feed the legacy field (the dead warp address is
+    /// cleared from it — never silently reused, never replaced by a
+    /// non-wireguard winner).
     #[test]
     fn evict_stale_lkg_is_per_transport() {
         let d = evict_dirs("per-transport");
@@ -844,10 +928,16 @@ mod tests {
             d.endpoints_file().exists(),
             "file survives while a sibling winner remains"
         );
-        assert_eq!(
+        assert_ne!(
             crate::session::reconnect::last_known_good(&d),
-            Some("127.0.0.1:443".parse().unwrap()),
-            "legacy LKG follows the surviving winner, never the dead one"
+            Some("127.0.0.1:2408".parse().unwrap()),
+            "legacy LKG never keeps the dead warp address"
+        );
+        assert!(
+            !std::fs::read_to_string(d.endpoints_file())
+                .unwrap()
+                .contains("\"last_known_good\":\"127.0.0.1:443\""),
+            "surviving masque winner never feeds the legacy field (wave C1)"
         );
         // Evicting the last transport clears the file (legacy-only stale
         // files included — no silent reuse).
@@ -1038,6 +1128,191 @@ mod tests {
         assert!(
             cache::read_winners(&d).contains_key("warp"),
             "family validation precedes cache writes"
+        );
+        let _ = std::fs::remove_dir_all(&d.config_dir);
+    }
+
+    /// FIX 1 (review wave C1): a non-probeable transport gets the honest
+    /// unverified tier from the shared pipeline — candidates reported
+    /// Uncertain without any probe socket, no eviction. A TCP echo listener
+    /// is running at the seeded endpoint, yet it must not be probed, and
+    /// nothing may reach Verified, because no real endpoint of this
+    /// transport speaks the probe's language.
+    #[tokio::test]
+    async fn undeclared_endpoint_contract_scans_nothing_without_probing() {
+        let d = evict_dirs("contract-none");
+        // `wireguard` is a registered kind with no declared endpoint
+        // contract (its endpoints are UDP): the pipeline must not open a
+        // TCP socket at its endpoints even when one would answer.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((s, _)) = listener.accept().await {
+                drop(s);
+            }
+        });
+        std::fs::write(
+            d.profile_dir.join("warp.toml"),
+            format!(
+                "[warp]\nranges = []\nseeds = [\"127.0.0.1\"]\nports = [{}]\nv6_ranges = []\nv6_seeds = []\n[masque]\nranges = []\nseeds = []\nports = [443]\nv6_ranges = []\nv6_seeds = []\n[defaults]\nscan_profile = \"balanced\"\n",
+                echo.port()
+            ),
+        )
+        .unwrap();
+        // A stale wireguard winner: the skipped fast path must not evict it
+        // (evicting here would destroy a healthy UDP endpoint on the
+        // strength of a proof-less TCP refusal).
+        cache::record_winner(&d, "wireguard", evict_winner("127.0.0.1:2408")).unwrap();
+        let profile = load_profile(&d, "balanced").expect("profile loads");
+        let report = run_scan_request(&d, "wireguard", profile, "dual")
+            .await
+            .expect("pipeline runs");
+        // Two candidates: the seeded loopback echo + the legacy LKG seed
+        // (both listed Uncertain without any probe).
+        assert_eq!(report.ranked.len(), 2, "candidates are listed, not probed");
+        assert!(
+            report
+                .ranked
+                .iter()
+                .all(|c| c.confidence == Confidence::Uncertain),
+            "unverified tier: no candidate is Verified without a declared contract"
+        );
+        assert!(
+            report.ranked.iter().all(|c| c.latency_ms == 0),
+            "no probe, no measurement"
+        );
+        assert!(
+            report.ranked.iter().all(|c| !c.last_known_good),
+            "uncertain is never promoted"
+        );
+        assert_eq!(
+            report.failed, 0,
+            "zero probe sockets: nothing was attempted, nothing failed"
+        );
+        assert_eq!(
+            cache::read_winners(&d)["wireguard"].address,
+            "127.0.0.1:2408",
+            "healthy winner survives a contract-less scan"
+        );
+        let _ = std::fs::remove_dir_all(&d.config_dir);
+    }
+
+    /// Test-only transport declaring the `TcpEcho` endpoint contract, so the
+    /// pipeline's contract gate can be exercised with a live echo endpoint
+    /// inside the qcore-core unit-test binary (which links no real transport
+    /// plugins — the registry here only sees test submissions like this one
+    /// and registry.rs's). Mirrors registry.rs's registration pattern.
+    struct EchoTestFactory;
+    static ECHO_TEST_FACTORY: EchoTestFactory = EchoTestFactory;
+
+    static ECHO_TEST_DESCRIPTOR: qcore_transport_api::TransportDescriptor =
+        qcore_transport_api::TransportDescriptor {
+            kind: "echo-test",
+            capabilities: qcore_transport_api::Capabilities {
+                accepts_tcp_carrier: true,
+                accepts_udp_carrier: true,
+                dials_tcp: true,
+                dials_udp: true,
+            },
+            obfuscation_families: &[],
+            config_schema: "echo-test/v1",
+            needs_sidecar: false,
+        };
+
+    #[async_trait::async_trait]
+    impl qcore_transport_api::HopFactory for EchoTestFactory {
+        fn descriptor(&self) -> &'static qcore_transport_api::TransportDescriptor {
+            &ECHO_TEST_DESCRIPTOR
+        }
+
+        fn endpoint_probe(&self) -> qcore_transport_api::EndpointProbe {
+            qcore_transport_api::EndpointProbe::TcpEcho
+        }
+
+        async fn build(
+            &self,
+            _cfg: qcore_transport_api::HopConfig,
+            _carrier: std::sync::Arc<dyn qcore_transport_api::Dialer>,
+        ) -> Result<
+            std::sync::Arc<dyn qcore_transport_api::RunningHop>,
+            qcore_transport_api::HopError,
+        > {
+            Err(qcore_transport_api::HopError::validation("test-only"))
+        }
+    }
+
+    qcore_transport_api::register_plugin!(&ECHO_TEST_FACTORY);
+
+    /// FIX 1 (review wave C1): the `TcpEcho` contract keeps the old
+    /// honest-confidence tiers — a live echo endpoint Verifies (and wins the
+    /// cache), a closed endpoint fails (probeable eviction applies).
+    /// `echo-test` declares the contract; an undeclared transport behaves
+    /// oppositely (see `undeclared_endpoint_contract_scans_nothing_without_probing`).
+    #[tokio::test]
+    async fn tcp_echo_contract_pipeline_verifies_and_caches() {
+        let d = evict_dirs("contract-tcp-echo");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let (mut r, mut w) = s.split();
+                    let _ = tokio::io::copy(&mut r, &mut w).await;
+                });
+            }
+        });
+        std::fs::write(
+            d.profile_dir.join("scan.toml"),
+            format!(
+                "{}\n[discovery.echo-test]\nseeds = [\"{echo}\"]\n",
+                SHIPPED_SCAN_TOML
+            ),
+        )
+        .unwrap();
+        let profile = load_profile(&d, "balanced").expect("profile loads");
+        let report = run_scan_request(&d, "echo-test", profile, "dual")
+            .await
+            .expect("pipeline runs");
+        assert_eq!(report.ranked.len(), 1, "echo endpoint verified");
+        assert_eq!(report.ranked[0].address, echo);
+        assert_eq!(
+            report.ranked[0].confidence,
+            Confidence::Verified,
+            "declared TcpEcho contract keeps the Verified tier"
+        );
+        assert_eq!(
+            cache::read_winners(&d)["echo-test"].address,
+            echo.to_string(),
+            "verified winner cached under the echo-test key"
+        );
+        let _ = std::fs::remove_dir_all(&d.config_dir);
+    }
+
+    /// FIX 2 (review wave C1): the pipeline's legacy LKG write is scoped to
+    /// the wireguard family — a verified masque scan reports the winner but
+    /// never overwrites the legacy field the wireguard readers consume.
+    #[tokio::test]
+    async fn masque_verified_scan_does_not_poison_legacy_lkg() {
+        let d = evict_dirs("masque-lkg");
+        cache::record_winner(&d, "warp", evict_winner("127.0.0.1:2408")).unwrap();
+        let mut report = empty_report_family("masque", "dual");
+        report
+            .ranked
+            .push(cand(10, Confidence::Verified, Reachability::Passed));
+        let cached = persist_verified_async(&d, &report).await.expect("persist");
+        assert!(cached.is_some(), "verified candidate reported");
+        assert_eq!(
+            cache::read_winners(&d)["warp"].address,
+            "127.0.0.1:2408",
+            "warp winner untouched"
+        );
+        let raw = std::fs::read_to_string(d.endpoints_file()).unwrap();
+        assert!(
+            !raw.contains("192.0.2.1"),
+            "masque winner never enters the legacy field: {raw}"
         );
         let _ = std::fs::remove_dir_all(&d.config_dir);
     }

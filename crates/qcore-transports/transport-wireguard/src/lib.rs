@@ -15,13 +15,15 @@ pub mod modes;
 pub mod stream;
 pub mod test_support;
 
+use boringtun::noise::errors::WireGuardError;
 use boringtun::noise::{Tunn, TunnResult};
 use qcore_transport_api::{
     unspecified_bind, ByteStream, Capabilities, Dialer, HopConfig, HopError, HopErrorKind,
     HopEvent, HopHealth, ObfuscationFamily, RunningHop, TransportDescriptor, UdpFlow,
 };
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use crate::stream::FrameSender;
@@ -43,6 +45,32 @@ pub const MAX_DGRAM_FRAME: usize = 65515;
 
 /// One queued uplink packet: destination + encrypted bytes.
 pub type EgressItem = (SocketAddr, Vec<u8>);
+
+/// How long the pump may stay parked on one `send_to` before the hop is
+/// declared failed (finding 6: a wedged carrier send must not silently stall
+/// the whole pump — recv stops, health stays green, timers freeze). 5 s: far
+/// above any legitimate loopback/LAN carrier latency, far below the
+/// WireGuard session-expiry window, so a false positive costs a clean
+/// failure rather than a silent blackhole.
+const PUMP_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// `QCORE_WG_TRACE` resolved once (finding 5: the hot path previously ran
+/// `std::env::var` per inbound packet). Read on first use; never re-read.
+fn wg_trace_enabled() -> bool {
+    static TRACE: OnceLock<bool> = OnceLock::new();
+    *TRACE.get_or_init(|| std::env::var("QCORE_WG_TRACE").is_ok())
+}
+
+/// Cumulative boringtun protocol-error count (finding 1b observability):
+/// tick errors (`update_timers`) and inbound decapsulate errors are counted
+/// here, never swallowed silently. `ConnectionExpired` additionally fails
+/// the hop.
+static PUMP_TICK_ERRORS: AtomicU64 = AtomicU64::new(0);
+
+/// Total boringtun protocol errors across all hops (diagnostics).
+pub fn pump_tick_errors() -> u64 {
+    PUMP_TICK_ERRORS.load(Ordering::Relaxed)
+}
 
 thread_local! {
     /// Reused 64K boringtun scratch (#15 perf batch). `vec![0u8; 65535]`
@@ -319,7 +347,11 @@ impl WireguardHop {
         }
         let (events, _) = tokio::sync::broadcast::channel(16);
         let (tx, tx_rx) = tokio::sync::mpsc::channel(EGRESS_QUEUE_CAP);
-        let streams = Arc::new(stream::StreamTable::new());
+        // This hop always initiates the WireGuard handshake, so it allocates
+        // odd stream ids (finding 3 invariant; responder space is even).
+        let streams = Arc::new(stream::StreamTable::new_with_side(
+            stream::StreamSide::Initiator,
+        ));
         streams.observe(hop_id.clone(), events.clone());
         let inner = Arc::new(HopInner {
             tunnel: Mutex::new(tunnel),
@@ -341,6 +373,11 @@ impl WireguardHop {
         if let Some(packet) = init {
             inner.udp.send_to(&packet, params.peer_endpoint).await.ok();
         }
+        // The handshake is now `InitSent`; from here the pump's
+        // `update_timers` tick owns retransmission (boringtun REKEY_TIMEOUT
+        // = 5 s + jitter). The pre-fix retry loop kept calling
+        // `encapsulate(&[])`, which returns `Done` while `is_in_progress()` —
+        // it could never retransmit (finding 1a).
 
         let pump_inner = Arc::downgrade(&inner);
         let pump_events = events.clone();
@@ -358,42 +395,24 @@ impl WireguardHop {
         };
 
         // Wait for handshake completion (engine wraps with its own timeout).
-        // One reused scratch buffer for the retry loop, not one 64K alloc
-        // per tick. The loop polls every 20 ms but retransmits at most every
-        // RETRANSMIT_INTERVAL: the old code slept 200 ms per iteration,
-        // flooring loopback handshakes at ~200 ms (measured 208 ms,
-        // i5-12400 loopback, release); the retransmit cadence — the only
-        // network-visible behavior — is unchanged.
-        const RETRANSMIT_INTERVAL: Duration = Duration::from_millis(200);
-        let mut retry_dst = vec![0u8; 65535];
-        // Backdated so the first iteration retransmits immediately, exactly
-        // like the old loop (which sent before its first 200 ms sleep).
-        let mut last_tx = std::time::Instant::now()
-            .checked_sub(RETRANSMIT_INTERVAL)
-            .unwrap_or_else(std::time::Instant::now);
+        // Poll-only: retransmission is boringtun's job now (pump
+        // `update_timers` tick, REKEY_TIMEOUT = 5 s + jitter). The old loop
+        // "retried" by calling `encapsulate(&[])` every 200 ms — which
+        // returns `Done` while the handshake is `InitSent`, so it never
+        // actually retransmitted (finding 1a); forcing a retransmit here
+        // instead (via `format_handshake_initiation(force_resend)`) would
+        // also reset `time_sent` per attempt and race the pump's rekey
+        // driver. 15 s exceeds boringtun's REKEY_ATTEMPT_TIME (90 s is not
+        // reached; the engine's own dial timeout fires first) — this local
+        // timeout is just the fail-closed backstop.
         let ok = tokio::time::timeout(Duration::from_secs(15), async {
             loop {
-                {
+                let established = {
                     let tunnel = inner.tunnel.lock().unwrap();
-                    if tunnel.time_since_last_handshake().is_some() {
-                        break;
-                    }
-                }
-                // Retransmit initiation while unestablished (lock released
-                // before await so the pump can make progress).
-                if last_tx.elapsed() >= RETRANSMIT_INTERVAL {
-                    let retry: Option<Vec<u8>> = {
-                        let mut tunnel = inner.tunnel.lock().unwrap();
-                        match tunnel.encapsulate(&[], &mut retry_dst) {
-                            TunnResult::WriteToNetwork(packet) => Some(packet.to_vec()),
-                            _ => None,
-                        }
-                    };
-                    if let Some(packet) = retry {
-                        let peer = *inner.peer.read().unwrap();
-                        inner.udp.send_to(&packet, peer).await.ok();
-                    }
-                    last_tx = std::time::Instant::now();
+                    tunnel.time_since_last_handshake().is_some()
+                };
+                if established {
+                    break;
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
@@ -500,6 +519,54 @@ impl FrameSender for EgressTx {
     }
 }
 
+/// One WireGuard timer tick against `inner`'s tunnel (finding 1): drives
+/// `Tunn::update_timers` — boringtun's single entry point for handshake
+/// retransmission (REKEY_TIMEOUT = 5 s + jitter), rekey
+/// (REKEY_AFTER_TIME = 120 s), reactive keepalive (10 s after the last
+/// inbound packet), persistent keepalive (per policy, default off —
+/// FR-013d) and expiry. The pre-fix tick called `encapsulate(&[])`
+/// instead, which (a) never retransmits while the handshake is `InitSent`
+/// (returns `Done`), (b) never rekeys — sessions silently blackholed
+/// after ~2-3 min against a real peer — and (c) emitted an empty
+/// keepalive every 100 ms with an established session (10 Hz), violating
+/// keepalive-default-off. The returned packet is enqueued by the caller
+/// (never sent directly) so ALL transmissions share one FIFO order —
+/// direct sends let keepalives overtake DATA and trip the peer's replay
+/// protection.
+fn pump_tick(inner: &HopInner, tick_dst: &mut [u8]) -> Result<Option<EgressItem>, WireGuardError> {
+    let mut tunnel = inner.tunnel.lock().unwrap();
+    match tunnel.update_timers(tick_dst) {
+        TunnResult::WriteToNetwork(packet) => {
+            Ok(Some((*inner.peer.read().unwrap(), packet.to_vec())))
+        }
+        // `update_timers` never decrypts inbound traffic, so tunnel-data
+        // results are unreachable — matched defensively anyway.
+        TunnResult::WriteToTunnelV4(..) | TunnResult::WriteToTunnelV6(..) => Ok(None),
+        TunnResult::Done => Ok(None),
+        TunnResult::Err(e) => Err(e),
+    }
+}
+
+/// Pump tick-error branch (finding 1b): count every tick error honestly
+/// (never swallowed), and map the terminal `ConnectionExpired` to the
+/// `HopEvent::Failed` the pump emits before stopping — the session can no
+/// longer carry traffic (keys zeroed), so fail the hop loudly instead of
+/// leaving health green over a blackholed tunnel. Returns `Some(Failed)`
+/// for a terminal error (the pump sends it and breaks); transient errors
+/// return `None` and the next tick retries (expiry still lands here within
+/// REJECT_AFTER_TIME). Shared by the pump select-arm and the tests, so
+/// deleting the mapping fails the tests.
+fn on_tick_error(err: WireGuardError, hop_id: &str) -> Option<HopEvent> {
+    PUMP_TICK_ERRORS.fetch_add(1, Ordering::Relaxed);
+    if matches!(err, WireGuardError::ConnectionExpired) {
+        return Some(HopEvent::Failed {
+            hop_id: hop_id.to_string(),
+            cause: format!("wireguard session expired: {err:?}"),
+        });
+    }
+    None
+}
+
 async fn pump_loop(
     inner: std::sync::Weak<HopInner>,
     mut tx_rx: tokio::sync::mpsc::Receiver<EgressItem>,
@@ -524,29 +591,66 @@ async fn pump_loop(
         };
         tokio::select! {
             _ = tick.tick() => {
-                // Keepalive / handshake retransmit driver. Enqueued (never
-                // sent directly) so ALL transmissions share one FIFO order —
-                // direct sends let keepalives overtake DATA and trip the
-                // peer's replay protection.
-                let queued: Option<EgressItem> = {
-                    let mut tunnel = inner.tunnel.lock().unwrap();
-                    match tunnel.encapsulate(&[], &mut tick_dst) {
-                        TunnResult::WriteToNetwork(packet) => {
-                            Some((*inner.peer.read().unwrap(), packet.to_vec()))
-                        }
-                        _ => None,
+                // WireGuard timer driver (finding 1): see [`pump_tick`].
+                match pump_tick(&inner, &mut tick_dst) {
+                    Ok(Some(item)) => {
+                        // Best-effort: a full queue already holds 1024 newer
+                        // packets' worth of backpressure; the next 100 ms
+                        // tick retransmits. Never blocks the pump on its own
+                        // queue.
+                        let _ = inner.tx.try_send(item);
                     }
-                };
-                if let Some(item) = queued {
-                    // Best-effort: a full queue already holds 1024 newer
-                    // packets' worth of backpressure; the next 100 ms tick
-                    // retransmits. Never blocks the pump on its own queue.
-                    let _ = inner.tx.try_send(item);
+                    Ok(None) => {}
+                    Err(e) => {
+                        // Honest error accounting (finding 1b): count every
+                        // tick error; `ConnectionExpired` is terminal — the
+                        // session can no longer carry traffic (keys zeroed),
+                        // so fail the hop loudly instead of leaving health
+                        // green over a blackholed tunnel. Transient tick
+                        // errors retry on the next tick.
+                        if let Some(failed) = on_tick_error(e, &hop_id) {
+                            let _ = events.send(failed);
+                            break;
+                        }
+                    }
                 }
             }
             queued = tx_rx.recv() => {
                 let Some((peer, bytes)) = queued else { break };
-                inner.udp.send_to(&bytes, peer).await.ok();
+                // Bounded transmit (finding 6): a wedged nested-carrier
+                // `send_to` previously parked this whole select loop — recv
+                // stopped, timers froze, health stayed green. A send that
+                // exceeds [`PUMP_SEND_TIMEOUT`] is a dead carrier: fail the
+                // hop and stop cleanly rather than hang.
+                match tokio::time::timeout(PUMP_SEND_TIMEOUT, inner.udp.send_to(&bytes, peer)).await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionReset => {
+                        // Windows: ICMP feedback surfaces on UDP sends as
+                        // ConnectionReset — routine transient, like the recv
+                        // path above. The packet is lost; WireGuard's
+                        // retransmit/keepalive timers recover.
+                    }
+                    Ok(Err(e)) => {
+                        // Terminal send failure: report like every other
+                        // failure path instead of dropping packets forever
+                        // with health green.
+                        let _ = events.send(HopEvent::Failed {
+                            hop_id: hop_id.clone(),
+                            cause: format!("uplink send failed: {e}"),
+                        });
+                        break;
+                    }
+                    Err(_) => {
+                        let _ = events.send(HopEvent::Failed {
+                            hop_id: hop_id.clone(),
+                            cause: format!(
+                                "uplink send wedged >{PUMP_SEND_TIMEOUT:?}; pump stopped"
+                            ),
+                        });
+                        break;
+                    }
+                }
             }
             recvd = inner.udp.recv_from(&mut buf) => {
                 match recvd {
@@ -602,7 +706,7 @@ fn handle_inbound(
                 return;
             };
             let inner_frame = inner_frame.to_vec();
-            if std::env::var("QCORE_WG_TRACE").is_ok() {
+            if wg_trace_enabled() {
                 eprintln!(
                     "[wg-pump] tunnel-data {}B type={:02x}",
                     data.len(),
@@ -625,7 +729,17 @@ fn handle_inbound(
             let _ = inner.tx.try_send((src, bytes));
         }
         TunnResult::Done => {}
-        TunnResult::Err(_) => {}
+        TunnResult::Err(e) => {
+            // Counted, not swallowed (finding 1b): decapsulate errors are
+            // per-packet (bad MAC, replay, no session — routine on the
+            // internet), so unlike a tick error they are not terminal;
+            // expiry also surfaces here per-packet and via the tick's
+            // terminal ConnectionExpired handling.
+            PUMP_TICK_ERRORS.fetch_add(1, Ordering::Relaxed);
+            if wg_trace_enabled() {
+                eprintln!("[wg-pump] decap err: {e:?}");
+            }
+        }
     }
 }
 
@@ -870,7 +984,11 @@ mod tests {
             tunnel: Mutex::new(a),
             udp: Arc::new(StubSock),
             peer: std::sync::RwLock::new("127.0.0.1:1".parse().unwrap()),
-            streams: Arc::new(stream::StreamTable::new()),
+            // The offline-completed handshake makes the test hop the
+            // initiator (same as the real bring-up): odd id space.
+            streams: Arc::new(stream::StreamTable::new_with_side(
+                stream::StreamSide::Initiator,
+            )),
             tx,
         });
         (inner, rx)
@@ -986,5 +1104,236 @@ mod tests {
             Some("wg-nested-0"),
             "names hop: {err}"
         );
+    }
+
+    /// A `PumpGuard` over a real pump task (weak-held inner so the pump can
+    /// exit on drop). Unused directly today (the two pump tests drive
+    /// `pump_loop` via their own handles for finer control) but kept for
+    /// parity with the guard shape used in `bring_up`.
+    #[allow(dead_code)]
+    fn spawn_pump(
+        inner: &Arc<HopInner>,
+        rx: tokio::sync::mpsc::Receiver<EgressItem>,
+        events: tokio::sync::broadcast::Sender<HopEvent>,
+    ) -> PumpGuard {
+        let weak = Arc::downgrade(inner);
+        let id = "wg-pump-test".to_string();
+        let handle = tokio::spawn(async move {
+            pump_loop(weak, rx, events, id).await;
+        });
+        PumpGuard {
+            abort: handle.abort_handle(),
+        }
+    }
+
+    /// Finding 1a regression: `encapsulate(&[])` returns `Done` while the
+    /// handshake is `InitSent`, so the pre-fix pump tick (and bring-up
+    /// "retry" loop) NEVER retransmitted the handshake initiation — against
+    /// a lossy/slow path the hop sat silent until the 15 s timeout. The
+    /// post-fix tick drives `update_timers`, which retransmits after
+    /// boringtun's REKEY_TIMEOUT (5 s + jitter ≤ 333 ms). Asserts a
+    /// retransmitted initiation arrives at the uplink within 6 s of the
+    /// first send. Pre-fix this failed: no packet ever left after the
+    /// initial initiation.
+    #[tokio::test]
+    async fn pump_tick_retransmits_unanswered_handshake() {
+        use crate::test_support::generate_keypair;
+        let (c_sk, _c_pk) = generate_keypair();
+        let (_s_sk, s_pk) = generate_keypair();
+        // A fresh (unestablished) tunnel — no offline handshake completion.
+        let tunnel = Tunn::new(
+            boringtun::x25519::StaticSecret::from(c_sk),
+            boringtun::x25519::PublicKey::from(s_pk),
+            None,
+            None,
+            0,
+            None,
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(EGRESS_QUEUE_CAP);
+        let inner = Arc::new(HopInner {
+            tunnel: Mutex::new(tunnel),
+            udp: Arc::new(StubSock),
+            peer: std::sync::RwLock::new("127.0.0.1:1".parse().unwrap()),
+            streams: Arc::new(stream::StreamTable::new()),
+            tx,
+        });
+        // Initial initiation, exactly like bring-up.
+        let init: Option<Vec<u8>> = {
+            let mut t = inner.tunnel.lock().unwrap();
+            with_scratch(|dst| match t.encapsulate(&[], dst) {
+                TunnResult::WriteToNetwork(p) => Some(p.to_vec()),
+                _ => None,
+            })
+        };
+        assert!(init.is_some(), "fresh tunnel initiates");
+        assert!(
+            init.as_ref().is_some_and(|p| p.len() == 148),
+            "handshake init is 148 B"
+        );
+        // Pre-REKEY_TIMEOUT the tick must stay silent (no 10 Hz spray).
+        let mut tick_dst = vec![0u8; 65535];
+        assert!(
+            pump_tick(&inner, &mut tick_dst).expect("tick ok").is_none(),
+            "no retransmit before REKEY_TIMEOUT"
+        );
+        // Past REKEY_TIMEOUT (5 s) + jitter headroom, the tick retransmits.
+        tokio::time::sleep(Duration::from_millis(5400)).await;
+        let retried = pump_tick(&inner, &mut tick_dst)
+            .expect("tick ok after REKEY_TIMEOUT")
+            .expect("handshake retransmitted");
+        assert_eq!(retried.1.len(), 148, "retransmit is a fresh initiation");
+    }
+
+    /// Finding 1b: `TunnResult::Err` is counted (observable via
+    /// [`pump_tick_errors`]) and a terminal `ConnectionExpired` from the
+    /// tick fails the pump loudly. Boringtun's real expiry lives at
+    /// REJECT_AFTER_TIME*3 = 540 s (no mock clock in this build), so the
+    /// test pins the two observable halves of the contract:
+    ///
+    /// 1. Counting — an inbound decapsulate error increments the shared
+    ///    counter (pre-fix `TunnResult::Err` was swallowed uncounted).
+    /// 2. Terminal mapping — the pump's own `on_tick_error` branch maps
+    ///    `ConnectionExpired` to `HopEvent::Failed`. The test calls the
+    ///    production fn (the same code the pump select-arm runs) and
+    ///    asserts the RETURNED event, so deleting the real mapping breaks
+    ///    this test (no more in-test re-implementation of the branch).
+    #[tokio::test]
+    async fn tick_error_counted_and_expired_fails_pump() {
+        // Half 1 — counting through the real handle_inbound path.
+        let before = pump_tick_errors();
+        let (inner, _rx) = test_inner(64);
+        let garbage = [0xFFu8; 64];
+        let mut plain = vec![0u8; 65535];
+        {
+            let mut t = inner.tunnel.lock().unwrap();
+            assert!(matches!(
+                t.decapsulate(Some("127.0.0.1".parse().unwrap()), &garbage, &mut plain),
+                TunnResult::Err(_)
+            ));
+        }
+        let (events, _ev) = tokio::sync::broadcast::channel(16);
+        handle_inbound(
+            &inner,
+            &events,
+            "wg-pump-test",
+            "127.0.0.1:1".parse().unwrap(),
+            &garbage,
+            &mut plain,
+        );
+        assert!(
+            pump_tick_errors() > before,
+            "decapsulate error is counted, not swallowed"
+        );
+
+        // Half 2 — the terminal mapping, through the pump's own branch:
+        // `on_tick_error` counts the error and returns the Failed event the
+        // pump emits. Assert the returned event, not a hand-rolled copy.
+        let expired_err = WireGuardError::ConnectionExpired;
+        let got = on_tick_error(expired_err, "wg-pump-test")
+            .expect("terminal ConnectionExpired maps to Failed");
+        let HopEvent::Failed { hop_id, cause } = got else {
+            panic!("on_tick_error returned a non-Failed event")
+        };
+        assert_eq!(hop_id, "wg-pump-test");
+        assert!(cause.contains("expired"), "{cause}");
+        // The count moved by exactly one more (the branch's own bump, not a
+        // test-side fetch_add on the process-global other tests read).
+        assert!(
+            pump_tick_errors() > before,
+            "on_tick_error counts the tick error itself"
+        );
+
+        // Transient tick errors are counted but not terminal.
+        let before_transient = pump_tick_errors();
+        assert!(
+            on_tick_error(WireGuardError::InvalidMac, "wg-pump-test").is_none(),
+            "transient tick error does not fail the pump"
+        );
+        assert!(
+            pump_tick_errors() > before_transient,
+            "transient tick error is still counted"
+        );
+    }
+
+    /// Finding 6: a wedged nested-carrier `send_to` previously parked the
+    /// pump's whole select loop (recv stopped, timers froze, health stayed
+    /// green). The pump now bounds every transmit at [`PUMP_SEND_TIMEOUT`];
+    /// a wedged send must emit `HopEvent::Failed` and stop the pump
+    /// cleanly.
+    #[tokio::test]
+    async fn wedged_send_fails_pump_within_timeout() {
+        struct WedgedSock;
+        #[async_trait::async_trait]
+        impl PacketSock for WedgedSock {
+            async fn send_to(&self, _bytes: &[u8], _peer: SocketAddr) -> std::io::Result<()> {
+                std::future::pending().await
+            }
+            async fn recv_from(&self, _buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+                std::future::pending().await
+            }
+            fn local_addr(&self) -> std::io::Result<SocketAddr> {
+                Ok("127.0.0.1:0".parse().unwrap())
+            }
+        }
+        let (inner, rx) = test_inner(64);
+        // Swap in the wedged uplink.
+        let wedged = Arc::new(HopInner {
+            tunnel: Mutex::new({
+                // Rebuild the tunnel (test_inner's is behind the Arc move).
+                let sk_a = boringtun::x25519::StaticSecret::from([7u8; 32]);
+                let pk_a = boringtun::x25519::PublicKey::from(&sk_a);
+                let sk_b = boringtun::x25519::StaticSecret::from([9u8; 32]);
+                let pk_b = boringtun::x25519::PublicKey::from(&sk_b);
+                let mut a = Tunn::new(sk_a, pk_b, None, None, 0, None);
+                let mut b = Tunn::new(sk_b, pk_a, None, None, 0, None);
+                let mut buf = vec![0u8; 65535];
+                let init = match a.encapsulate(&[], &mut buf) {
+                    TunnResult::WriteToNetwork(p) => p.to_vec(),
+                    _ => panic!("handshake init"),
+                };
+                let resp = match b.decapsulate(None, &init, &mut buf) {
+                    TunnResult::WriteToNetwork(p) => p.to_vec(),
+                    _ => panic!("handshake response"),
+                };
+                let _ = a.decapsulate(None, &resp, &mut buf);
+                a
+            }),
+            udp: Arc::new(WedgedSock),
+            peer: std::sync::RwLock::new("127.0.0.1:1".parse().unwrap()),
+            streams: Arc::new(stream::StreamTable::new()),
+            tx: inner.tx.clone(),
+        });
+        let (events, mut ev_rx) = tokio::sync::broadcast::channel(16);
+        let weak = Arc::downgrade(&wedged);
+        let handle = tokio::spawn(async move {
+            pump_loop(weak, rx, events, "wg-wedge-0".to_string()).await;
+        });
+        // Queue one packet: the pump's send branch parks on the wedged
+        // socket until the timeout fires.
+        wedged
+            .tx
+            .send(("127.0.0.1:1".parse().unwrap(), vec![0u8; 16]))
+            .await
+            .expect("queued");
+        let failed = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match ev_rx.recv().await {
+                    Ok(HopEvent::Failed { hop_id, cause }) => break (hop_id, cause),
+                    Ok(_) => continue,
+                    Err(_) => panic!("event bus closed before Failed"),
+                }
+            }
+        })
+        .await
+        .expect("Failed within PUMP_SEND_TIMEOUT + slack");
+        assert_eq!(failed.0, "wg-wedge-0");
+        assert!(
+            failed.1.contains("wedged"),
+            "names the wedge: {:?}",
+            failed.1
+        );
+        // Pump stopped cleanly (not hung, not aborted).
+        let done = tokio::time::timeout(Duration::from_millis(500), handle).await;
+        assert!(done.is_ok(), "pump exits after the wedge failure");
     }
 }

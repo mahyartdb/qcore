@@ -178,23 +178,30 @@ unsafe fn j_to_rust(env: JniEnv, s: JString) -> Option<String> {
     out
 }
 
-/// Reinterpret a handle integer as the engine pointer it came from.
-/// Returns `None` for non-positive or non-live handles so callers fail
-/// closed without dereferencing forged/stale pointers.
+/// Reinterpret a handle integer as the engine it came from and acquire a
+/// strong reference to it. Returns `None` for non-positive or non-live
+/// handles so callers fail closed without dereferencing forged/stale
+/// pointers. The clone is taken under the registry lock (never held across
+/// the call), so a concurrent `engineFree` on another thread cannot free
+/// the engine out from under the closure: the strong reference held for
+/// the closure's duration keeps the engine memory alive; worst case the
+/// acquire sees the entry already removed and fails closed.
 ///
 /// # Safety
-/// A positive `handle` must be a live engine pointer previously produced
-/// as `out as i64` by `engineNew` and not yet freed; anything else is
+/// A positive `handle` must be an engine pointer previously produced as
+/// `out as i64` by `engineNew` and not yet freed; anything else is
 /// rejected before any pointer use.
 unsafe fn with_engine<T>(handle: i64, f: impl FnOnce(*mut crate::QcoreEngine) -> T) -> Option<T> {
     if handle <= 0 {
         return None;
     }
-    let ptr = handle as *mut crate::QcoreEngine;
-    if !crate::handle_is_live(ptr) {
-        return None;
-    }
-    // SAFETY: `ptr` is live per the check above.
+    // SAFETY: `handle` is positive per the check above; `acquire_engine`
+    // validates liveness against the registry before any pointer use.
+    let engine = crate::acquire_engine(handle as *mut crate::QcoreEngine)?;
+    // The acquired reference pins the engine allocation; its address is
+    // the registered handle itself, so the raw pointer below is valid for
+    // the closure's duration and identical to what the caller stashed.
+    let ptr = std::sync::Arc::as_ptr(&engine) as *mut crate::QcoreEngine;
     Some(f(ptr))
 }
 
@@ -226,10 +233,11 @@ fn take_error(ptr: *mut crate::QcoreError) {
 /// Java string, failed pin, non-UTF-8 content) or an interior NUL fails the
 /// whole call with null — JVM input problems never silently become empty
 /// input, and NULs never rewrite into different valid input. The out buffer
-/// is always reclaimed (`take_string` is null-safe); only code 0 returns a
-/// string. Java-observable behavior matches the previous inline code (null
-/// on every failure path); this only removes the five-fold triplication
-/// and the silent coercions.
+/// is always reclaimed (`take_string` is null-safe); code 0 returns the
+/// out-string, and code 4 (scan empty) returns it too: the C ABI guarantees
+/// the shaped empty document (`{"ranked":[]}`, lib.rs `qcore_scan`) even on
+/// the empty verdict, so Java `scanJson` keeps that parity instead of
+/// losing it to a null.
 unsafe fn call_c_abi(
     env: JniEnv,
     args: &[JString],
@@ -250,7 +258,7 @@ unsafe fn call_c_abi(
     let (code, out, err) = call(&ptrs);
     take_error(err);
     let s = take_string(out);
-    if code == 0 {
+    if code == 0 || (code == 4 && !s.is_empty()) {
         rust_to_j(env, &s)
     } else {
         std::ptr::null_mut()
@@ -292,9 +300,20 @@ pub unsafe extern "system" fn Java_com_qcore_Qcore_engineNew(
                 None => return 0,
             }
         };
-        let cfg_ptr = cfg
-            .as_ref()
-            .map(|s| CString::new(s.as_str()).unwrap_or_else(|_| CString::new("").unwrap()));
+        // Fail closed on interior NULs: the old rewrite
+        // (`unwrap_or_else(|_| CString::new(""))`) turned a misencoded
+        // config into the empty string, which parses as default-config —
+        // a silent input rewrite. An NULError is a named error instead.
+        let cfg_ptr = match cfg.as_ref().map(|s| CString::new(s.as_str())) {
+            None => None,
+            Some(Ok(c)) => Some(c),
+            Some(Err(_)) => {
+                // Surface the named failure through the C ABI's thread-local
+                // error channel (see `set_last_error_jni` docs below).
+                crate::set_last_error_jni("config contains an interior NUL byte; input rejected");
+                return 0;
+            }
+        };
         let mut out: *mut crate::QcoreEngine = std::ptr::null_mut();
         let mut err: *mut crate::QcoreError = std::ptr::null_mut();
         let code = crate::qcore_engine_new(
@@ -402,7 +421,6 @@ pub unsafe extern "system" fn Java_com_qcore_Qcore_engineStop(
     });
     result.unwrap_or(-1)
 }
-
 /// `Qcore.engineFree(handle)`.
 ///
 /// # Safety
@@ -414,11 +432,12 @@ pub unsafe extern "system" fn Java_com_qcore_Qcore_engineFree(
     handle: i64,
 ) {
     let _ = std::panic::catch_unwind(|| {
-        // SAFETY: `handle` came from the JVM side holding a live engine;
-        // `with_engine` documents the handle-validity contract and rejects
-        // non-positive handles before any pointer use.
+        // SAFETY: `qcore_engine_free` validates the handle against the
+        // registry itself (null no-op, forged/double-free → 6) and takes
+        // its strong reference atomically, so no pre-check can race a
+        // concurrent call here.
         unsafe {
-            let _ = with_engine(handle, |e| crate::qcore_engine_free(e));
+            crate::qcore_engine_free(handle as *mut crate::QcoreEngine);
         }
     });
 }
@@ -680,5 +699,147 @@ mod tests {
             Some("\u{1F600}"),
             "CESU-8 decodes to the emoji"
         );
+    }
+
+    // --- Interior-NUL + scan-empty parity (P2 JNI fixes) -----------------
+
+    /// A recording JVM whose pin succeeds and returns an ASCII string; the
+    /// NewStringUTF slot captures what the JNI layer hands back (null means
+    /// "nothing returned to Java").
+    static PINNED: std::sync::Mutex<Vec<CString>> = std::sync::Mutex::new(Vec::new());
+    static RETURNED: std::sync::Mutex<Option<Vec<u8>>> = std::sync::Mutex::new(None);
+
+    unsafe extern "system" fn pin_ascii(
+        _env: JniEnv,
+        _s: JString,
+        _is_copy: *mut u8,
+    ) -> *const c_char {
+        // The test always passes the same pinned content; store a marker
+        // string the test set beforehand.
+        let cell = PINNED
+            .lock()
+            .unwrap()
+            .last()
+            .expect("test set a pinned string")
+            .clone();
+        cell.as_ptr()
+    }
+
+    unsafe extern "system" fn capture_new_string(_env: JniEnv, bytes: *const c_char) -> JString {
+        let c = unsafe { CStr::from_ptr(bytes) };
+        *RETURNED.lock().unwrap() = Some(c.to_bytes().to_vec());
+        std::ptr::dangling_mut::<c_void>()
+    }
+
+    fn recording_env() -> (JniEnv, *mut *const JniTable) {
+        // SAFETY-free construction: a fake table on the test's stack frame.
+        let table = Box::leak(Box::new(JniTable {
+            _reserved_and_unused: [std::ptr::null(); 167],
+            new_string_utf: capture_new_string,
+            _get_string_utf_length: std::ptr::null(),
+            get_string_utf_chars: pin_ascii,
+            release_string_utf_chars: noop_release,
+        }));
+        let slot: *mut *const JniTable = Box::leak(Box::new(table as *const JniTable));
+        (slot as JniEnv, slot)
+    }
+
+    fn set_pinned(s: &str) {
+        PINNED.lock().unwrap().clear();
+        PINNED
+            .lock()
+            .unwrap()
+            .push(CString::new(s).expect("test pinned string has no NUL"));
+    }
+
+    #[test]
+    fn scan_empty_code4_keeps_shaped_document() {
+        // C ABI parity (lib.rs `qcore_scan`): an empty scan returns code 4
+        // AND the shaped `{"ranked":[]}` document in the out-param. Java
+        // scanJson must see that document, not a null. The ABI owns the
+        // out buffer (`take_string` reclaims it); the test never frees it.
+        let (env, _slot) = recording_env();
+        set_pinned("warp");
+        let doc = r#"{"transport":"warp","ranked":[],"failed":[]}"#;
+        let j = unsafe {
+            call_c_abi(env, &[std::ptr::dangling_mut::<c_void>()], |_| {
+                // SAFETY: `into_raw` leaks a test-scoped CString the ABI
+                // reclaim (`take_string` → `qcore_string_free`) owns.
+                let out = CString::new(doc).unwrap().into_raw();
+                (4, out, std::ptr::null_mut())
+            })
+        };
+        assert!(!j.is_null(), "code 4 keeps the shaped empty document");
+        let got = RETURNED
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("NewStringUTF called");
+        assert_eq!(
+            String::from_utf8_lossy(&got),
+            doc,
+            "Java receives the exact C-ABI document"
+        );
+    }
+
+    #[test]
+    fn other_error_codes_still_return_null() {
+        // Only code 0 and the code-4 scan-empty parity keep their strings;
+        // every other failure is still null (no silent success rewrite).
+        let (env, _slot) = recording_env();
+        set_pinned("x");
+        for code in [2, 3, 5, 6, -1] {
+            let j = unsafe {
+                call_c_abi(env, &[std::ptr::dangling_mut::<c_void>()], |_| {
+                    // SAFETY: test-scoped leak reclaimed by the ABI (see the
+                    // code-4 test above).
+                    let out = CString::new("{}").unwrap().into_raw();
+                    (code, out, std::ptr::null_mut())
+                })
+            };
+            assert!(j.is_null(), "code {code} must return null");
+        }
+    }
+
+    #[test]
+    fn last_error_channel_round_trips_interior_nul_message() {
+        // The interior-NUL failure parks a named message (never empty, never
+        // the input) on the C ABI's last-error channel. Set + drain within
+        // this test (the channel is process-global and nextest is parallel).
+        crate::set_last_error_jni("config contains an interior NUL byte; input rejected");
+        let mut out: *mut c_char = std::ptr::null_mut();
+        let rc = unsafe { crate::qcore_take_last_error(&mut out) };
+        assert_eq!(rc, 0, "message parked");
+        assert!(!out.is_null());
+        // SAFETY: string returned by this ABI (out-param contract).
+        let s = unsafe { CStr::from_ptr(out).to_str().unwrap().to_string() };
+        assert_eq!(unsafe { crate::qcore_string_free(out) }, 0);
+        assert!(s.contains("interior NUL"), "named failure: {s}");
+    }
+
+    #[test]
+    fn engine_new_interior_nul_config_fails_closed_not_empty() {
+        // A Java config string containing an interior NUL (pinned as the
+        // modified-UTF-8 `C0 80`) used to be rewritten to the empty string
+        // (default-config engine!). It must fail closed with handle 0. The
+        // last-error channel is process-global (parallel tests drain it),
+        // so this test only asserts the fail-closed handle, not the parked
+        // message — `last_error_channel_round_trips_interior_nul_message`
+        // owns the message shape.
+        let (env, _slot) = recording_env();
+        PINNED.lock().unwrap().clear();
+        PINNED.lock().unwrap().push(
+            CString::new(vec![0xC0, 0x80]) // decodes to "\0"
+                .expect("C0 80 has no NUL"),
+        );
+        let bogus: JString = std::ptr::dangling_mut::<c_void>();
+        let handle = unsafe { Java_com_qcore_Qcore_engineNew(env, std::ptr::null_mut(), bogus) };
+        assert_eq!(
+            handle, 0,
+            "interior-NUL config fails closed, never default-config"
+        );
+        // SAFETY: `acquire_engine` only probes the tracked-handle set; it
+        // never dereferences the (null) probe.
+        assert!(crate::acquire_engine(handle as *mut crate::QcoreEngine).is_none());
     }
 }

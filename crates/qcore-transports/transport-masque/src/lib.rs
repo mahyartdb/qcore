@@ -2,9 +2,12 @@
 //!
 //! - `alpn=h3`: real QUIC (quinn + rustls/ring) with ALPN `h3`; TCP egress
 //!   rides native QUIC bidirectional streams, UDP egress rides QUIC DATAGRAM
-//!   frames with a dst-prefix.
+//!   frames with a dst-prefix. The client connection sends QUIC keep-alives
+//!   every 15 s so NATed idle paths do not die under green health.
 //! - `alpn=h2`: HTTP/2 over TCP (h2 crate, prior knowledge); egress rides
 //!   per-dial POST streams, datagrams length-prefixed on a dedicated stream.
+//!   H2 sends are flow-window-bounded (`reserve_capacity` then
+//!   `poll_capacity`) so a fast writer cannot buffer unboundedly inside h2.
 //!
 //! Loopback-verified against [`test_support`] responders (real QUIC/TLS and
 //! HTTP/2 framing). Full MASQUE CONNECT-UDP proxy interop against third-party
@@ -57,23 +60,12 @@ impl qcore_transport_api::HopFactory for MasqueFactory {
     ) -> Result<Arc<dyn RunningHop>, HopError> {
         let hop_id = cfg.get("hop_id").unwrap_or("masque-0").to_string();
         let alpn = cfg.get("alpn").unwrap_or("h3");
-        let endpoint: SocketAddr = cfg
-            .get("endpoint")
-            .ok_or_else(|| {
-                HopError::new(
-                    HopErrorKind::Config,
-                    Some(hop_id.clone()),
-                    "masque hop requires endpoint=<ip:port>",
-                )
-            })?
-            .parse()
-            .map_err(|e: std::net::AddrParseError| {
-                HopError::new(
-                    HopErrorKind::Config,
-                    Some(hop_id.clone()),
-                    format!("bad endpoint: {e}"),
-                )
-            })?;
+        // `build` is async, so hostnames resolve here (same policy as
+        // transport-wireguard's `resolve_endpoint`): IP literals parse
+        // synchronously, names go through `lookup_host` with a timeout, and
+        // every failure is a Config error naming the field — never a chain
+        // that cannot run.
+        let endpoint = resolve_endpoint(hop_id.clone(), cfg.get("endpoint")).await?;
         let insecure = cfg.get("insecure_skip_verify") == Some("true");
         let fragment = obfuscate::fragment_size(&cfg)?;
         match alpn {
@@ -88,8 +80,70 @@ impl qcore_transport_api::HopFactory for MasqueFactory {
     }
 }
 
+/// Timeout for the DNS resolution of a hostname `endpoint` (fails closed).
+const ENDPOINT_RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Parse `endpoint=<ip:port|host:port>` into a `SocketAddr`, resolving
+/// hostnames like `transport-wireguard::modes::resolve_endpoint`. Standard
+/// configs carry hostnames; failing them at build with a Config error naming
+/// the field is early and precise.
+async fn resolve_endpoint(hop_id: String, raw: Option<&str>) -> Result<SocketAddr, HopError> {
+    let config_err = |msg: String| HopError::new(HopErrorKind::Config, Some(hop_id.clone()), msg);
+    let Some(s) = raw else {
+        return Err(config_err(
+            "masque hop requires endpoint=<ip:port>".to_string(),
+        ));
+    };
+    if let Ok(addr) = s.parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+    // Bracketed v6 that failed to parse above is malformed, not a name.
+    if s.starts_with('[') {
+        return Err(config_err(format!(
+            "bad endpoint: `{s}` is not `[ipv6]:port`"
+        )));
+    }
+    // Unbracketed multi-colon input is ambiguous: do not guess.
+    let (host, port_str) = s
+        .rsplit_once(':')
+        .ok_or_else(|| config_err(format!("bad endpoint: `{s}` is not host:port")))?;
+    if host.is_empty() || host.contains(':') {
+        return Err(config_err(format!("bad endpoint: `{s}` is not host:port")));
+    }
+    let port: u16 = port_str
+        .parse()
+        .map_err(|_| config_err(format!("bad endpoint: port `{port_str}` is not numeric")))?;
+    if port == 0 {
+        return Err(config_err(
+            "bad endpoint: port `0` is not connectable".to_string(),
+        ));
+    }
+    let lookup = tokio::time::timeout(
+        ENDPOINT_RESOLVE_TIMEOUT,
+        tokio::net::lookup_host((host, port)),
+    )
+    .await
+    .map_err(|_| config_err(format!("bad endpoint: resolve `{host}` timed out")))?;
+    let addrs: Vec<SocketAddr> = lookup
+        .map_err(|e| config_err(format!("bad endpoint: resolve `{host}`: {e}")))?
+        .collect();
+    addrs
+        .into_iter()
+        .next()
+        .ok_or_else(|| config_err(format!("bad endpoint: no address for `{host}`")))
+}
+
 enum Conn {
-    H3(quinn::Connection),
+    H3 {
+        /// Client connection riding this endpoint.
+        conn: quinn::Connection,
+        /// QUIC endpoint (owns the bound UDP socket + endpoint driver task).
+        /// Quinn semantics (vendored quinn-0.11.12): the driver task spawned
+        /// by `Endpoint::client` exits only once every `Endpoint` handle is
+        /// dropped AND every connection has drained, so the endpoint must be
+        /// owned here — forgetting it leaks the driver and socket forever.
+        endpoint: quinn::Endpoint,
+    },
     H2(H2Conn),
 }
 
@@ -139,8 +193,8 @@ impl MasqueHop {
                 )
             })?
             .map_err(|e| HopError::transport(hop_id.clone(), format!("masque handshake: {e}")))?;
-        // Keep the endpoint alive with the connection.
-        std::mem::forget(endpoint_builder);
+        // The endpoint is owned by the hop: dropping it is what lets the
+        // endpoint driver exit and releases the UDP socket at stop().
         let (events, _) = tokio::sync::broadcast::channel(16);
         let _ = events.send(HopEvent::Started {
             hop_id: hop_id.clone(),
@@ -149,7 +203,10 @@ impl MasqueHop {
             hop_id,
             endpoint,
             local,
-            conn: Conn::H3(conn),
+            conn: Conn::H3 {
+                conn,
+                endpoint: endpoint_builder,
+            },
             // H3 is OS-direct QUIC in US3 (T058); the carrier is kept so the
             // dialer shape stays uniform.
             carrier,
@@ -275,6 +332,11 @@ pub(crate) fn ensure_provider() {
     });
 }
 
+/// QUIC keep-alive interval: an ack-eliciting ping every 15 s keeps idle
+/// connections alive through NAT rebinding / idle timeouts that would
+/// otherwise kill them while health still reports green.
+const QUIC_KEEP_ALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+
 fn client_config(insecure: bool) -> Result<quinn::ClientConfig, HopError> {
     ensure_provider();
     let mut roots = rustls::RootCertStore::empty();
@@ -297,10 +359,14 @@ fn client_config(insecure: bool) -> Result<quinn::ClientConfig, HopError> {
             .dangerous()
             .set_certificate_verifier(Arc::new(test_support::NoVerifier));
     }
-    Ok(quinn::ClientConfig::new(Arc::new(
+    let mut transport = quinn::TransportConfig::default();
+    transport.keep_alive_interval(Some(QUIC_KEEP_ALIVE_INTERVAL));
+    let mut config = quinn::ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
             .map_err(|e| HopError::transport("masque", format!("quic crypto: {e}")))?,
-    )))
+    ));
+    config.transport_config(Arc::new(transport));
+    Ok(config)
 }
 
 #[async_trait::async_trait]
@@ -311,7 +377,7 @@ impl RunningHop for MasqueHop {
 
     fn dialer(&self) -> Arc<dyn Dialer> {
         match &self.conn {
-            Conn::H3(conn) => Arc::new(H3Dialer {
+            Conn::H3 { conn, .. } => Arc::new(H3Dialer {
                 hop_id: self.hop_id.clone(),
                 conn: conn.clone(),
                 local: self.local,
@@ -329,7 +395,7 @@ impl RunningHop for MasqueHop {
 
     fn health(&self) -> HopHealth {
         match &self.conn {
-            Conn::H3(conn) => {
+            Conn::H3 { conn, .. } => {
                 if conn.close_reason().is_some() {
                     HopHealth::Failed
                 } else {
@@ -337,6 +403,11 @@ impl RunningHop for MasqueHop {
                 }
             }
             Conn::H2(_) => HopHealth::Healthy,
+            // H2 has no liveness signal to poll (no PING task in v1): the
+            // value below is a build-succeeded/never-stopped signal, NOT a
+            // probe of the TCP+H2 connection, which can die silently behind
+            // green health. Known limitation, documented here until an idle
+            // PING task (bounded by the connection handle) lands.
         }
     }
 
@@ -346,7 +417,20 @@ impl RunningHop for MasqueHop {
 
     async fn stop(&self) -> Result<(), HopError> {
         match &self.conn {
-            Conn::H3(conn) => conn.close(0u32.into(), b"stop"),
+            Conn::H3 { conn, endpoint } => {
+                // Close the connection, then the endpoint: quinn's
+                // `Endpoint::close` immediately ceases accepting/sending new
+                // connections and signals every connection to close, so the
+                // driver task exits as soon as the connection drains — and
+                // dropping this hop's handle (the only one left, the old
+                // builder handle never escapes) drops the socket state with
+                // it. Sending the close frame is the driver's job while it
+                // still runs, so the order matters: close first, drop after.
+                conn.close(0u32.into(), b"stop");
+                endpoint.close(0u32.into(), b"stop");
+                // Dropping happens implicitly when this `MasqueHop` (and the
+                // dialers cloned from it) go away; nothing is forgotten.
+            }
             // Reap the bring-up driver: without this the H2 connection it
             // holds stays open past teardown.
             Conn::H2(c) => c.driver.abort(),
@@ -478,6 +562,20 @@ struct QuicDgrams {
     local: SocketAddr,
 }
 
+/// Parse one dst-prefixed datagram frame: `[len u8][dst][payload]`.
+/// Returns `None` for anything malformed or addressed elsewhere — callers
+/// skip-and-count those instead of failing the flow. `Ok` always carries the
+/// flow's own `dst` (send_to rejects anything else, so a frame for another
+/// destination is malformed for this flow).
+fn parse_dst_prefixed(dg: &[u8], flow_dst: SocketAddr) -> Option<(SocketAddr, &[u8])> {
+    let (&len, rest) = dg.split_first()?;
+    let len = len as usize;
+    let payload = rest.get(len..)?;
+    let dst_s = std::str::from_utf8(&rest[..len]).ok()?;
+    let dst: SocketAddr = dst_s.parse().ok()?;
+    (dst == flow_dst).then_some((dst, payload))
+}
+
 #[async_trait::async_trait]
 impl UdpFlow for QuicDgrams {
     async fn send_to(&self, buf: &[u8], dst: SocketAddr) -> Result<(), HopError> {
@@ -498,30 +596,29 @@ impl UdpFlow for QuicDgrams {
     }
 
     async fn recv_from(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr), HopError> {
+        // Debug-counted skip of malformed datagrams: one junk datagram must
+        // not kill the whole flow. Fail-closed stays for framing that gates
+        // the whole stream (connection errors below).
+        let mut malformed: u64 = 0;
         loop {
             let dg =
                 self.conn.read_datagram().await.map_err(|e| {
                     HopError::transport(self.hop_id.clone(), format!("datagram: {e}"))
                 })?;
-            if dg.is_empty() {
-                continue;
-            }
-            let len = dg[0] as usize;
-            if dg.len() < 1 + len {
-                continue;
-            }
-            let dst: SocketAddr = std::str::from_utf8(&dg[1..1 + len])
-                .map_err(|e| HopError::transport(self.hop_id.clone(), e.to_string()))?
-                .parse()
-                .map_err(|e: std::net::AddrParseError| {
-                    HopError::transport(self.hop_id.clone(), e.to_string())
-                })?;
-            if dst != self.dst {
-                continue;
-            }
-            let n = dg.len() - 1 - len;
-            let n = n.min(buf.len());
-            buf[..n].copy_from_slice(&dg[1 + len..1 + len + n]);
+            let frame = match parse_dst_prefixed(&dg, self.dst) {
+                Some(dst) => dst,
+                None => {
+                    malformed = malformed.wrapping_add(1);
+                    #[cfg(debug_assertions)]
+                    if malformed % 128 == 1 {
+                        eprintln!("qcore-masque: skipped {malformed} malformed datagram(s)");
+                    }
+                    continue;
+                }
+            };
+            let (dst, payload) = frame;
+            let n = payload.len().min(buf.len());
+            buf[..n].copy_from_slice(&payload[..n]);
             return Ok((n, dst));
         }
     }
@@ -758,19 +855,49 @@ impl tokio::io::AsyncRead for H2Stream {
 impl tokio::io::AsyncWrite for H2Stream {
     fn poll_write(
         mut self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
+        cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
-        // Direct `send_data` (no `reserve_capacity` prelude): h2 documents
-        // this as valid — data is buffered and flushed as window opens, and
-        // errors mean closed/reset streams, NOT window exhaustion. Gating on
-        // `poll_capacity` here would hang forever: capacity is only assigned
-        // in response to `reserve_capacity`, which we never call (a prior
-        // revision did exactly this and deadlocked the H2 conformance
-        // suite). Chunks stay ≤16384 so no single write can balloon the
-        // documented-unbounded internal buffer.
-        // Noize fragmentation (US5 T070): chunk writes at the profile size.
+        // Window-bounded send: reserve capacity for the chunk, then await
+        // `poll_capacity` before handing data to h2. Without this pairing a
+        // writer faster than the network buffers unboundedly inside h2
+        // (`send_data` without reserved capacity implicitly requests capacity
+        // and buffers the frame while waiting for the window — h2's own docs
+        // call this buffering unbounded).
+        //
+        // The pairing is `reserve_capacity` FIRST, `poll_capacity` second:
+        // capacity is only assigned in response to a reservation, so polling
+        // without reserving hangs forever (a prior revision did exactly this
+        // and deadlocked the H2 conformance suite — keep that lesson).
+        //
+        // Chunks stay ≤16384 so one write can never exceed a max DATA frame.
         let n = obfuscate::chunk_for_send(buf.len().min(16384), self.fragment);
+        // Reserve the full chunk, then poll: `poll_capacity` returns the
+        // total assigned capacity (≥1, >0 guaranteed by h2) which bounds what
+        // we may hand to `send_data` here.
+        self.send.reserve_capacity(n);
+        let assigned = match self.send.poll_capacity(cx) {
+            std::task::Poll::Ready(Some(Ok(c))) => c,
+            std::task::Poll::Ready(Some(Err(e))) => {
+                self.send.reserve_capacity(0);
+                return std::task::Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    e.to_string(),
+                )));
+            }
+            // `None`: the stream is no longer streaming (closed/reset).
+            std::task::Poll::Ready(None) => {
+                self.send.reserve_capacity(0);
+                return std::task::Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "h2 send capacity closed",
+                )));
+            }
+            std::task::Poll::Pending => return std::task::Poll::Pending,
+        };
+        // Never exceed the assigned capacity: h2 decrements the reservation
+        // as data is sent, so a send larger than `assigned` would over-buffer.
+        let n = n.min(assigned);
         match self
             .send
             .send_data(Bytes::copy_from_slice(&buf[..n]), false)
@@ -1002,6 +1129,29 @@ mod tests {
         }
     }
 
+    /// Direct carrier (no nesting): H2 bring-up dials the OS socket path.
+    struct DirectCarrier;
+
+    #[async_trait::async_trait]
+    impl Dialer for DirectCarrier {
+        async fn dial_tcp(&self, _dst: SocketAddr) -> Result<Box<dyn ByteStream>, HopError> {
+            Err(HopError::transport("test-carrier", "no uplink"))
+        }
+
+        async fn dial_udp(&self, _dst: SocketAddr) -> Result<Box<dyn UdpFlow>, HopError> {
+            Err(HopError::transport("test-carrier", "no uplink"))
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                accepts_tcp_carrier: true,
+                accepts_udp_carrier: true,
+                dials_tcp: true,
+                dials_udp: true,
+            }
+        }
+    }
+
     #[tokio::test]
     async fn nested_carrier_failure_is_fail_closed_and_named() {
         let mut cfg = HopConfig::new("masque");
@@ -1161,5 +1311,283 @@ mod tests {
             .expect("recv resolves")
             .expect_err("pending overflow must fail closed");
         assert!(err.message.contains("exceeds"), "bounded pending: {err}");
+    }
+
+    // --- Fix 6: one malformed datagram must not kill the flow ---
+
+    #[test]
+    fn malformed_dst_prefixed_frames_parse_to_none() {
+        let dst: SocketAddr = "127.0.0.1:53".parse().expect("static literal");
+        let other: SocketAddr = "127.0.0.1:54".parse().expect("static literal");
+        let frame = |dst_s: &str, payload: &[u8]| {
+            let mut v = vec![dst_s.len() as u8];
+            v.extend_from_slice(dst_s.as_bytes());
+            v.extend_from_slice(payload);
+            v
+        };
+        // Good frame parses to (dst, payload).
+        let good = frame("127.0.0.1:53", b"ping");
+        assert_eq!(
+            parse_dst_prefixed(&good, dst),
+            Some((dst, b"ping".as_slice()))
+        );
+        // Empty datagram: nothing to parse.
+        assert_eq!(parse_dst_prefixed(&[], dst), None);
+        // Length prefix declares more bytes than present (truncated).
+        let mut truncated = frame("127.0.0.1:53", b"ping");
+        truncated[0] = 64;
+        assert_eq!(parse_dst_prefixed(&truncated, dst), None);
+        // Destination is not UTF-8.
+        let not_utf8 = vec![
+            12u8, 0xFF, 0xFE, 0x31, 0x32, 0x37, 0x2E, 0x30, 0x2E, 0x30, 0x2E, 0x31, 0x00,
+        ];
+        assert_eq!(parse_dst_prefixed(&not_utf8, dst), None);
+        // Destination does not parse as a SocketAddr.
+        let bad_addr = frame("not-an-address", b"ping");
+        assert_eq!(parse_dst_prefixed(&bad_addr, dst), None);
+        // Valid frame addressed to a different destination: malformed for
+        // this flow (send_to rejects foreign dsts, so recv must not accept).
+        let foreign = frame("127.0.0.1:54", b"ping");
+        assert_eq!(parse_dst_prefixed(&foreign, dst), None);
+        // But the same frame IS valid for a flow bound to that destination.
+        assert_eq!(
+            parse_dst_prefixed(&foreign, other),
+            Some((other, b"ping".as_slice()))
+        );
+    }
+
+    // --- Fix 3: hostname endpoints resolve at build, fail closed ---
+
+    #[tokio::test]
+    async fn hostname_endpoint_resolves_through_loopback() {
+        // `localhost:PORT` must resolve via lookup_host and complete the h2
+        // handshake against the loopback responder.
+        let responder = test_support::H2Responder::spawn("127.0.0.1".parse().unwrap())
+            .await
+            .expect("h2 responder");
+        let mut cfg = HopConfig::new("masque");
+        cfg.fields.insert("hop_id".into(), "masque-host-0".into());
+        cfg.fields.insert("alpn".into(), "h2".into());
+        cfg.fields.insert(
+            "endpoint".into(),
+            format!("localhost:{}", responder.addr.port()),
+        );
+        let hop = MasqueFactory
+            .build(cfg, Arc::new(DirectCarrier))
+            .await
+            .expect("hostname endpoint resolves and connects");
+        assert_eq!(hop.health(), HopHealth::Healthy);
+        hop.stop().await.expect("clean stop");
+    }
+
+    #[tokio::test]
+    async fn bogus_hostname_fails_closed_as_config_error() {
+        let mut cfg = HopConfig::new("masque");
+        cfg.fields.insert("hop_id".into(), "masque-host-1".into());
+        cfg.fields
+            .insert("endpoint".into(), "bogus.invalid.example:443".into());
+        let err = match MasqueFactory.build(cfg, Arc::new(RefusingCarrier)).await {
+            Ok(_) => panic!("unresolvable hostname must fail closed"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind, HopErrorKind::Config, "Config, not panic: {err}");
+        assert_eq!(
+            err.hop_id.as_deref(),
+            Some("masque-host-1"),
+            "names hop: {err}"
+        );
+        assert!(
+            err.message.contains("endpoint") && err.message.contains("bogus.invalid.example"),
+            "names the field and host: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_endpoint_and_bad_port_fail_closed() {
+        // Absent field.
+        let err = match MasqueFactory
+            .build(HopConfig::new("masque"), Arc::new(RefusingCarrier))
+            .await
+        {
+            Ok(_) => panic!("missing endpoint must fail closed"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind, HopErrorKind::Config);
+        assert!(err.message.contains("endpoint"), "names field: {err}");
+        // Non-numeric port on a hostname.
+        let mut cfg = HopConfig::new("masque");
+        cfg.fields
+            .insert("endpoint".into(), "proxy.example.com:nope".into());
+        let err = match MasqueFactory.build(cfg, Arc::new(RefusingCarrier)).await {
+            Ok(_) => panic!("non-numeric port must fail closed"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind, HopErrorKind::Config);
+        assert!(
+            err.message.contains("port") && err.message.contains("nope"),
+            "names the bad port: {err}"
+        );
+    }
+
+    // --- Fix 4: h2 writes are flow-window bounded (reserve THEN poll) ---
+
+    /// An H2Stream paired with a real h2 server peer whose window the test
+    /// controls: the server never releases inbound capacity, so a bounded
+    /// writer must stop making progress instead of buffering forever.
+    /// Returns the stream and the server connection (the test owns the
+    /// server task's abort handle to reap it with the test).
+    async fn h2_stream_pair() -> (H2Stream, tokio::task::AbortHandle) {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let client_task = tokio::spawn(async move {
+            let (sender, conn) = h2::client::handshake(client_io)
+                .await
+                .expect("client handshake");
+            tokio::spawn(async move {
+                let mut conn = conn;
+                let _ = (&mut conn).await;
+            });
+            sender
+        });
+        let mut server = h2::server::Builder::new()
+            .initial_window_size(1) // 1-byte stream window: slow peer by construction
+            .handshake::<_, Bytes>(server_io)
+            .await
+            .expect("server handshake");
+        let mut sender = client_task.await.expect("client task");
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("http://127.0.0.1/stream")
+            .body(())
+            .unwrap();
+        let (resp_fut, send) = sender.send_request(request, false).expect("send_request");
+        let (req, mut respond) = server
+            .accept()
+            .await
+            .expect("accept Some")
+            .expect("accept Ok");
+        let response = http::Response::builder().status(200).body(()).unwrap();
+        let _server_send = respond
+            .send_response(response, false)
+            .expect("send_response");
+        let body = req.into_body();
+        let driver = tokio::spawn(async move {
+            let mut server = server;
+            // The slow peer: hold the request body and never poll it. Dropping
+            // it would auto-release the recv capacity (h2 sends a
+            // WINDOW_UPDATE on drop) and unblock the client's sends.
+            let _held_body = body;
+            while let Some(accepted) = server.accept().await {
+                let _ = accepted;
+            }
+        });
+        // The driver must run before awaiting the response, or the queued
+        // 200 HEADERS never reach the client and this await hangs forever.
+        let client_recv = resp_fut.await.expect("response").into_body();
+        let stream = H2Stream {
+            send,
+            recv: client_recv,
+            fragment: None,
+            pending: Vec::new(),
+            driver: driver.abort_handle(),
+        };
+        (stream, driver.abort_handle())
+    }
+
+    #[tokio::test]
+    async fn h2_write_is_window_bounded_not_unbounded() {
+        use tokio::io::AsyncWriteExt;
+        let (mut stream, _server_driver) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), h2_stream_pair())
+                .await
+                .expect("pair built");
+        // The server's stream window starts at 1 byte and it never releases
+        // capacity. The first write must complete bounded by the assigned
+        // capacity, NOT with the full 4096 buffered into h2.
+        let big = vec![0x42u8; 4096];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(5), stream.write(&big))
+            .await
+            .expect("first write resolves against the 1-byte window")
+            .expect("first write is capacity-capped");
+        assert!(
+            n <= 1,
+            "write must be bounded by the server's 1-byte window (sent {n})"
+        );
+        // Without the server releasing capacity, a second write must stay
+        // pending: the pairing reserves then polls, so outstanding bytes are
+        // bounded — an unbounded implementation would buffer all 4096 here.
+        let second =
+            tokio::time::timeout(std::time::Duration::from_millis(300), stream.write(&big)).await;
+        assert!(
+            second.is_err(),
+            "write past exhausted window must await capacity, not buffer"
+        );
+    }
+
+    // --- Fix 1: stop() must release the QUIC endpoint + UDP socket ---
+
+    #[tokio::test]
+    async fn stop_releases_the_bound_udp_port() {
+        let (cert_der, key_der) = {
+            let key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+                .expect("self-signed cert");
+            (key.cert.der().to_vec(), key.signing_key.serialize_der())
+        };
+        let responder =
+            test_support::QuinnResponder::spawn("127.0.0.1".parse().unwrap(), cert_der, key_der)
+                .await
+                .expect("quinn responder");
+        let mut cfg = HopConfig::new("masque");
+        cfg.fields.insert("hop_id".into(), "masque-h3-own-0".into());
+        cfg.fields.insert("alpn".into(), "h3".into());
+        cfg.fields
+            .insert("endpoint".into(), responder.addr.to_string());
+        cfg.fields
+            .insert("insecure_skip_verify".into(), "true".into());
+        let hop = MasqueFactory
+            .build(cfg, Arc::new(DirectCarrier))
+            .await
+            .expect("masque h3 establishes over loopback");
+
+        // Discover the hop's actual local UDP port: dial a flow whose
+        // `local_addr` is the client endpoint's bind address.
+        let local = {
+            let flow = hop
+                .dialer()
+                .dial_udp(responder.addr)
+                .await
+                .expect("dial_udp");
+            flow.local_addr().expect("local addr")
+        };
+        assert_ne!(local.port(), 0, "endpoint bound an ephemeral port");
+
+        hop.stop().await.expect("clean stop");
+        // Drop every handle that keeps the quinn socket's Arc alive: the hop
+        // (owning the endpoint) and the dialers' connection clones. The
+        // `Arc::new(MasqueHop)` goes away with the local `hop` binding here.
+        drop(hop);
+
+        // The leak proof: a NEW bind on the same port must succeed once the
+        // endpoint driver exits. Rebinds race the driver's drain, so poll
+        // with a deadline instead of assuming a fixed delay.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let rebind = loop {
+            match tokio::net::UdpSocket::bind(local).await {
+                Ok(sock) => break Ok(sock),
+                Err(e) if tokio::time::Instant::now() >= deadline => {
+                    break Err(e);
+                }
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+            }
+        };
+        match rebind {
+            Ok(sock) => {
+                let got = sock.local_addr().expect("rebind local addr");
+                assert_eq!(got.port(), local.port(), "same port re-bound");
+            }
+            Err(e) => panic!(
+                "stop() must release the UDP socket; rebind {} failed: {e}",
+                local
+            ),
+        }
     }
 }

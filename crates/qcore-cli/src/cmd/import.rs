@@ -18,11 +18,14 @@ pub fn run_import(path: &str, json: bool, dirs: &ProfileDirs, _quiet: bool) -> i
         Ok(imp) => imp,
         Err(e) => {
             // IO failure is a usage error, not a content rejection.
-            eprintln!("qcore: cannot read {path}: {e}");
+            exit::diag_exit(exit::USAGE, &format!("cannot read {path}: {e}"));
             return exit::USAGE;
         }
     };
     if imp.verdict != qcore_core::config::import::ImportVerdict::Accepted {
+        // The core caps reasons at 20 + one `…and N more` marker; this loop
+        // prints that verbatim. Anything else here is a core-contract bug,
+        // not something the CLI should re-truncate.
         if json {
             println!(
                 "{}",
@@ -63,7 +66,7 @@ pub fn run_import(path: &str, json: bool, dirs: &ProfileDirs, _quiet: bool) -> i
             exit::SUCCESS
         }
         Err(e) => {
-            eprintln!("qcore: import failed: {e}");
+            exit::diag_exit(exit::HOP_FAILURE, &format!("import failed: {e}"));
             exit::HOP_FAILURE
         }
     }

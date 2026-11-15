@@ -239,11 +239,22 @@ impl Engine {
     /// unknown ids, never panics. The handle is cloned out from under the
     /// lock before building the report so report construction never holds
     /// the map lock.
+    ///
+    /// Self-reaping: when every hop of the session reports Failed/Stopped
+    /// (the session died on its own — transport failure, not an explicit
+    /// stop), the entry is removed from `live` so a dead session cannot
+    /// linger forever. The report is still returned once (the final report
+    /// — callers learn *what* died); the next call reports `None`.
     pub fn session_report(&self, id: &str) -> Option<crate::session::report::ConnectionReport> {
-        let handle = { self.lock_live().get(id).cloned() };
-        handle.map(|h| {
-            crate::session::report::ConnectionReport::new(h.hop_reports(), h.exit_hop_id.clone())
-        })
+        let handle = { self.lock_live().get(id).cloned() }?;
+        let reports = handle.hop_reports();
+        if self_dead(&reports) {
+            self.lock_live().remove(id);
+        }
+        Some(crate::session::report::ConnectionReport::new(
+            reports,
+            handle.exit_hop_id.clone(),
+        ))
     }
 
     /// Tear down one live session by id.
@@ -458,7 +469,16 @@ impl Engine {
     /// continues — the failure, if real, surfaces from the tunnel itself.
     /// MASQUE credentials inside the rotation window rotate inline when the
     /// chain needs MASQUE (failures defer with a notice — the credential is
-    /// still valid until expiry). Returns stderr notices or a fatal report.
+    /// still valid until expiry).
+    ///
+    /// Fatal vs notice-and-proceed (documented contract): refusal-class
+    /// errors ([`ReportAction::Refused`], and the no-stored-identity shape
+    /// of Blocked whose cause names `qcore register`) are fatal — the
+    /// connect cannot proceed without an identity. Every other Blocked
+    /// (provider unreachable / rejected / protocol garbage on the refresh
+    /// path) is a transient failure: the stored identity is kept, a notice
+    /// is emitted, and the connect proceeds. Returns stderr notices or the
+    /// fatal report.
     pub async fn preconnect_identity(
         &self,
         specs: &[ExpandedHop],
@@ -509,7 +529,28 @@ impl Engine {
                 .await;
                 match report.action {
                     ReportAction::Reused => {}
-                    ReportAction::Blocked => return Err(report),
+                    ReportAction::Refused => return Err(report),
+                    // Blocked splits by content (fail closed naming the
+                    // class): the no-stored-identity shape means the connect
+                    // cannot proceed (ensure should have registered one —
+                    // treat as fatal). Every other Blocked is a transient
+                    // refresh failure (unreachable/rejected/protocol): the
+                    // identity is kept and the connect proceeds — the
+                    // documented contract; a real failure surfaces from the
+                    // tunnel itself.
+                    ReportAction::Blocked => {
+                        if report.identity.is_none() {
+                            return Err(report);
+                        }
+                        notices.push(format!(
+                            "{}: {}",
+                            match role {
+                                IdentityRole::Outer => "warp",
+                                IdentityRole::Inner => "warp-inner",
+                            },
+                            report.cause
+                        ));
+                    }
                     ReportAction::ReRegistered if had_masque => {
                         notices.push(report.cause.clone());
                         notices.push(
@@ -625,6 +666,17 @@ fn new_session_id() -> String {
         .map(|d| d.as_millis())
         .unwrap_or(0);
     format!("sess-{ms}-{n}")
+}
+
+/// True when every hop reports a terminal-dead status (Failed/Stopped).
+/// A session in this state can never carry traffic again — the engine
+/// reaps it from `live` so status stops serving a corpse. Cheap: reads the
+/// hops' atomic health, no locks held beyond the map op, no IO.
+fn self_dead(reports: &[crate::session::report::HopReport]) -> bool {
+    !reports.is_empty()
+        && reports
+            .iter()
+            .all(|h| h.status == "failed" || h.status == "stopped")
 }
 
 #[cfg(test)]
@@ -844,6 +896,396 @@ mod tests {
             }],
             events,
         }
+    }
+
+    /// Hop whose health is a fixed, configurable value (reaping tests).
+    struct StaticHealthHop {
+        health: qcore_transport_api::HopHealth,
+    }
+
+    #[async_trait::async_trait]
+    impl qcore_transport_api::RunningHop for StaticHealthHop {
+        fn descriptor(&self) -> &'static qcore_transport_api::TransportDescriptor {
+            &FAILING_STOP_DESCRIPTOR
+        }
+        fn dialer(&self) -> std::sync::Arc<dyn qcore_transport_api::Dialer> {
+            std::sync::Arc::new(UnusedDialer)
+        }
+        fn health(&self) -> qcore_transport_api::HopHealth {
+            self.health
+        }
+        fn events(&self) -> tokio::sync::broadcast::Receiver<HopEvent> {
+            tokio::sync::broadcast::channel(1).0.subscribe()
+        }
+        async fn stop(&self) -> Result<(), qcore_transport_api::HopError> {
+            Ok(())
+        }
+    }
+
+    /// Mid-session death double (H1.5): health is Healthy for the FIRST call
+    /// (bring-up readiness passes, exactly the mock transport's
+    /// `fail_after_first_health_check` mode this test mirrors) and Failed
+    /// for every later call — the shape of a real transport dying after a
+    /// green start (wg tunnel expiry, sidecar death).
+    struct DiesAfterStartHop {
+        health_checks: std::sync::atomic::AtomicU64,
+    }
+
+    #[async_trait::async_trait]
+    impl qcore_transport_api::RunningHop for DiesAfterStartHop {
+        fn descriptor(&self) -> &'static qcore_transport_api::TransportDescriptor {
+            &FAILING_STOP_DESCRIPTOR
+        }
+        fn dialer(&self) -> std::sync::Arc<dyn qcore_transport_api::Dialer> {
+            std::sync::Arc::new(UnusedDialer)
+        }
+        fn health(&self) -> qcore_transport_api::HopHealth {
+            let n = self
+                .health_checks
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n >= 1 {
+                qcore_transport_api::HopHealth::Failed
+            } else {
+                qcore_transport_api::HopHealth::Healthy
+            }
+        }
+        fn events(&self) -> tokio::sync::broadcast::Receiver<HopEvent> {
+            tokio::sync::broadcast::channel(16).0.subscribe()
+        }
+        async fn stop(&self) -> Result<(), qcore_transport_api::HopError> {
+            Ok(())
+        }
+    }
+
+    fn handle_with_health(id: &str, health: qcore_transport_api::HopHealth) -> SessionHandle {
+        let (events, _) = tokio::sync::broadcast::channel(8);
+        SessionHandle {
+            id: id.to_string(),
+            exit_hop_id: "exit-d".to_string(),
+            chain: ChainSer {
+                hops: Vec::new(),
+                max_depth: 3,
+            },
+            started: vec![crate::session::lifecycle::StartedHop {
+                hop_id: "h-0".to_string(),
+                kind: "static-health".to_string(),
+                family: "ipv4".to_string(),
+                endpoint: None,
+                via: "root".to_string(),
+                nested: false,
+                inner_mtu: 1500,
+                obfuscation: None,
+                hop: std::sync::Arc::new(StaticHealthHop { health }),
+                congested_drops: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                keepalive: None,
+                forwarder: None,
+            }],
+            events,
+        }
+    }
+
+    #[test]
+    fn session_report_reaps_a_self_dead_session_but_reports_it_once() {
+        let engine = test_engine();
+        engine.lock_live().insert(
+            "dead".to_string(),
+            handle_with_health("dead", qcore_transport_api::HopHealth::Failed),
+        );
+        // First call: the final report is still served (callers learn what
+        // died), and the entry is reaped from `live`.
+        let report = engine
+            .session_report("dead")
+            .expect("final report served once");
+        assert_eq!(report.ordered_chain.len(), 1);
+        assert_eq!(report.ordered_chain[0].status, "failed");
+        assert!(
+            engine.lock_live().get("dead").is_none(),
+            "self-dead session reaped from the live map"
+        );
+        // Subsequent calls: gone — a dead session cannot linger forever.
+        assert!(
+            engine.session_report("dead").is_none(),
+            "reaped session reports None afterwards"
+        );
+    }
+
+    #[test]
+    fn session_report_keeps_alive_and_partial_sessions() {
+        let engine = test_engine();
+        engine.lock_live().insert(
+            "up".to_string(),
+            handle_with_health("up", qcore_transport_api::HopHealth::Healthy),
+        );
+        // Healthy: stays live across repeated reads.
+        for _ in 0..3 {
+            let report = engine.session_report("up").expect("healthy persists");
+            assert_eq!(report.ordered_chain[0].status, "up");
+        }
+        assert!(engine.lock_live().get("up").is_some());
+        // Degraded and Starting are not terminal: no reaping either.
+        engine.lock_live().insert(
+            "degraded".to_string(),
+            handle_with_health("degraded", qcore_transport_api::HopHealth::Degraded),
+        );
+        engine
+            .session_report("degraded")
+            .expect("degraded session serves");
+        assert!(engine.lock_live().get("degraded").is_some());
+    }
+
+    #[test]
+    fn self_dead_requires_every_hop_dead() {
+        // Empty `started` (never happens from a real bring-up) must not be
+        // reaped: an empty report is not proof of death.
+        assert!(!self_dead(&[]));
+        // One failed hop is dead.
+        let one_failed = vec![crate::session::report::HopReport {
+            hop_id: "h".into(),
+            kind: "k".into(),
+            family: "ipv4".into(),
+            endpoint: None,
+            status: "failed".into(),
+            via: "root".into(),
+            nested: false,
+            mtu: 1500,
+            obfuscation: None,
+            dropped: 0,
+        }];
+        assert!(self_dead(&one_failed));
+        // A mixed chain with one healthy hop is not dead.
+        let mut mixed = one_failed.clone();
+        mixed.push(crate::session::report::HopReport {
+            status: "up".into(),
+            ..one_failed[0].clone()
+        });
+        assert!(!self_dead(&mixed));
+    }
+
+    /// Real-path mid-session death (H1.5): a started hop whose health flips
+    /// Healthy→Failed after bring-up (the mock transport's
+    /// `fail_after_first_health_check` mode; against a real transport this
+    /// is wg tunnel expiry or sidecar death, and the `HopEvent::Failed`
+    /// below is the same signal the hop's event forwarder fans into the
+    /// session bus). The report must self-reap: final failed report served
+    /// ONCE, entry reaped, subsequent reports None. The predecessor's
+    /// reaper tests used fixed-health stubs; this one exercises the death
+    /// transition itself on the live path.
+    #[tokio::test]
+    async fn mid_session_hop_death_self_reaps_through_session_report() {
+        let engine = test_engine();
+        let dying = DiesAfterStartHop {
+            health_checks: std::sync::atomic::AtomicU64::new(0),
+        };
+        let (_events, _drain) = tokio::sync::broadcast::channel::<HopEvent>(8);
+        let mut handle = SessionHandle {
+            id: "dying".to_string(),
+            exit_hop_id: "exit-die".to_string(),
+            chain: ChainSer {
+                hops: Vec::new(),
+                max_depth: 3,
+            },
+            started: Vec::new(),
+            events: engine.events.clone(),
+        };
+        handle.started.push(crate::session::lifecycle::StartedHop {
+            hop_id: "die-0".to_string(),
+            kind: "mock".to_string(),
+            family: "ipv4".to_string(),
+            endpoint: None,
+            via: "root".to_string(),
+            nested: false,
+            inner_mtu: 1500,
+            obfuscation: None,
+            hop: std::sync::Arc::new(dying),
+            congested_drops: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            keepalive: None,
+            forwarder: None,
+        });
+        // Bring-up read the health first: the hop started green.
+        assert_eq!(
+            handle.started[0].hop.health(),
+            qcore_transport_api::HopHealth::Healthy,
+            "bring-up readiness probe sees a healthy hop"
+        );
+        engine.lock_live().insert("dying".to_string(), handle);
+
+        // The transport dies mid-session: the Failed event fans into the
+        // session bus (embedder-visible via subscribe()); the engine's own
+        // sender is the same channel `start()` forwards hop events onto.
+        // A subscriber must exist (as the embedder/forwarder would) — a
+        // broadcast with zero receivers drops sends.
+        let mut bus = engine.subscribe();
+        engine
+            .events
+            .send(HopEvent::Failed {
+                hop_id: "die-0".to_string(),
+                cause: "mock transport failed after first health check".to_string(),
+            })
+            .expect("session bus send");
+        let delivered = tokio::time::timeout(std::time::Duration::from_secs(2), bus.recv())
+            .await
+            .expect("event arrives")
+            .expect("recv ok");
+        assert!(
+            matches!(delivered, HopEvent::Failed { .. }),
+            "embedder sees the mid-session death on the bus: {delivered:?}"
+        );
+
+        // First report AFTER the death: the final failed report, served once.
+        let report = engine
+            .session_report("dying")
+            .expect("final report served once");
+        assert_eq!(report.ordered_chain.len(), 1);
+        assert_eq!(report.ordered_chain[0].hop_id, "die-0");
+        assert_eq!(
+            report.ordered_chain[0].status, "failed",
+            "mid-session death reads as failed, not up"
+        );
+        assert!(
+            engine.lock_live().get("dying").is_none(),
+            "self-dead session reaped from the live map"
+        );
+        // Subsequent calls: gone — a dead session cannot linger forever.
+        assert!(
+            engine.session_report("dying").is_none(),
+            "reaped session reports None afterwards"
+        );
+    }
+
+    // --- preconnect_identity classification tests -------------------------
+
+    fn preconnect_dirs(tag: &str) -> (std::path::PathBuf, ProfileDirs) {
+        let root = std::env::temp_dir().join(format!(
+            "qcore-preconnect-{tag}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
+        ));
+        let dirs = ProfileDirs::resolve(Some(root.join("config")), Some(root.join("profiles")));
+        (root, dirs)
+    }
+
+    /// Single warp hop spec for preconnect tests (needs exactly the Outer
+    /// role, so `ensure_warp_for_specs` covers it).
+    fn warp_specs() -> Vec<ExpandedHop> {
+        vec![ExpandedHop::Hop(HopSpec {
+            id: "wg-0".to_string(),
+            config: crate::config::HopConfig::Wireguard(crate::config::WireguardConfig {
+                peer: "warp".to_string(),
+                import_ref: None,
+                obfuscation: None,
+                family: "dual".to_string(),
+                endpoint: Some("162.159.192.1:2408".to_string()),
+            }),
+        })]
+    }
+
+    fn seed_outer_identity(dirs: &ProfileDirs) {
+        crate::identity::store::save(
+            dirs,
+            crate::identity::store::IdentityRole::Outer,
+            &crate::identity::model::ProviderIdentity {
+                device_id: "dev-pre-1".to_string(),
+                access_token: crate::config::secret::SecretString::new("tok"),
+                private_key_b64: crate::config::secret::SecretString::new(
+                    "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=",
+                ),
+                peer_key_b64: "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk=".to_string(),
+                interface_v4: "172.16.0.2".to_string(),
+                interface_v6: "2606:4700:110::2".to_string(),
+                masque: None,
+                refused: false,
+                license_upgraded: false,
+            },
+        )
+        .expect("seeds identity");
+    }
+
+    #[tokio::test]
+    async fn preconnect_transient_refresh_failure_proceeds_with_notice() {
+        // Refresh times out (provider unreachable class): the stored
+        // identity is kept and preconnect must PROCEED with a notice — the
+        // documented contract (the failure, if real, surfaces from the
+        // tunnel itself), not a fatal Err.
+        let (_root, dirs) = preconnect_dirs("transient");
+        dirs.ensure_dirs().expect("dirs");
+        seed_outer_identity(&dirs);
+        let engine = Engine::new(EngineConfig {
+            dirs: dirs.clone(),
+            ..EngineConfig::default()
+        });
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("addr");
+        // Holds connections open: every provider call times out.
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::AsyncReadExt as _;
+                    let mut buf = [0u8; 4096];
+                    let _ = s.read(&mut buf).await;
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                });
+            }
+        });
+
+        let opts = crate::identity::register::ProviderOptions {
+            provider_base: format!("http://{addr}/v0test"),
+            timeout_secs: 1,
+            family: "dual".to_string(),
+        };
+        let outcome = engine.preconnect_identity(&warp_specs(), &opts, None).await;
+        server.abort();
+        let notice = outcome
+            .expect("transient refresh failure must proceed, not fail")
+            .expect("a notice names the failure");
+        assert!(
+            notice.contains("identity kept"),
+            "notice explains the kept identity: {notice}"
+        );
+        // The stored identity survived untouched.
+        assert_eq!(
+            engine
+                .load_identity(crate::identity::store::IdentityRole::Outer)
+                .expect("kept")
+                .device_id,
+            "dev-pre-1"
+        );
+        let _ = std::fs::remove_dir_all(&_root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preconnect_missing_identity_is_fatal() {
+        // The no-stored-identity shape of Blocked (identity: None, cause
+        // names `qcore register`) means the connect cannot proceed: fatal.
+        let (_root, dirs) = preconnect_dirs("missing");
+        dirs.ensure_dirs().expect("dirs");
+        let engine = Engine::new(EngineConfig {
+            dirs: dirs.clone(),
+            ..EngineConfig::default()
+        });
+        // No fixture, no stored identity: ensure_warp_for_specs will try to
+        // register against a dead endpoint → Blocked, identity: None.
+        let dead = std::net::SocketAddr::from(([127, 0, 0, 1], 1));
+        let opts = crate::identity::register::ProviderOptions {
+            provider_base: format!("http://{dead}/v0test"),
+            timeout_secs: 1,
+            family: "dual".to_string(),
+        };
+        let err = engine
+            .preconnect_identity(&warp_specs(), &opts, None)
+            .await
+            .expect_err("no identity + dead provider is fatal");
+        assert_eq!(err.action, crate::identity::report::ReportAction::Blocked);
+        assert!(err.identity.is_none(), "the fatal shape");
+        let _ = std::fs::remove_dir_all(&_root);
     }
 
     #[test]

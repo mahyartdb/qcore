@@ -2,8 +2,10 @@
 //! Release Integrity).
 //!
 //! Artifacts: `qcore-<ver>-<target>.zip|.tar.gz` (CLI binary + cdylib +
-//! `qcore.h` + `abi-version.txt`), `SHA256SUMS`, `sbom.cdx.json` (CycloneDX,
-//! derived from `cargo metadata` — no extra tool needed), cosign keyless
+//! `qcore.h` + `abi-version.txt`), `SHA256SUMS`, `sbom-<ver>.cdx.json`
+//! (CycloneDX 1.5 over the FULL `cargo metadata` package graph — first-party
+//! plus every transitive crate, name+version, sorted deterministically; no
+//! extra tool needed), cosign keyless
 //! signatures (`.sig`) plus SLSA attestation when those tools are present.
 //! The container format comes from the target's `delivery` field in
 //! `targets.toml` (`cli-zip` → zip, `cli-targz`/`termux-cli` → tar.gz); a
@@ -345,14 +347,21 @@ fn read_dir_sorted(dir: &Path) -> Result<Vec<std::fs::DirEntry>, String> {
     Ok(v)
 }
 
-/// CycloneDX SBOM from `cargo metadata` (no extra tooling).
+/// CycloneDX SBOM from FULL `cargo metadata` (with dependencies): the
+/// component list covers first-party AND transitive crates (name+version
+/// only), sorted+deduped so the document is deterministic for a given
+/// lockfile. An empty package graph fails closed — metadata without
+/// packages means the workspace did not resolve, not "no components".
 fn write_sbom(dist: &Path, ver: &str) -> Result<PathBuf, String> {
     let out = std::process::Command::new("cargo")
-        .args(["metadata", "--format-version", "1", "--no-deps"])
+        .args(["metadata", "--format-version", "1"])
         .output()
         .map_err(|e| format!("cargo metadata: {e}"))?;
     if !out.status.success() {
-        return Err("cargo metadata failed".to_string());
+        return Err(format!(
+            "cargo metadata failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
     }
     let meta: serde_json_lite::Value =
         serde_json_lite::parse(&String::from_utf8_lossy(&out.stdout))
@@ -425,11 +434,10 @@ fn stage_and_archive(
 
 pub fn package(args: Vec<String>) -> super::anyhow::Result<()> {
     let fail = |m: String| super::anyhow::Error::msg(m);
-    let target = args
-        .iter()
-        .skip_while(|a| *a != "--target")
-        .nth(1)
-        .cloned()
+    // Shared parser: both `--target X` and `--target=X` spellings; a
+    // valueless flag errors instead of silently meaning native.
+    let target = super::args::parse_target_arg(&args)
+        .map_err(fail)?
         .unwrap_or_else(|| "native".to_string());
     if target != "native" && !contract_targets().contains(&target) {
         return Err(fail(format!(
@@ -475,8 +483,17 @@ pub fn package(args: Vec<String>) -> super::anyhow::Result<()> {
     println!("package: staged {name} (CLI {bin_name}, {cdylib_name}, qcore.h, abi-version.txt)");
     println!("package: {}", archive_path.display());
 
-    // SBOM first so it joins the checksum list.
+    // SBOM first so it joins the checksum list. Full dependency graph
+    // (first-party + transitive); an empty component list means metadata
+    // did not resolve — fail closed instead of shipping an empty SBOM.
     let sbom = write_sbom(&dist, &ver).map_err(fail)?;
+    let sbom_text = std::fs::read_to_string(&sbom).map_err(|e| fail(format!("read sbom: {e}")))?;
+    if !sbom_text.contains("\"type\":\"library\"") {
+        return Err(fail(
+            "SBOM has no components (cargo metadata resolved nothing); refusing to package"
+                .to_string(),
+        ));
+    }
     println!("package: {}", sbom.display());
 
     // SHA256SUMS over the archive + staged files + SBOM: the checksums now
@@ -519,36 +536,26 @@ pub fn package(args: Vec<String>) -> super::anyhow::Result<()> {
     Ok(())
 }
 
-pub fn run(_args: Vec<String>) -> super::anyhow::Result<()> {
+pub fn run(args: Vec<String>) -> super::anyhow::Result<()> {
     let fail = |m: String| super::anyhow::Error::msg(m);
-    // Tier C local gates: the same workspace-wide nextest invocations CI runs
-    // (`xtask ci` in main.rs; T7 story 15). Local and CI results agree by
-    // construction — a single definition, not two similar command lists.
-    for gate in [
-        "cargo fmt --check",
-        "cargo clippy --workspace --all-targets --all-features -- -D warnings",
-        "cargo nextest run --workspace --all-features --exclude tests-conformance",
-        "cargo nextest run -p tests-conformance",
-        "cargo run -q -p xtask -- abi-diff",
-        "cargo run -q -p xtask -- smoke --target native",
-    ] {
-        if !shell_ok(gate) {
-            return Err(fail(format!("release blocked: gate failed: {gate}")));
-        }
-    }
+
     // Release-matrix honesty (targets.toml is the 9-target contract): the CI
-    // tag matrix builds only the 3 Windows legs, so a local `release` can
-    // prove exactly one native package. Printing "package complete" without
-    // naming the 6 unproven targets was a silent contract breach — fail
-    // closed unless the operator acknowledges the partial matrix
-    // explicitly. Full expansion needs runner capacity + a constitution
-    // amendment (see AGENTS.md release row); do not tag `v*` until then.
+    // tag matrix builds only the 3 Windows legs, so no release invocation —
+    // local OR publish-finalize — may proceed without acknowledging the
+    // partial matrix explicitly. Printing "package complete" without naming
+    // the 6 unproven targets was a silent contract breach. Full expansion
+    // needs runner capacity + a constitution amendment (see AGENTS.md
+    // release row); do not tag `v*` until then.
     //
     // DOCUMENTED STUB (T7 story 18): COVERED is the Windows-only subset the
     // tag matrix in `.github/workflows/release.yml` proves today. It must
     // match that file's `matrix.target` list triple-for-triple; CONTRACT is
     // read from `targets.toml` at compile time, so manifest drift fails the
-    // count here instead of shipping silently.
+    // count here instead of shipping silently. The workflow's publish job
+    // passes --allow-partial-matrix for exactly this reason: the matrix DID
+    // prove the three Windows legs, and the finalize mode below carries the
+    // per-target artifacts; the 6 unproven targets are still named, never
+    // silently claimed.
     const COVERED: &[&str] = &[
         "i686-pc-windows-msvc",
         "x86_64-pc-windows-msvc",
@@ -559,7 +566,7 @@ pub fn run(_args: Vec<String>) -> super::anyhow::Result<()> {
         .iter()
         .filter(|t| !COVERED.contains(&t.as_str()))
         .collect();
-    if !_args.iter().any(|a| a == "--allow-partial-matrix") {
+    if !args.iter().any(|a| a == "--allow-partial-matrix") {
         return Err(fail(format!(
             "release blocked: tag matrix covers {}/{} targets ({}); unproven: {}. Re-run with --allow-partial-matrix to acknowledge, or expand the matrix (constitution amendment required).",
             COVERED.len(),
@@ -580,9 +587,131 @@ pub fn run(_args: Vec<String>) -> super::anyhow::Result<()> {
             .collect::<Vec<_>>()
             .join(", ")
     );
-    package(_args)?;
+
+    // CI finalize mode (`--staged-artifacts <dir>`): the workflow's matrix
+    // legs each built + smoked + packaged + uploaded their own target
+    // artifact; the publish job downloaded them all into one directory.
+    // This mode skips the local gates + native packaging (the matrix already
+    // proved them — re-running gates here would rebuild the world on the
+    // publish runner) and only stages the downloaded archives into
+    // `target/dist`, writes the SBOM over the full dependency graph, and
+    // produces SHA256SUMS + the cosign keyless signature. Fail closed:
+    // every artifact must exist on disk, non-empty, before anything is
+    // hashed.
+    if let Some(staged) = super::args::flag_value(&args, "--staged-artifacts").map_err(fail)? {
+        return finalize_staged(Path::new(&staged)).map_err(fail);
+    }
+
+    // Tier C local gates: the same workspace-wide nextest invocations CI runs
+    // (`xtask ci` in main.rs; T7 story 15). Local and CI results agree by
+    // construction — a single definition, not two similar command lists.
+    for gate in [
+        "cargo fmt --check",
+        "cargo clippy --workspace --all-targets --all-features -- -D warnings",
+        "cargo nextest run --workspace --all-features --exclude tests-conformance",
+        "cargo nextest run -p tests-conformance",
+        "cargo run -q -p xtask -- abi-diff",
+        "cargo run -q -p xtask -- smoke --target native",
+    ] {
+        if !shell_ok(gate) {
+            return Err(fail(format!("release blocked: gate failed: {gate}")));
+        }
+    }
+    package(args)?;
     println!(
         "release: package complete; publish only from a tag build with cosign + SLSA attestation"
+    );
+    Ok(())
+}
+
+/// Stage every downloaded matrix artifact into `target/dist`, then emit the
+/// SBOM + SHA256SUMS + cosign signature over exactly those files. Used by
+/// the release workflow's publish job (per-target artifacts built on their
+/// proven runners); never invents an archive that was not uploaded.
+fn finalize_staged(staged: &Path) -> Result<(), String> {
+    let fail = |m: String| format!("release finalize: {m}");
+    if !staged.is_dir() {
+        return Err(fail(format!(
+            "staged-artifacts dir {} missing (publish job must download the matrix artifacts first)",
+            staged.display()
+        )));
+    }
+    let ver = version()?;
+    let dist = dist_dir();
+    std::fs::create_dir_all(&dist).map_err(|e| fail(format!("dist dir: {e}")))?;
+    let mut artifacts: Vec<PathBuf> = Vec::new();
+    for entry in read_dir_sorted(staged)? {
+        let p = entry.path();
+        if !p.is_file() {
+            continue;
+        }
+        let meta = entry
+            .metadata()
+            .map_err(|e| fail(format!("stat {}: {e}", p.display())))?;
+        if meta.len() == 0 {
+            return Err(fail(format!(
+                "staged artifact {} is empty (upload/download broken); refusing to publish",
+                p.display()
+            )));
+        }
+        let dest = dist.join(
+            p.file_name()
+                .ok_or_else(|| fail(format!("unnamed staged artifact {}", p.display())))?,
+        );
+        std::fs::copy(&p, &dest).map_err(|e| fail(format!("copy {}: {e}", p.display())))?;
+        artifacts.push(dest);
+    }
+    if artifacts.is_empty() {
+        return Err(fail(
+            "no staged artifacts found; refusing to publish an empty release".to_string(),
+        ));
+    }
+    println!(
+        "release finalize: staged {} artifact(s) into {}",
+        artifacts.len(),
+        dist.display()
+    );
+
+    // SBOM over the full dependency graph joins the checksum list.
+    let sbom = write_sbom(&dist, &ver)?;
+    println!("release finalize: {}", sbom.display());
+
+    // SHA256SUMS over every staged archive + the SBOM.
+    let mut files = artifacts.clone();
+    files.push(sbom);
+    files.sort();
+    files.dedup();
+    let mut sums = String::new();
+    for f in &files {
+        if f.is_file() {
+            let bytes = std::fs::read(f).map_err(|e| fail(format!("hash {}: {e}", f.display())))?;
+            sums.push_str(&format!(
+                "{}  {}\n",
+                sha256_hex(&bytes),
+                f.strip_prefix(&dist).unwrap_or(f).display()
+            ));
+        }
+    }
+    std::fs::write(dist.join("SHA256SUMS"), &sums).map_err(|e| fail(format!("sums: {e}")))?;
+    println!("release finalize: SHA256SUMS ({} files)", files.len());
+
+    // Keyless signature when cosign is present; otherwise a loud stop (the
+    // workflow installs cosign before this runs — order is enforced there).
+    if shell_ok("cosign version") {
+        if !shell_ok(&format!(
+            "cosign sign-blob --yes {}/SHA256SUMS --output-signature {}/SHA256SUMS.sig",
+            dist.display(),
+            dist.display()
+        )) {
+            return Err(fail("cosign sign-blob failed".to_string()));
+        }
+        println!("release finalize: cosign keyless signature written");
+    } else {
+        println!("release finalize: cosign not installed — publish requires `cosign sign-blob` + SLSA attestation on CI");
+    }
+    println!(
+        "release finalize: complete for qcore {ver}; upload {}/* to the GitHub release",
+        dist.display()
     );
     Ok(())
 }
@@ -759,7 +888,11 @@ mod serde_json_lite {
                 _ => String::new(),
             }
         }
-        /// CycloneDX 1.5 SBOM from cargo-metadata packages.
+        /// CycloneDX 1.5 SBOM from cargo-metadata packages: first-party +
+        /// transitive crates (name+version only), deduped and sorted by
+        /// `name@version` so a given lockfile always yields byte-identical
+        /// output. Empty package graph fails closed upstream in `write_sbom`
+        /// via the component-count check in `package`.
         pub fn sbom_json(&self, ver: &str) -> String {
             let mut comps = Vec::new();
             if let Some(Value::Arr(pkgs)) = self.get("packages") {
@@ -777,6 +910,11 @@ mod serde_json_lite {
                     ));
                 }
             }
+            // Deterministic ordering (sort + dedup on name@version): cargo
+            // metadata lists packages in manifest order, and the same crate
+            // can appear once per workspace member it backs.
+            comps.sort();
+            comps.dedup();
             format!(
                 "{{\n  \"bomFormat\":\"CycloneDX\",\n  \"specVersion\":\"1.5\",\n  \"version\":1,\n  \"metadata\":{{\"component\":{{\"type\":\"application\",\"name\":\"qcore\",\"version\":{}}}}},\n  \"components\":[\n{}\n  ]\n}}\n",
                 json_str(ver),
@@ -813,6 +951,36 @@ mod serde_json_lite {
             let sbom = v.sbom_json("0.1.0");
             assert!(sbom.contains("\"bomFormat\":\"CycloneDX\""));
             assert!(sbom.contains("\"name\":\"a\""));
+        }
+
+        #[test]
+        fn sbom_components_are_sorted_and_deduped() {
+            // Full metadata lists one package entry per workspace member
+            // (the same crate repeats); components must come out sorted by
+            // bom-ref with duplicates removed — a deterministic SBOM, not a
+            // manifest-order dump.
+            let v = parse(
+                r#"{"packages":[
+                    {"name":"zlib","version":"1.0"},
+                    {"name":"a","version":"0.1"},
+                    {"name":"qcore-core","version":"0.3.0"},
+                    {"name":"a","version":"0.1"},
+                    {"name":"qcore-core","version":"0.3.0"}
+                ]}"#,
+            )
+            .expect("parses");
+            let sbom = v.sbom_json("0.1.0");
+            let a = sbom.find("\"name\":\"a\"").expect("a present");
+            let q = sbom
+                .find("\"name\":\"qcore-core\"")
+                .expect("qcore-core present");
+            let z = sbom.find("\"name\":\"zlib\"").expect("zlib present");
+            assert!(a < q && q < z, "components sorted: {sbom}");
+            assert_eq!(
+                sbom.matches("\"name\":\"a\"").count(),
+                1,
+                "duplicate package entries deduped: {sbom}"
+            );
         }
     }
 }

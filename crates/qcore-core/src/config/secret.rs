@@ -75,6 +75,9 @@ impl fmt::Debug for SecretString {
 pub struct SecretStore {
     service: String,
     fallback_dir: std::path::PathBuf,
+    /// `false` forces the file-only backend (tests must not write the
+    /// developer's real OS keyring). Production paths always keep `true`.
+    use_keyring: bool,
 }
 
 /// v1 account-filename encoding: injective escape so distinct accounts
@@ -107,6 +110,23 @@ impl SecretStore {
         SecretStore {
             service: service.into(),
             fallback_dir,
+            use_keyring: true,
+        }
+    }
+
+    /// File-only variant: identical put/get semantics, but the OS keyring is
+    /// never touched. Tests use this — a unit test storing under a fixed
+    /// service name would otherwise write the developer's real credential
+    /// store (and read back whatever is already there).
+    pub fn with_backends(
+        service: impl Into<String>,
+        fallback_dir: std::path::PathBuf,
+        use_keyring: bool,
+    ) -> Self {
+        SecretStore {
+            service: service.into(),
+            fallback_dir,
+            use_keyring,
         }
     }
 
@@ -137,7 +157,7 @@ impl SecretStore {
         // drop via `Zeroizing` (pre-v1 this was a plain `String` that was
         // never wiped).
         let value = Zeroizing::new(String::from_utf8_lossy(secret.expose()).into_owned());
-        if Self::put_keyring(&self.service, account, &value) {
+        if self.use_keyring && Self::put_keyring(&self.service, account, &value) {
             return Ok(());
         }
         self.put_file(account, &value)
@@ -162,6 +182,9 @@ impl SecretStore {
     }
 
     pub fn get(&self, account: &str) -> Result<SecretString, String> {
+        if !self.use_keyring {
+            return self.get_file(account);
+        }
         match Self::keyring_retry(|| keyring::Entry::new(&self.service, account)) {
             Ok(entry) => match Self::keyring_retry(|| entry.get_password()) {
                 Ok(pw) => Ok(SecretString::new(pw)),
@@ -179,6 +202,9 @@ impl SecretStore {
     /// are silently ignored (leftovers are inert — loads prefer the current
     /// namespace).
     pub fn delete_keyring(&self, account: &str) {
+        if !self.use_keyring {
+            return;
+        }
         if let Ok(entry) = Self::keyring_retry(|| keyring::Entry::new(&self.service, account)) {
             let _ = Self::keyring_retry(|| entry.delete_credential());
         }
@@ -348,8 +374,7 @@ mod tests {
     fn file_fallback_round_trip() {
         let dir = std::env::temp_dir().join(format!("qcore-secret-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        // Force the file path by using an account the keyring cannot hold is
-        // platform-dependent; instead verify the file helpers directly.
+        // File helpers directly (file-only; the OS keyring is never touched).
         let store = SecretStore::new("qcore-test", dir.clone());
         store
             .put_file("wg-home", "private-key-bytes")
@@ -361,9 +386,12 @@ mod tests {
 
     #[test]
     fn put_get_round_trips_through_either_backend() {
+        // File-only (`with_backends(_, false)`): a unit test must not write
+        // the developer's real OS keyring under the fixed `qcore-test`
+        // service name — put/get semantics are identical either way.
         let dir = std::env::temp_dir().join(format!("qcore-secret-rt-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let store = SecretStore::new("qcore-test", dir.clone());
+        let store = SecretStore::with_backends("qcore-test", dir.clone(), false);
         store
             .put(
                 "import/wg-home/interface.private_key",
@@ -374,6 +402,41 @@ mod tests {
             .get("import/wg-home/interface.private_key")
             .expect("get");
         assert_eq!(back.expose(), b"round-trip-value");
+        // The file-only backend actually wrote the fallback file.
+        assert!(
+            store
+                .account_path("import/wg-home/interface.private_key")
+                .exists(),
+            "file-only put persisted to the fallback dir"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The REAL backend round-trip (OS keyring, service `qcore-test`).
+    /// `#[ignore]` by default: it writes/reads the developer's actual
+    /// credential store, so it runs only when explicitly requested
+    /// (`cargo nextest run -- --ignored` on a machine that consents).
+    #[test]
+    #[ignore = "writes the developer's real OS keyring (service=qcore-test); opt-in only"]
+    fn real_keyring_round_trip_when_run_explicitly() {
+        let dir = std::env::temp_dir().join(format!(
+            "qcore-secret-kr-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        // Unique account keeps the developer's store clean on re-runs.
+        let account = format!("qcore-ignore-check/{}", std::process::id());
+        let store = SecretStore::with_backends("qcore-test", dir.clone(), true);
+        store
+            .put(&account, &SecretString::new("keyring-round-trip"))
+            .expect("put (keyring path on real machines)");
+        let back = store.get(&account).expect("get");
+        assert_eq!(back.expose(), b"keyring-round-trip");
+        store.delete_keyring(&account);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

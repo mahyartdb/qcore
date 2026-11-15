@@ -2,7 +2,7 @@
 //!
 //! Re-exports force linkage so each transport's `register_plugin!`
 //! submission reaches the engine registry (FR-006). Adding a transport is
-//! one crate + one `HopFactory` + one feature line here.
+//! 7 edit points — see docs/transport-authoring.md.
 
 #[cfg(feature = "masque")]
 pub use transport_masque as masque;

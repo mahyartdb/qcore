@@ -118,6 +118,12 @@ fn resolve_fields(cfg: &HopConfig, peer: &str) -> Result<WgParams, String> {
         .ok_or_else(|| "wireguard hop requires endpoint=<ip:port>".to_string())?
         .parse()
         .map_err(|e: std::net::AddrParseError| format!("bad endpoint: {e}"))?;
+    // Same gate as `resolve_endpoint` (finding 7): the literal path
+    // previously accepted port 0 while the hostname path rejected it.
+    // Fail closed naming the field.
+    if endpoint.port() == 0 {
+        return Err("bad endpoint: `endpoint` port `0` is not connectable".to_string());
+    }
     let private_key = cfg
         .get("private_key")
         .ok_or_else(|| {
@@ -281,6 +287,22 @@ mod tests {
         ]))
         .expect_err("bad preshared_key");
         assert!(err.contains("invalid preshared_key"), "{err}");
+    }
+
+    #[test]
+    fn literal_endpoint_port_zero_rejected_naming_field() {
+        // Finding 7: resolve_fields parses the endpoint as a literal,
+        // bypassing resolve_endpoint's port-0 gate. Both paths must reject
+        // identically, naming the field.
+        let k = "ab".repeat(32);
+        let err = resolve(&cfg(&[
+            ("endpoint", "127.0.0.1:0"),
+            ("private_key", &k),
+            ("peer_public_key", &k),
+        ]))
+        .expect_err("port-0 literal endpoint must fail closed");
+        assert!(err.contains("endpoint"), "names the field: {err}");
+        assert!(err.contains("port `0`"), "names the port: {err}");
     }
 
     #[tokio::test]

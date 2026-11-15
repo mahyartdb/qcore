@@ -78,10 +78,13 @@ pub async fn renew_role(
             let mut extra = String::new();
             if let Some(key) = license {
                 // A key on a healthy renew upgrades in place (no re-register
-                // needed for WARP+).
+                // needed for WARP+). Monotonic: a failed upgrade attempt
+                // must never clear a previously-applied upgrade — the flag
+                // records that the provider account IS upgraded, which a
+                // refused call does not undo.
                 let upgrade = apply_license(opts, &id, key).await;
                 license_applied = upgrade.applied;
-                id.license_upgraded = upgrade.applied;
+                id.license_upgraded = id.license_upgraded || upgrade.applied;
                 if let Some(note) = upgrade.note {
                     extra = format!(" ({note})");
                 }
@@ -369,6 +372,16 @@ mod tests {
         let _ = s.write_all(resp.as_bytes()).await;
     }
 
+    /// Arbitrary-status JSON reply (license PUT 402 vs 200 routing tests).
+    async fn write_json_raw(s: &mut tokio::net::TcpStream, body: &str) {
+        use tokio::io::AsyncWriteExt as _;
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = s.write_all(resp.as_bytes()).await;
+    }
+
     #[tokio::test]
     async fn peer_key_rotation_marks_changed_and_persists() {
         let old_peer = b64_fill(0x42);
@@ -458,6 +471,114 @@ mod tests {
         assert_eq!(report.exit_code(), 2);
         let stored = load(&dirs, IdentityRole::Outer).expect("kept");
         assert_eq!(stored.device_id, "dev-keep-1");
+        let _ = std::fs::remove_dir_all(&dirs.config_dir);
+    }
+
+    /// PUT /account answered non-2xx while the GET refresh is healthy: the
+    /// upgrade failed. See the two tests below for both directions of the
+    /// monotonicity contract.
+    #[tokio::test]
+    async fn failed_license_upgrade_never_downgrades_stored_flag() {
+        let dirs = test_dirs("license-monotone");
+        seed_identity(&dirs, &b64_fill(0x42));
+        // Stored record already says upgraded: a failed attempt must not
+        // clear it.
+        let mut id = load(&dirs, IdentityRole::Outer).expect("seeded");
+        id.license_upgraded = true;
+        save(&dirs, IdentityRole::Outer, &id).expect("marks upgraded");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("addr");
+        let peer = b64_fill(0x42);
+        let body = refresh_body("dev-keep-1", &peer);
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = listener.accept().await else {
+                    break;
+                };
+                let b = body.clone();
+                tokio::spawn(async move {
+                    let head = read_head(&mut s).await;
+                    let text = String::from_utf8_lossy(&head).into_owned();
+                    let request_line = text.lines().next().unwrap_or("");
+                    if request_line.starts_with("PUT ") && request_line.contains("/account") {
+                        let resp = "HTTP/1.1 402 Payment Required\r\nContent-Type: application/json\r\nContent-Length: 24\r\nConnection: close\r\n\r\n{\"error\":\"license bad\"}";
+                        use tokio::io::AsyncWriteExt as _;
+                        let _ = s.write_all(resp.as_bytes()).await;
+                    } else {
+                        write_json(&mut s, &b).await;
+                    }
+                });
+            }
+        });
+
+        let key = SecretString::new("lic-key");
+        let opts = ProviderOptions {
+            provider_base: format!("http://{addr}/v0test"),
+            timeout_secs: 5,
+            family: "dual".to_string(),
+        };
+        let report = renew_role(&dirs, IdentityRole::Outer, &opts, Some(&key), false).await;
+        server.abort();
+        assert_eq!(report.action, ReportAction::Reused, "{}", report.cause);
+        assert!(!report.license_applied, "upgrade attempt failed");
+        let stored = load(&dirs, IdentityRole::Outer).expect("kept");
+        assert!(
+            stored.license_upgraded,
+            "failed attempt must not downgrade the stored flag"
+        );
+        let _ = std::fs::remove_dir_all(&dirs.config_dir);
+    }
+
+    #[tokio::test]
+    async fn successful_license_upgrade_sets_stored_flag() {
+        let dirs = test_dirs("license-apply");
+        seed_identity(&dirs, &b64_fill(0x42));
+        assert!(
+            !load(&dirs, IdentityRole::Outer)
+                .expect("seeded")
+                .license_upgraded
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("addr");
+        let peer = b64_fill(0x42);
+        let body = refresh_body("dev-keep-1", &peer);
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = listener.accept().await else {
+                    break;
+                };
+                let b = body.clone();
+                tokio::spawn(async move {
+                    let head = read_head(&mut s).await;
+                    let text = String::from_utf8_lossy(&head).into_owned();
+                    let request_line = text.lines().next().unwrap_or("");
+                    if request_line.starts_with("PUT ") && request_line.contains("/account") {
+                        write_json_raw(&mut s, r#"{"account":{"license":"active"}}"#).await;
+                    } else {
+                        write_json(&mut s, &b).await;
+                    }
+                });
+            }
+        });
+
+        let key = SecretString::new("lic-key");
+        let opts = ProviderOptions {
+            provider_base: format!("http://{addr}/v0test"),
+            timeout_secs: 5,
+            family: "dual".to_string(),
+        };
+        let report = renew_role(&dirs, IdentityRole::Outer, &opts, Some(&key), false).await;
+        server.abort();
+        assert_eq!(report.action, ReportAction::Reused, "{}", report.cause);
+        assert!(report.license_applied, "fixture accepts the upgrade");
+        let stored = load(&dirs, IdentityRole::Outer).expect("kept");
+        assert!(stored.license_upgraded, "success sets the flag");
         let _ = std::fs::remove_dir_all(&dirs.config_dir);
     }
 }

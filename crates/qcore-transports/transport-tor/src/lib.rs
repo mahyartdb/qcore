@@ -84,7 +84,7 @@ impl qcore_transport_api::HopFactory for TorFactory {
             hop_id,
             client,
             events,
-            stopped: AtomicBool::new(false),
+            stopped: Arc::new(AtomicBool::new(false)),
         }))
     }
 }
@@ -109,7 +109,11 @@ pub struct TorHop {
     events: tokio::sync::broadcast::Sender<HopEvent>,
     /// Stopped-stays-stopped (psiphon invariant): post-stop dials fail
     /// instead of silently serving through the still-bootstrapped client.
-    stopped: AtomicBool,
+    /// Shared with every dialer handed out by `dialer()` — the engine holds
+    /// carriers across stop(), so a snapshot at dialer-creation time would
+    /// let pre-existing dialers keep dialing after stop; the same Arc makes
+    /// the flag live for them too.
+    stopped: Arc<AtomicBool>,
 }
 
 struct TorDialer {
@@ -238,7 +242,9 @@ impl RunningHop for TorHop {
         Arc::new(TorDialer {
             hop_id: self.hop_id.clone(),
             client: self.client.clone(),
-            stopped: Arc::new(AtomicBool::new(self.stopped.load(Ordering::SeqCst))),
+            // Share the live flag, never a snapshot: dials through a carrier
+            // held from bring-up must observe stop() too.
+            stopped: Arc::clone(&self.stopped),
         })
     }
 
@@ -275,5 +281,78 @@ mod tests {
         assert!(parse_bootstrap_secs(Some("abc")).is_err());
         assert!(parse_bootstrap_secs(Some("0")).is_err());
         assert!(parse_bootstrap_secs(Some("9999999999")).is_err());
+    }
+
+    /// Stopped-stays-stopped through a pre-existing dialer: the dialer taken
+    /// BEFORE stop() shares the hop's flag, so dialing through it after
+    /// stop() fails with the stopped error instead of being served by the
+    /// still-bootstrapped client (the engine holds carriers across stop()).
+    #[tokio::test]
+    async fn dialer_taken_before_stop_fails_after_stop() {
+        // Unique state/cache dirs (same pattern as tests/conformance/testutil):
+        // the default config points at the user's real arti state, which
+        // parallel runs and sqlite locks must never touch.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::SeqCst);
+        let base = std::env::temp_dir().join(format!("qcore-tor-stop-{}-{n}", std::process::id()));
+        let state = base.join("state");
+        let cache = base.join("cache");
+        std::fs::create_dir_all(&state).expect("state dir");
+        std::fs::create_dir_all(&cache).expect("cache dir");
+        let config = arti_client::config::TorClientConfigBuilder::from_directories(&state, &cache)
+            .build()
+            .expect("tor client config");
+        // Same provider requirement the factory satisfies before bootstrap.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let client = TorClient::builder()
+            .config(config)
+            .bootstrap_behavior(arti_client::BootstrapBehavior::Manual)
+            .create_unbootstrapped()
+            .expect("unbootstrapped tor client (no network in tests)");
+        let hop = TorHop {
+            hop_id: "tor-stop-0".to_string(),
+            client,
+            events: {
+                let (tx, _) = tokio::sync::broadcast::channel(16);
+                tx
+            },
+            stopped: Arc::new(AtomicBool::new(false)),
+        };
+
+        // Take the dialer while the hop is running.
+        let dialer = hop.dialer();
+        assert_eq!(hop.health(), HopHealth::Healthy);
+        let dst: SocketAddr = "127.0.0.1:80".parse().expect("static literal");
+        // Pre-stop: the dial itself may fail (unbootstrapped client), but it
+        // must NOT fail with the stopped error.
+        if let Err(e) = dialer.dial_tcp(dst).await {
+            assert!(
+                !e.message.contains("stopped"),
+                "pre-stop dial must not be gated by the stopped flag: {e}"
+            );
+        }
+
+        hop.stop().await.expect("clean stop");
+        assert_eq!(hop.health(), HopHealth::Stopped);
+
+        // Post-stop: dialing through the SAME dialer (a carrier the engine
+        // held from bring-up) must fail with the stopped error.
+        let err = match dialer.dial_tcp(dst).await {
+            Ok(_) => panic!("dial through pre-existing dialer must fail after stop"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind, HopErrorKind::Transport);
+        assert_eq!(err.hop_id.as_deref(), Some("tor-stop-0"));
+        assert!(
+            err.message.contains("stopped"),
+            "names the stopped reason: {err}"
+        );
+
+        // New dialers from the stopped hop see the flag too.
+        let err = match hop.dialer().dial_udp(dst).await {
+            Ok(_) => panic!("dial_udp on stopped hop must fail"),
+            Err(e) => e,
+        };
+        assert!(err.message.contains("stopped"), "stopped reason: {err}");
     }
 }

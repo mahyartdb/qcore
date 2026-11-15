@@ -16,6 +16,9 @@
 //! beyond the carrier's is out of scope for v1 (loopback/LAN carriers are
 //! lossless; loss stalls a stream — documented, never silent corruption).
 
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
+
 use bytes::Bytes;
 use qcore_transport_api::{ByteStream, HopError, HopEvent};
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -38,6 +41,36 @@ const DGRAM: u8 = 0x04;
 /// dispatch path is sync and holds the table lock) and counts into
 /// [`StreamTable::stream_drops`], surfaced as [`HopEvent::Congested`].
 pub const STREAM_QUEUE_CAP: usize = 1024;
+
+/// Reorder window in sequence numbers: a DATA chunk ahead of the in-order
+/// cursor by less than this is buffered pending its predecessors; at or
+/// beyond this it can never be re-ordered into place (the cursor advances
+/// only via contiguous delivery) and the chunk is dropped — counted as
+/// congestion (finding 4).
+const REORDER_WINDOW: u32 = 1024;
+
+/// Which end of the WireGuard handshake this table dials from. Stream ids
+/// are `u32` split into two disjoint spaces by parity so both ends can dial
+/// outward through one tunnel without collision (finding 3):
+///
+/// - the handshake **initiator** allocates local ids `1, 3, 5, …` (odd);
+/// - the handshake **responder** allocates local ids `2, 4, 6, …` (even);
+/// - the remote end's ids are the complementary space.
+///
+/// Invariant: an inbound OPEN never names a locally allocated id — the peer
+/// allocates only from its own space. `dispatch` enforces this fail-closed:
+/// a remote OPEN in our space is rejected and counted
+/// ([`StreamTable::rejected_opens`]), never inserted over a local lane.
+/// `u32` arithmetic with step 2 preserves parity through wrapping
+/// (…, 4294967295, 1, … odd; …, 4294967294, 0, … even).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamSide {
+    /// We initiated the WireGuard handshake (the only mode
+    /// [`crate::WireguardFactory`] builds).
+    Initiator,
+    /// We answered the handshake (test responders, future server use).
+    Responder,
+}
 
 /// Cap on concurrent streams per table: lanes are individually bounded
 /// (1024 + 1024-seq window) but the id space is a full u32, so one
@@ -133,6 +166,8 @@ struct StreamEntry {
 /// Demultiplexing table shared by one hop.
 pub struct StreamTable {
     inner: Mutex<TableInner>,
+    /// Next locally allocated stream id (see [`StreamSide`] for the
+    /// odd/even invariant). Stepped +2 from its start.
     next_id: AtomicU32,
     dgrams: tokio::sync::broadcast::Sender<(Vec<u8>, SocketAddr)>,
     /// Congestion sink (#12 observability hook): set once at hop bring-up.
@@ -143,6 +178,9 @@ pub struct StreamTable {
     stream_drops: AtomicU64,
     /// Cumulative datagram-lag skips (`Lagged` on the dgram fan-out).
     dgram_drops: AtomicU64,
+    /// Remote OPENs rejected for naming a locally-allocated id (finding 3
+    /// fail-closed accounting).
+    rejected_opens: AtomicU64,
 }
 
 struct TableInner {
@@ -150,6 +188,19 @@ struct TableInner {
 }
 
 impl StreamTable {
+    /// Table dialing from `side`'s id space. The hop installs
+    /// [`StreamSide::Initiator`] (it always initiates the WireGuard
+    /// handshake); test responders install `Responder`.
+    pub fn new_with_side(side: StreamSide) -> Self {
+        let first = match side {
+            StreamSide::Initiator => 1,
+            StreamSide::Responder => 2,
+        };
+        let table = StreamTable::new();
+        table.next_id.store(first, Ordering::Relaxed);
+        table
+    }
+
     pub fn new() -> Self {
         let (dgrams, _) = tokio::sync::broadcast::channel(256);
         StreamTable {
@@ -161,6 +212,7 @@ impl StreamTable {
             sink: Mutex::new(None),
             stream_drops: AtomicU64::new(0),
             dgram_drops: AtomicU64::new(0),
+            rejected_opens: AtomicU64::new(0),
         }
     }
 
@@ -182,6 +234,18 @@ impl StreamTable {
     /// Cumulative datagram-lag skips since creation.
     pub fn dgram_drops(&self) -> u64 {
         self.dgram_drops.load(Ordering::Relaxed)
+    }
+
+    /// Remote OPENs rejected for naming a locally-allocated (peer-space)
+    /// stream id since creation (finding 3 accounting).
+    pub fn rejected_opens(&self) -> u64 {
+        self.rejected_opens.load(Ordering::Relaxed)
+    }
+
+    /// The locally allocated id space: odd for the handshake initiator,
+    /// even for the responder (see [`StreamSide`]).
+    fn allocates_parity(&self) -> u32 {
+        self.next_id.load(Ordering::Relaxed) & 1
     }
 
     /// Drop every stream entry (hop stop): closing the per-lane channels
@@ -240,6 +304,16 @@ pub fn dispatch(table: &StreamTable, frame: Vec<u8>) -> Result<(), String> {
     match frame[0] {
         OPEN => {
             let (id, _dst) = parse_open(&frame[1..])?;
+            // Parity invariant (finding 3): remote OPENs must name the
+            // peer's id space — the complement of ours (odd initiator ⇄
+            // even responder). An OPEN in OUR space would collide with a
+            // locally allocated stream: pre-fix it was silently ignored
+            // while later DATA cross-wired that local lane. Fail closed:
+            // reject (never insert over a local lane) and count.
+            if id & 1 == table.allocates_parity() {
+                table.rejected_opens.fetch_add(1, Ordering::Relaxed);
+                return Ok(());
+            }
             let mut t = table.inner.lock().unwrap();
             if !t.streams.contains_key(&id) {
                 if t.streams.len() >= MAX_STREAMS {
@@ -312,8 +386,15 @@ pub fn dispatch(table: &StreamTable, frame: Vec<u8>) -> Result<(), String> {
                             }
                         }
                     }
-                } else if seq.wrapping_sub(entry.expect) < 1024 {
+                } else if seq.wrapping_sub(entry.expect) < REORDER_WINDOW {
                     entry.pending.entry(seq).or_insert(payload);
+                } else {
+                    // Beyond the reorder window (finding 4): the cursor can
+                    // only advance via contiguous delivery, so a chunk this
+                    // far ahead can never be re-ordered into place — it is
+                    // unrecoverable here. Count it (surfaced as
+                    // `Congested`) instead of silently vanishing.
+                    dropped += 1;
                 }
             }
             table.record_stream_drops(dropped);
@@ -377,6 +458,13 @@ fn parse_dgram(b: &[u8]) -> Result<(SocketAddr, Vec<u8>), String> {
 }
 
 /// Open an outbound stream to `dst`. Sends OPEN, returns the stream handle.
+///
+/// The id is allocated from this table's parity space (see [`StreamSide`]):
+/// odd when we initiated the WireGuard handshake, even when we answered.
+/// The remote end allocates the complementary space, so `dispatch` can
+/// reject any inbound OPEN that names our space (finding 3: pre-fix both
+/// ends drew from one counter and a peer OPEN could collide with a local
+/// stream, silently cross-wiring the lane).
 pub async fn open_stream(
     table: &Arc<StreamTable>,
     dst: SocketAddr,
@@ -419,8 +507,11 @@ pub async fn open_stream(
 }
 
 fn fresh_id(table: &StreamTable) -> u32 {
-    // Uniqueness only needs atomicity, not cross-thread ordering.
-    table.next_id.fetch_add(1, Ordering::Relaxed)
+    // Parity-stepped allocator (see [`StreamSide`]): odd for the initiator,
+    // even for the responder. Uniqueness needs atomicity, not cross-thread
+    // ordering; `fetch_add(2)` keeps every id in the same space (u32 wrap
+    // preserves parity: …, 4294967295, 1, … odd / …, 4294967294, 0, … even).
+    table.next_id.fetch_add(2, Ordering::Relaxed)
 }
 
 /// Encode one UDP datagram for `dst`.
@@ -539,7 +630,7 @@ impl tokio::io::AsyncRead for WgTcpStream {
 
 impl tokio::io::AsyncWrite for WgTcpStream {
     fn poll_write(
-        self: std::pin::Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
@@ -547,18 +638,32 @@ impl tokio::io::AsyncWrite for WgTcpStream {
         // (see WRITE_SEGMENT).
         let n = buf.len().min(WRITE_SEGMENT);
         let this = self.get_mut();
-        let seq = this.write_seq.fetch_add(1, Ordering::Relaxed);
+        // The seq is committed ONLY on an accepted frame (finding 2): the
+        // pre-fix code consumed a seq via `fetch_add` before `try_send_frame`
+        // and, on egress backpressure, dropped the frame while keeping the
+        // seq — a permanent hole the receiver's in-order cursor parked on
+        // forever (no sender re-delivery exists at this layer). A
+        // backpressured write parks its waker and retries the SAME seq, so
+        // acceptance order equals seq order and the receiver never sees a
+        // gap (the retried frame is byte-identical: id, seq, payload).
+        let seq = this.write_seq.load(Ordering::Relaxed);
         let mut frame = Vec::with_capacity(9 + n);
         frame.push(DATA);
         frame.extend_from_slice(&this.id.to_be_bytes());
         frame.extend_from_slice(&seq.to_be_bytes());
         frame.extend_from_slice(&buf[..n]);
         match this.send.try_send_frame(frame) {
-            Ok(()) => std::task::Poll::Ready(Ok(n)),
+            Ok(()) => {
+                // Commit: this seq is now in flight.
+                this.write_seq.store(seq.wrapping_add(1), Ordering::Relaxed);
+                std::task::Poll::Ready(Ok(n))
+            }
             Err(e) if e.is_backpressure() => {
                 // Park on queue space: exactly one waiter task per
                 // `Pending` (created only on a full queue), woken when
-                // `reserve` succeeds. No busy-spin, no silent drop.
+                // `reserve` succeeds. The seq stays uncommitted until the
+                // retry lands. No busy-spin, no silent drop, no
+                // consumed-but-unsent seq.
                 let waker = cx.waker().clone();
                 let waiter = this.send.congestion_waiter();
                 tokio::spawn(async move {
@@ -765,12 +870,15 @@ mod tests {
 
     #[test]
     fn stream_table_caps_concurrent_opens() {
+        // Peer-space ids only (finding 3 parity): the default table is
+        // initiator-side (odd space), so inbound OPENs must use even ids.
         let table = StreamTable::new();
-        for id in 0..MAX_STREAMS as u32 {
-            dispatch(&table, open_frame(id)).expect("opens within cap");
+        for i in 0..MAX_STREAMS as u32 {
+            dispatch(&table, open_frame(i * 2)).expect("opens within cap");
         }
         assert_eq!(table.stream_drops(), 0);
-        for id in MAX_STREAMS as u32..MAX_STREAMS as u32 + 50 {
+        for i in 0..50u32 {
+            let id = (MAX_STREAMS as u32 + i) * 2;
             dispatch(&table, open_frame(id)).expect("over-cap OPENs drop, not error");
         }
         assert_eq!(table.stream_drops(), 50, "flood beyond cap is counted");
@@ -802,5 +910,230 @@ mod tests {
         }
         assert_eq!(sum as u16, 0xFFFF, "checksum validates");
         assert_eq!(unwrap_ip(&pkt), Some(frame.as_slice()));
+    }
+
+    /// Gate sender for the poll_write regression: refuses the FIRST
+    /// DATA `try_send_frame` (once, via a swap gate — never again), then
+    /// accepts everything. Records every accepted frame verbatim so the
+    /// test can assert the receiver-visible seq sequence.
+    struct CongestedOnceSender {
+        refused: AtomicBool,
+        accepted: Mutex<Vec<Vec<u8>>>,
+    }
+
+    impl CongestedOnceSender {
+        fn new() -> Self {
+            CongestedOnceSender {
+                refused: AtomicBool::new(false),
+                accepted: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn accepted_frames(&self) -> Vec<Vec<u8>> {
+            self.accepted.lock().unwrap().clone()
+        }
+
+        fn accepted_data_frames(&self) -> Vec<Vec<u8>> {
+            self.accepted_frames()
+                .into_iter()
+                .filter(|f| f.first() == Some(&DATA))
+                .collect()
+        }
+
+        fn accepted_seqs(&self) -> Vec<u32> {
+            self.accepted_data_frames()
+                .iter()
+                .map(|f| u32::from_be_bytes(f[5..9].try_into().expect("DATA header is 8 bytes")))
+                .collect()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl FrameSender for CongestedOnceSender {
+        async fn send_frame(&self, frame: Vec<u8>) -> Result<(), HopError> {
+            self.try_send_frame(frame)
+        }
+        fn try_send_frame(&self, frame: Vec<u8>) -> Result<(), HopError> {
+            // Refuse exactly the first DATA frame, then accept everything
+            // (OPEN/FIN included). A swap gate, not arithmetic: the counter
+            // must never wrap back into refusing.
+            if frame.first() == Some(&DATA) && !self.refused.swap(true, Ordering::Relaxed) {
+                return Err(HopError::overloaded("wg-test-0", "egress queue full"));
+            }
+            self.accepted.lock().unwrap().push(frame);
+            Ok(())
+        }
+        fn congestion_waiter(&self) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+            Box::pin(async {})
+        }
+    }
+
+    /// Finding 2 regression: a seq consumed before `try_send_frame` on egress
+    /// backpressure dropped the frame but kept the seq — the receiver's
+    /// in-order cursor parked on the hole forever (no sender re-delivery at
+    /// this layer). The seq must be committed ONLY on an accepted frame, and
+    /// the retried frame must be byte-identical (same seq, same payload).
+    /// Pre-fix this failed: the refused first write consumed seq 0 and the
+    /// retry sent seq 1, so the accepted DATA seqs ran [1, 2]; post-fix the
+    /// retry reuses seq 0 and they run [0, 1] contiguous.
+    #[tokio::test]
+    async fn poll_write_backpressure_does_not_consume_seq() {
+        use tokio::io::AsyncWriteExt;
+        let table = Arc::new(StreamTable::new());
+        let dst: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let sender = Arc::new(CongestedOnceSender::new());
+        let send: SendFrame = sender.clone();
+        let mut stream = open_stream(&table, dst, send).await.expect("opens");
+
+        // First DATA write: refused with backpressure once, retried with the
+        // SAME seq after the (immediate) congestion waiter, then accepted.
+        stream
+            .write_all(b"first")
+            .await
+            .expect("first write completes after the congestion waiter");
+        // Second write: uncontended.
+        stream
+            .write_all(b"second")
+            .await
+            .expect("second write completes");
+        let _ = stream; // FIN attempt rides the always-accepting sender
+
+        let data_frames = sender.accepted_data_frames();
+        assert_eq!(
+            data_frames
+                .iter()
+                .map(|f| f[9..].to_vec())
+                .collect::<Vec<_>>(),
+            vec![b"first".to_vec(), b"second".to_vec()],
+            "exactly the two DATA payloads were accepted, in order"
+        );
+        let seqs = sender.accepted_seqs();
+        assert_eq!(seqs, vec![0, 1], "receiver sees contiguous seqs: {seqs:?}");
+    }
+
+    /// Finding 3: stream ids are split into disjoint parity spaces — the
+    /// handshake initiator allocates odd ids, the responder even — so both
+    /// ends can dial outward through one tunnel without collision. Asserts
+    /// the allocator's parity per side and that locally allocated ids always
+    /// stay in their own space.
+    #[test]
+    fn stream_ids_split_by_parity_per_side() {
+        for side in [StreamSide::Initiator, StreamSide::Responder] {
+            let table = StreamTable::new_with_side(side);
+            let expected_parity = match side {
+                StreamSide::Initiator => 1,
+                StreamSide::Responder => 0,
+            };
+            for i in 0..100u32 {
+                let id = fresh_id(&table);
+                assert_eq!(
+                    id & 1,
+                    expected_parity,
+                    "{side:?} allocates only its parity space (id {id}, i {i})"
+                );
+            }
+        }
+        // Wrapping preserves parity through the full u32 space (u32::MAX is
+        // odd → next initiator id wraps to 1, still odd).
+        let table = StreamTable::new_with_side(StreamSide::Initiator);
+        table.next_id.store(u32::MAX - 2, Ordering::Relaxed);
+        assert_eq!(fresh_id(&table), u32::MAX - 2);
+        assert_eq!(fresh_id(&table), u32::MAX);
+        assert_eq!(fresh_id(&table), 1, "wrap keeps the odd space");
+    }
+
+    /// Finding 3, inbound side: a remote OPEN naming a locally allocated id
+    /// (our parity space) must NOT create a lane in our space — it is
+    /// rejected and counted. Pre-fix a peer OPEN for an id we had not yet
+    /// allocated created a squatter lane in the shared namespace, so our
+    /// next `open_stream` allocation (same counter!) collided with it and
+    /// the two logical streams cross-wired. With the parity split the
+    /// guard is defense-in-depth: a well-behaved peer never OPENs in our
+    /// space; a buggy one fails closed here instead of corrupting lanes.
+    /// Also asserts the complementary space is accepted.
+    #[tokio::test]
+    async fn inbound_open_in_local_parity_space_is_rejected_and_counted() {
+        // Default table = initiator side (odd local space).
+        let table = Arc::new(StreamTable::new());
+        let dst: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let send: SendFrame = Arc::new(StubSender);
+        let stream = open_stream(&table, dst, send).await.expect("opens");
+        assert_eq!(stream.id & 1, 1, "initiator allocates odd ids");
+        let local_id = stream.id;
+
+        // Peer OPEN in OUR space (odd, not yet allocated by us): rejected,
+        // counted, and NO lane created — our space stays ours.
+        let squatter = local_id + 2;
+        dispatch(&table, open_frame(squatter)).expect("rejection is not an error");
+        assert_eq!(
+            table.rejected_opens(),
+            1,
+            "remote OPEN in our space is counted"
+        );
+        assert!(
+            !table.inner.lock().unwrap().streams.contains_key(&squatter),
+            "rejected OPEN must not create a lane in our space"
+        );
+
+        // Peer OPEN in the complementary (even) space: accepted normally.
+        dispatch(&table, open_frame(local_id - 1)).expect("peer-space OPEN accepted");
+        assert_eq!(
+            table.rejected_opens(),
+            1,
+            "peer-space OPEN is not a rejection"
+        );
+        assert!(table
+            .inner
+            .lock()
+            .unwrap()
+            .streams
+            .contains_key(&(local_id - 1)));
+
+        // And our own allocation can never land on an even (peer) id that a
+        // peer lane occupies: next fresh id keeps the odd parity.
+        let next = fresh_id(&table);
+        assert_eq!(next & 1, 1, "local allocation stays in the odd space");
+        assert_ne!(next, local_id - 1, "never collides with a peer lane");
+    }
+
+    /// Finding 4: DATA beyond the reorder window (>1024 ahead of expect) can
+    /// never be re-ordered into place (the cursor advances only via
+    /// contiguous delivery) — it must be counted as congestion, not
+    /// silently vanished. Pre-fix the drop was uncounted.
+    #[tokio::test]
+    async fn data_beyond_reorder_window_is_counted_as_drop() {
+        let table = Arc::new(StreamTable::new());
+        let dst: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let send: SendFrame = Arc::new(StubSender);
+        let stream = open_stream(&table, dst, send).await.expect("opens");
+        let id = stream.id;
+        let _stream = stream; // lane held shut
+
+        // Exactly one window ahead: buffered, not a drop.
+        dispatch(&table, data_frame(id, REORDER_WINDOW - 1, b"edge")).expect("dispatches");
+        assert_eq!(table.stream_drops(), 0, "last in-window seq is buffered");
+        // One past the window: dropped and counted.
+        dispatch(&table, data_frame(id, REORDER_WINDOW, b"too far")).expect("dispatches");
+        assert_eq!(
+            table.stream_drops(),
+            1,
+            "beyond-window DATA is counted congestion"
+        );
+        // The beyond-window chunk must not be buffered anywhere (only the
+        // in-window 1023 sits in pending).
+        let pending = table
+            .inner
+            .lock()
+            .unwrap()
+            .streams
+            .get(&id)
+            .expect("lane alive")
+            .pending
+            .clone();
+        assert_eq!(
+            pending.keys().copied().collect::<Vec<_>>(),
+            vec![REORDER_WINDOW - 1],
+            "only the in-window seq is pending; the beyond-window chunk left nothing"
+        );
     }
 }

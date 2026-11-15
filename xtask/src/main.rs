@@ -1,5 +1,8 @@
 mod abi_diff;
+mod args;
 mod build;
+mod deny_sync;
+mod notices;
 mod release;
 mod smoke;
 
@@ -11,9 +14,11 @@ fn main() -> anyhow::Result<()> {
         Some("package") => release::package(args.collect()),
         Some("release") => release::run(args.collect()),
         Some("abi-diff") => abi_diff::run(args.collect()),
+        Some("deny-sync") => deny_sync::run(args.collect()),
+        Some("notices") => notices::run(args.collect()),
         Some("ci") => ci(),
         other => {
-            eprintln!("usage: xtask <build|smoke|package|release|abi-diff|ci> [args...]");
+            eprintln!("usage: xtask <build|smoke|package|release|abi-diff|deny-sync|notices|ci> [args...]");
             eprintln!("got: {other:?}");
             std::process::exit(6);
         }
@@ -32,6 +37,11 @@ fn ci() -> anyhow::Result<()> {
     shell("cargo clippy --workspace --all-targets --all-features -- -D warnings")?;
     shell("cargo nextest run --workspace --all-features --exclude tests-conformance")?;
     shell("cargo nextest run -p tests-conformance")?;
+    // Supply-chain policy sync AFTER the deny step's own wiring: deny-sync
+    // re-derives the duplicate graph per configured target and fails when a
+    // skip entry went dead or a duplicate lost its skip (H3.11a).
+    shell("cargo run -q -p xtask -- deny-sync")?;
+    shell("cargo run -q -p xtask -- notices --check")?;
     shell("cargo run -q -p xtask -- abi-diff")?;
     shell("cargo run -q -p xtask -- smoke --target native")?;
     Ok(())

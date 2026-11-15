@@ -56,6 +56,11 @@ uint32_t qcore_abi_version(void);
  * the CLI links, including tor; `qcore-transports` is built with the `tor`
  * feature for both surfaces).
  *
+ * On Android, where embedders typically have neither `HOME` nor
+ * `USERPROFILE`, no default config location exists. The caller must pass an
+ * absolute, writable `config_dir` in `config_json`; otherwise this returns 6
+ * naming `config_dir` instead of placing the identity in the process CWD.
+ *
  * `worker_threads` sizes the private FFI runtime (#15 perf batch: the fixed
  * `worker_threads(2)` ignored host width — embedders driving parallel scans
  * or multi-hop pumps can raise it; single-session embedders can lower it to
@@ -172,5 +177,15 @@ int qcore_string_free(char *s);
  * `err` must be null or an error previously returned by this ABI.
  */
 int qcore_error_free(struct QcoreError *err);
+
+/**
+ * Drain the thread-local last-error message into `out`. Returns 0 with the
+ * message moved out, or 6 when there is nothing parked / the out-param is
+ * null. The caller frees the string with `qcore_string_free`.
+ *
+ * # Safety
+ * `out` must be null or a writable pointer.
+ */
+int qcore_take_last_error(char **out);
 
 #endif  /* QCORE_H */

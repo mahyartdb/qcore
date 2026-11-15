@@ -167,7 +167,239 @@ fn native_matrix() -> Result<(), String> {
         &[("Bogus", Stderr)],
         "import rejection exit 5",
     )?;
+    status_stop_matrix().map_err(|e| format!("status/stop: {e}"))?;
+    scan_json_single_document().map_err(|e| format!("scan --json: {e}"))?;
     Ok(())
+}
+
+/// Deterministic session-record exit codes (fix wave E): every shape here
+/// is read straight from `SessionStatus::read` (session/mod.rs) and the
+/// `run_status`/`run_stop` CLI mappings — no live session needed. Cases
+/// that depend on seeded `control.json` + live-listener semantics are
+/// deliberately NOT asserted here (ambiguous across hosts); the three
+/// record-only shapes below are stable.
+fn status_stop_matrix() -> Result<(), String> {
+    // Isolated state dirs per case: `--config` redirects session.json.
+    let base = std::env::temp_dir().join(format!("qcore-smoke-status-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).map_err(|e| format!("scratch dir: {e}"))?;
+
+    let cli = |config: &std::path::Path, args: &[&str]| -> Result<CliOutput, String> {
+        let cfg = config.to_string_lossy().into_owned();
+        let mut full: Vec<&str> = vec!["--config", &cfg];
+        full.extend_from_slice(args);
+        cli(&full)
+    };
+
+    // 1. Fresh profile (no session.json): status → exit 10 ("no session");
+    //    stop with no session → exit 10 as well.
+    let fresh = base.join("fresh");
+    std::fs::create_dir_all(&fresh).map_err(|e| format!("fresh dir: {e}"))?;
+    let out = cli(&fresh, &["status"])?;
+    if out.code != 10 {
+        return Err(format!(
+            "fresh status: exit {}, want 10\nstdout:\n{}\nstderr:\n{}",
+            out.code, out.stdout, out.stderr
+        ));
+    }
+    if !out.stderr.contains("no session (exit 10)") {
+        return Err(format!(
+            "fresh status: stderr lacks the no-session diagnostic\nstdout:\n{}\nstderr:\n{}",
+            out.stdout, out.stderr
+        ));
+    }
+    let out = cli(&fresh, &["stop"])?;
+    if out.code != 10 {
+        return Err(format!(
+            "fresh stop: exit {}, want 10\nstdout:\n{}\nstderr:\n{}",
+            out.code, out.stdout, out.stderr
+        ));
+    }
+    println!("smoke status/stop: fresh profile exits 10 (no session): ok");
+
+    // 2. Seeded state=stopped record: `SessionStatus::read` maps
+    //    Stopped/Failed records to Dead{} (session/mod.rs) → `status` exit
+    //    1. No control.json needed: the Dead branch never consults it.
+    //    Layout: `session_file()` is `<config_dir>/session.json`
+    //    (config/profile_dir.rs), so `--config <dir>` must find the seed
+    //    directly inside `<dir>` — not a nested `config/` subdir.
+    let stopped = base.join("stopped");
+    std::fs::create_dir_all(&stopped).map_err(|e| format!("stopped dir: {e}"))?;
+    // Chain shape mirrors Session/serde: chain.hops entries are
+    // `{"id","kind",...}` (HopConfig's hand-written wire shape), max_depth
+    // rides beside hops (ChainSer).
+    let session = serde_json_less::json_stopped_session();
+    std::fs::write(stopped.join("session.json"), session)
+        .map_err(|e| format!("seed session.json: {e}"))?;
+    let out = cli(&stopped, &["status"])?;
+    if out.code != 1 {
+        return Err(format!(
+            "stopped-record status: exit {}, want 1 (dead)\nstdout:\n{}\nstderr:\n{}",
+            out.code, out.stdout, out.stderr
+        ));
+    }
+    if !out.stderr.contains("is dead (exit 1)") {
+        return Err(format!(
+            "stopped-record status: stderr lacks the dead diagnostic\nstdout:\n{}\nstderr:\n{}",
+            out.stdout, out.stderr
+        ));
+    }
+    println!("smoke status: seeded state=stopped record exits 1 (dead): ok");
+
+    // 3. Corrupt record (invalid JSON): present-but-unparseable is
+    //    `Unverifiable` (fail closed, never "no session") → exit 12.
+    let corrupt = base.join("corrupt");
+    std::fs::create_dir_all(&corrupt).map_err(|e| format!("corrupt dir: {e}"))?;
+    std::fs::write(corrupt.join("session.json"), "{not json at all")
+        .map_err(|e| format!("seed corrupt session.json: {e}"))?;
+    let out = cli(&corrupt, &["status"])?;
+    if out.code != 12 {
+        return Err(format!(
+            "corrupt-record status: exit {}, want 12 (unverifiable)\nstdout:\n{}\nstderr:\n{}",
+            out.code, out.stdout, out.stderr
+        ));
+    }
+    if !out.stderr.contains("unverifiable") {
+        return Err(format!(
+            "corrupt-record status: stderr lacks the unverifiable diagnostic\nstdout:\n{}\nstderr:\n{}",
+            out.stdout, out.stderr
+        ));
+    }
+    println!("smoke status: corrupt session.json exits 12 (unverifiable): ok");
+
+    let _ = std::fs::remove_dir_all(&base);
+    Ok(())
+}
+
+/// `scan --json` must print exactly ONE JSON document on stdout (the
+/// one-document contract): a double-print (e.g. the table AND the json
+/// body, or two documents) fails the smoke even though both halves parse.
+/// Counted structurally: top-level `{` at column 0 of each stdout line
+/// group — good enough to catch any 2+-document stdout without a JSON
+/// dependency in xtask.
+fn scan_json_single_document() -> Result<(), String> {
+    let out = cli(&[
+        "scan",
+        "--transport",
+        "mock",
+        "--profile",
+        "balanced",
+        "--family",
+        "ipv4",
+        "--json",
+    ])?;
+    // Exit 0 (found) or 4 (empty) are both legal verdicts offline; either
+    // way stdout must be exactly one JSON document.
+    if out.code != 0 && out.code != 4 {
+        let text = format!("stdout:\n{}\nstderr:\n{}", out.stdout, out.stderr);
+        return Err(format!(
+            "scan --json: exit {}, want 0 or 4\n{text}",
+            out.code
+        ));
+    }
+    let doc_count = count_json_documents(&out.stdout)?;
+    if doc_count != 1 {
+        let text = format!("stdout:\n<<<{}>>>", out.stdout);
+        return Err(format!(
+            "scan --json: stdout carried {doc_count} top-level JSON documents, want exactly 1\n{text}"
+        ));
+    }
+    // And the single document must actually parse (shape check on the
+    // candidates key, which both the empty and the ranked shapes carry).
+    if !out.stdout.contains("\"candidates\"") {
+        return Err(format!(
+            "scan --json: stdout document lacks `candidates`\nstdout:\n<<<{}>>>",
+            out.stdout
+        ));
+    }
+    println!("smoke scan --json: exactly one JSON document on stdout: ok");
+    Ok(())
+}
+
+/// Count top-level JSON values in `text` (xtask keeps zero deps; a tiny
+/// brace-depth scanner distinguishes one document from several or zero).
+/// Documents are expected whitespace-separated; strings are skipped so
+/// braces inside string literals cannot confuse the count.
+fn count_json_documents(text: &str) -> Result<usize, String> {
+    let mut count = 0usize;
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut saw_content = false;
+    for c in text.chars() {
+        if in_string {
+            match (escaped, c) {
+                (true, _) => escaped = false,
+                (false, '\\') => escaped = true,
+                (false, '"') => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                in_string = true;
+                saw_content = true;
+            }
+            '{' | '[' => {
+                if depth == 0 {
+                    count += 1;
+                }
+                depth += 1;
+                saw_content = true;
+            }
+            '}' | ']' => {
+                depth -= 1;
+                if depth < 0 {
+                    return Err("scan --json: unbalanced JSON on stdout".to_string());
+                }
+            }
+            c if c.is_whitespace() => {}
+            _ => saw_content = true,
+        }
+    }
+    if depth != 0 {
+        return Err("scan --json: truncated JSON on stdout".to_string());
+    }
+    // Bare non-JSON stdout (e.g. diagnostics leaking to the result stream)
+    // counts as a broken document too.
+    if count == 0 && saw_content {
+        return Err("scan --json: stdout carried no JSON document".to_string());
+    }
+    Ok(count)
+}
+
+/// Hand-rolled `session.json` seed for the stopped-record status case (xtask
+/// keeps zero serde deps): exactly the wire shape `Session`/`ChainSer`/
+/// `HopConfig` serialize (config/hop.rs hand-written map with `kind` first).
+mod serde_json_less {
+    /// A `state: "stopped"` session with one mock hop: loads as
+    /// `SessionStatus::Dead` (exit 1), no control channel consulted.
+    pub fn json_stopped_session() -> String {
+        r#"{
+  "id": "smoke-seeded-0",
+  "chain": {
+    "hops": [
+      {
+        "id": "mock-0",
+        "kind": "mock",
+        "family": "dual"
+      }
+    ],
+    "max_depth": 3
+  },
+  "family_policy": {
+    "mode": "dual",
+    "prefer": "ipv4",
+    "connection_attempt_delay_ms": 250,
+    "resolution_delay_ms": 50
+  },
+  "state": "stopped",
+  "started_at": 1700000000000,
+  "failure": null
+}"#
+        .to_string()
+    }
 }
 
 /// Byte-scan a cdylib/dll/so for the required `qcore_*` exports (std-only;
@@ -217,11 +449,10 @@ pub fn check_cdylib_exports(path: &std::path::Path) -> Result<(), String> {
 }
 
 pub fn run(args: Vec<String>) -> super::anyhow::Result<()> {
-    let target = args
-        .iter()
-        .skip_while(|a| *a != "--target")
-        .nth(1)
-        .cloned()
+    // Shared parser: both `--target X` and `--target=X` spellings; a
+    // valueless flag errors instead of silently meaning native.
+    let target = super::args::parse_target_arg(&args)
+        .map_err(super::anyhow::Error::msg)?
         .unwrap_or_else(|| "native".to_string());
     if target != "native" && !targets().contains(&target) {
         return Err(super::anyhow::Error::msg(format!(

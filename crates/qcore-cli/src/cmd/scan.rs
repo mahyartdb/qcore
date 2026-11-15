@@ -67,7 +67,7 @@ pub async fn run(
     let profile = match profile_named(dirs, profile) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("qcore: {e}");
+            exit::diag_exit(exit::USAGE, &e);
             return exit::USAGE;
         }
     };
@@ -78,7 +78,7 @@ pub async fn run(
     let report = match run_scan_request(dirs, transport, profile, family).await {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("qcore: scan failed: {e}");
+            exit::diag_exit(exit::HOP_FAILURE, &format!("scan failed: {e}"));
             return exit::HOP_FAILURE;
         }
     };

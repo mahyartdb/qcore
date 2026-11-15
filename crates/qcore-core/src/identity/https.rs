@@ -75,6 +75,7 @@ impl std::fmt::Display for HttpError {
     }
 }
 
+#[derive(Debug)]
 struct Url {
     tls: bool,
     host: String,
@@ -103,6 +104,11 @@ fn parse_url(url: &str) -> Result<Url, HttpError> {
         Some(i) => (&rest[..i], rest[i..].to_string()),
         None => (rest, "/".to_string()),
     };
+    if authority.bytes().any(|b| b <= 0x20 || b == 0x7F) {
+        return Err(HttpError::Usage(
+            "bad provider URL (host must not contain whitespace or controls)".to_string(),
+        ));
+    }
     // The path is written verbatim into the request line: reject anything
     // that splits it (CR/LF → header injection, space → line split,
     // `..` traversal is left to the provider but never constructed here).
@@ -588,5 +594,15 @@ mod tests {
     fn url_path_with_controls_rejected() {
         assert!(parse_url("https://api.example.com/reg/abc\r\nX-Inject: 1").is_err());
         assert!(parse_url("https://api.example.com/reg/a b").is_err());
+        // The authority lands in the `Host:` header and drives DNS/TLS: same
+        // byte gate as the path, or CR/LF in the host splits the request.
+        let e = parse_url("https://api.example.com\r\nX-Inject: 1/reg").unwrap_err();
+        assert!(matches!(e, HttpError::Usage(_)), "{e}");
+        assert!(e.to_string().contains("host"), "names the field: {e}");
+        assert!(e.to_string().contains("control"), "names the rule: {e}");
+        assert!(parse_url("https://api example.com/reg").is_err());
+        // Ordinary authorities keep parsing.
+        assert!(parse_url("https://api.example.com/reg").is_ok());
+        assert!(parse_url("http://127.0.0.1:9/fixture").is_ok());
     }
 }

@@ -94,20 +94,19 @@ pub fn backend_for(target: &str) -> &'static str {
 }
 
 pub fn run(args: Vec<String>) -> super::anyhow::Result<()> {
-    let target = args
-        .iter()
-        .skip_while(|a| *a != "--target")
-        .nth(1)
-        .map(|s| s.as_str())
-        .unwrap_or("native");
+    // Shared parser: both `--target X` and `--target=X` spellings; a
+    // valueless flag errors instead of silently meaning native.
+    let target = super::args::parse_target_arg(&args)
+        .map_err(super::anyhow::Error::msg)?
+        .unwrap_or_else(|| "native".to_string());
     let backend = if target == "native" {
         "cargo"
     } else {
-        backend_for(target)
+        backend_for(&target)
     };
     println!("build backend for {target}: {backend} (see targets.toml)");
     let cmd = match backend {
-        "native-msvc" | "cargo" => format!("cargo build --release{}", opt_target(target)),
+        "native-msvc" | "cargo" => format!("cargo build --release{}", opt_target(&target)),
         "cross-rs" => format!("cross build --release --target {target}"),
         "cargo-ndk" => format!("cargo ndk --target {target} build --release"),
         "cargo-zigbuild" => format!("cargo zigbuild --release --target {target}"),

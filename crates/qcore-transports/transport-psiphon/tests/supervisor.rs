@@ -21,6 +21,12 @@ fn base_config() -> SidecarConfig {
 
 #[tokio::test]
 async fn spawn_reports_ready_and_secret_arrives_on_stdin() {
+    // Two stdin proofs, one per sidecar generation:
+    // 1. Hand-spawned fake sidecar: SECRET_LEN on stderr (direct write).
+    // 2. Supervisor-spawned sidecar WITH cfg.secret set: the supervisor's
+    //    own stdin delivery is exercised (never the test's hand) — the fake
+    //    reports the total stdin byte count to a file on EOF, and teardown
+    //    closes the pipe, so the file shows the secret arrived.
     let mut cfg = base_config();
     cfg.secret = Some(SidecarSecret {
         payload: b"sidecar-secret-token".to_vec(),
@@ -60,9 +66,54 @@ async fn spawn_reports_ready_and_secret_arrives_on_stdin() {
         stderr.contains("SECRET_LEN=13"),
         "secret arrived via stdin, never argv: {stderr}"
     );
-    // Supervisor-spawned sidecar still healthy and addressable.
-    assert!(running.is_running());
+
+    // Supervisor-delivered secret: a fresh fake sidecar asks for the stdin
+    // report; the supervisor (cfg.secret above) writes the payload + \n in
+    // one write-all, and the fake reports the delivered byte count as soon
+    // as the line lands. Polled until the file appears — no fixed sleep
+    // (slow spawns race).
+    let report = std::env::temp_dir().join(format!(
+        "qcore-sidecar-stdin-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let _ = std::fs::remove_file(&report);
+    let mut sup_cfg = base_config();
+    sup_cfg.args = vec![format!("--report-stdin-len={}", report.display())];
+    sup_cfg.secret = Some(SidecarSecret {
+        payload: b"supervisor-delivered-secret".to_vec(),
+    });
+    let sup2 = SidecarSupervisor::new(sup_cfg);
+    let sup_running = sup2.spawn().await.expect("supervisor ready handshake");
+    // Payload + newline must arrive on the sidecar's stdin via the
+    // supervisor's write-once delivery (supervisor.rs stdin branch).
+    let len = wait_for_stdin_report(&report).await;
+    assert_eq!(
+        len, 28,
+        "supervisor delivered payload+newline on stdin (never argv)"
+    );
+    sup_running.teardown().await;
     running.teardown().await;
+}
+
+/// Poll for the stdin-length report file until the fake sidecar writes it
+/// (as soon as the supervisor's secret line lands) or the deadline passes.
+async fn wait_for_stdin_report(path: &std::path::Path) -> u64 {
+    let t0 = std::time::Instant::now();
+    loop {
+        if t0.elapsed() > Duration::from_secs(10) {
+            panic!("stdin report never written to {}", path.display());
+        }
+        if let Ok(text) = std::fs::read_to_string(path) {
+            if let Ok(n) = text.trim().parse::<u64>() {
+                return n;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 #[tokio::test]
@@ -96,8 +147,15 @@ async fn restart_cap_exhaustion_fails_closed_naming_bound() {
     cfg.max_restarts = 0;
     let sup = SidecarSupervisor::new(cfg);
     let mut running = sup.spawn().await.expect("initial ready");
-    // Let it die, then require revival with zero budget left.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Death is awaited (polled), not fixed-slept: the 100 ms death timer
+    // races slow spawns, and a fixed sleep either overshoots or undershoots.
+    let t0 = std::time::Instant::now();
+    while running.is_running() {
+        if t0.elapsed() > Duration::from_secs(15) {
+            panic!("sidecar never died");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     let err = sup
         .ensure_running(&mut running)
         .await
@@ -108,16 +166,41 @@ async fn restart_cap_exhaustion_fails_closed_naming_bound() {
 
 #[tokio::test]
 async fn revive_within_budget_gets_new_ready_sidecar() {
+    // Death awaited (not slept) so the revive lands within milliseconds of
+    // death, with the full fresh window left; the revived sidecar must
+    // actually serve — the same socks round-trip its sibling
+    // `revived_sidecar_serves_traffic` asserts (a revival that flips
+    // is_running without serving is a dead revival path).
+    let stub = StubPeer::bind("dual").await.unwrap();
+    let tcp_dst = stub.tcp_addr(false).unwrap();
     let mut cfg = base_config();
     cfg.args = vec!["--die-after-ms=100".into()];
     cfg.max_restarts = 2;
     let sup = SidecarSupervisor::new(cfg);
     let mut running = sup.spawn().await.expect("initial ready");
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let t0 = std::time::Instant::now();
+    while running.is_running() {
+        if t0.elapsed() > Duration::from_secs(15) {
+            panic!("sidecar never died");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     sup.ensure_running(&mut running)
         .await
         .expect("revive within budget");
     assert!(running.is_running());
+    // The revived generation serves traffic through its socks port.
+    let addr = running.socks_addr();
+    let mut stream = qcore_transport_psiphon::socks::socks_connect(addr, tcp_dst)
+        .await
+        .expect("revived sidecar serves");
+    stream.write_all(b"ping-rv2").await.expect("write");
+    let mut back = [0u8; 8];
+    tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut back))
+        .await
+        .expect("echo arrives")
+        .expect("read");
+    assert_eq!(&back, b"ping-rv2");
     running.teardown().await;
 }
 

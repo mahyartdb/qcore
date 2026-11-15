@@ -48,6 +48,12 @@ pub struct HopError {
     pub kind: HopErrorKind,
     pub hop_id: Option<String>,
     pub message: String,
+    /// Retry-vs-terminal verdict (H1.2): `true` only for backpressure
+    /// ([`HopError::overloaded`]) — the frame was NOT sent and NOT dropped,
+    /// so the caller must retry. Every other failure is terminal (`false`).
+    /// Production retry branches read the flag via [`HopError::is_backpressure`];
+    /// message wording is free-form, never a contract.
+    retryable: bool,
 }
 
 impl HopError {
@@ -56,6 +62,7 @@ impl HopError {
             kind,
             hop_id,
             message: message.into(),
+            retryable: false,
         }
     }
 
@@ -68,24 +75,24 @@ impl HopError {
     /// senders `await` queue space; `poll_write` parks on a waker). Kind
     /// stays `Transport` (never a new `HopErrorKind` variant) so downstream
     /// exhaustive matches keep compiling: a dedicated kind needs a major
-    /// version window (map #7 enum windows). The message prefix is the
-    /// machine-readable marker; see [`HopError::is_backpressure`].
+    /// version window (map #7 enum windows). The message prefix stays for
+    /// human diagnostics; the machine-readable marker is the `retryable`
+    /// flag — see [`HopError::is_backpressure`].
     pub fn overloaded(hop_id: impl Into<String>, message: impl Into<String>) -> Self {
-        HopError::new(
+        let mut e = HopError::new(
             HopErrorKind::Transport,
             Some(hop_id.into()),
             format!("egress congested (backpressure; retry): {}", message.into()),
-        )
+        );
+        e.retryable = true;
+        e
     }
 
     /// True for [`HopError::overloaded`] backpressure (retry), false for all
-    /// other transport failures (fail). Callers must not string-match the
-    /// free-form suffix — only this prefix is contractual.
+    /// other transport failures (fail). Reads the typed `retryable` flag —
+    /// never the message: wording is a human diagnostic, not a contract.
     pub fn is_backpressure(&self) -> bool {
-        self.kind == HopErrorKind::Transport
-            && self
-                .message
-                .starts_with("egress congested (backpressure; retry)")
+        self.retryable
     }
 
     pub fn validation(message: impl Into<String>) -> Self {
@@ -198,7 +205,7 @@ mod tests {
     fn overloaded_is_retryable_without_new_kind() {
         // #12/#15: backpressure rides the existing `Transport` kind (a new
         // `HopErrorKind` variant would break downstream exhaustive matches —
-        // version-window rule). The prefix is the contract.
+        // version-window rule). The typed `retryable` flag is the contract.
         let e = HopError::overloaded("wg-0", "egress queue full");
         assert_eq!(e.kind, HopErrorKind::Transport);
         assert!(e.is_backpressure());
@@ -208,5 +215,51 @@ mod tests {
         assert!(!closed.is_backpressure());
         let other = HopError::transport("wg-0", "encapsulate: NoiseProtocol");
         assert!(!other.is_backpressure());
+    }
+
+    #[test]
+    fn backpressure_verdict_reads_the_flag_not_the_wording() {
+        // H1.2: production retry-vs-terminal branches on the typed flag. A
+        // transport error with a DIFFERENT message but retryable=true is
+        // backpressure; a same-prefix message without the flag is not.
+        let mut flagged = HopError::transport("wg-0", "carrier congestion, retry soon");
+        flagged.retryable = true;
+        assert!(
+            flagged.is_backpressure(),
+            "any transport error flagged retryable is backpressure, whatever its wording"
+        );
+
+        let wording_only = HopError::transport(
+            "wg-0",
+            "egress congested (backpressure; retry): forged wording, flag never set",
+        );
+        assert!(
+            !wording_only.is_backpressure(),
+            "matching message wording without the flag is terminal"
+        );
+
+        let mut unflagged_overload = HopError::new(
+            HopErrorKind::Transport,
+            Some("wg-0".to_string()),
+            "egress congested (backpressure; retry): forged",
+        );
+        assert!(!unflagged_overload.is_backpressure());
+        // The only sanctioned setter is the `overloaded` constructor; direct
+        // flag pokes are test-scope (field is private outside this crate).
+        unflagged_overload.retryable = true;
+        assert!(unflagged_overload.is_backpressure());
+
+        // Non-transport kinds stay terminal even if a caller flagged them.
+        let mut chain_flagged = HopError::new(HopErrorKind::Chain, None, "boom");
+        chain_flagged.retryable = true;
+        assert!(
+            chain_flagged.is_backpressure(),
+            "flag is authoritative; kind is diagnostic metadata only"
+        );
+
+        // The overloaded constructor sets kind + flag together.
+        let over = HopError::overloaded("wg-0", "full");
+        assert_eq!(over.kind, HopErrorKind::Transport);
+        assert!(over.retryable);
     }
 }

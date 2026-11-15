@@ -9,6 +9,13 @@
 //! engine's own bounded budgets (connection timeout / scan RTT budget).
 //! Secrets are never written to caller buffers (FR-026): export goes
 //! through the redacted form, reports are secret-free by construction.
+//!
+//! Handle lifetime: the registry owns one strong reference (`Arc`) per
+//! live engine; every entry point acquires a clone of that reference under
+//! the registry lock (the lock is never held across the call) and runs on
+//! it. A freed engine is removed from the registry; in-flight calls on
+//! other threads finish on the last strong reference before the engine
+//! drops. Forged/double-free handles remain a usage error (6).
 
 use qcore_core::api::{Engine, EngineConfig};
 use qcore_core::config::profile_dir::ProfileDirs;
@@ -115,52 +122,70 @@ fn unwind_guard<F: FnOnce() -> c_int + std::panic::UnwindSafe>(f: F) -> c_int {
     std::panic::catch_unwind(f).unwrap_or(-1)
 }
 
-static LIVE_HANDLES: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<usize>>> =
-    std::sync::OnceLock::new();
+static LIVE_HANDLES: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<usize, std::sync::Arc<QcoreEngine>>>,
+> = std::sync::OnceLock::new();
 
-fn live_handles() -> &'static std::sync::Mutex<std::collections::HashSet<usize>> {
-    LIVE_HANDLES.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+fn live_handles(
+) -> &'static std::sync::Mutex<std::collections::HashMap<usize, std::sync::Arc<QcoreEngine>>> {
+    LIVE_HANDLES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
 /// Poison-tolerant guard for the live-handle set: a poisoned mutex is
 /// restored (contents preserved) and the restore is logged, so a poisoned
 /// set never silently drops a track/lookup/remove into a false answer.
-fn lock_live_handles() -> std::sync::MutexGuard<'static, std::collections::HashSet<usize>> {
+fn lock_live_handles(
+) -> std::sync::MutexGuard<'static, std::collections::HashMap<usize, std::sync::Arc<QcoreEngine>>> {
     live_handles().lock().unwrap_or_else(|e| {
         eprintln!("qcore: live handle set lock poisoned; restoring");
         e.into_inner()
     })
 }
 
-fn track_handle(ptr: *mut QcoreEngine) {
-    lock_live_handles().insert(ptr as usize);
+/// Register a freshly created engine: the registry takes one strong
+/// reference and the handle (the `Arc` pointer, stable for the engine's
+/// lifetime) maps to it. The handle stays an opaque pointer for callers —
+/// ABI-identical to the former boxed-pointer representation.
+fn track_handle(engine: std::sync::Arc<QcoreEngine>) -> *mut QcoreEngine {
+    let handle = std::sync::Arc::as_ptr(&engine) as *mut QcoreEngine;
+    lock_live_handles().insert(handle as usize, engine);
+    handle
 }
 
-/// Returns true only for a live handle from [`qcore_engine_new`] not yet freed.
-pub(crate) fn handle_is_live(ptr: *mut QcoreEngine) -> bool {
-    if ptr.is_null() {
-        return false;
+/// Acquire a strong reference for a live handle, or `None` when the handle
+/// is null/forged/already freed. The clone is taken under the registry lock
+/// and the lock is released before the caller uses the engine, so a
+/// concurrent free can never race the dereference: worst case the acquire
+/// sees the entry already removed and fails closed.
+pub(crate) fn acquire_engine(handle: *mut QcoreEngine) -> Option<std::sync::Arc<QcoreEngine>> {
+    if handle.is_null() {
+        return None;
     }
-    lock_live_handles().contains(&(ptr as usize))
+    lock_live_handles().get(&(handle as usize)).cloned()
 }
 
-/// Removes from the live set; returns true if it was live.
-fn untrack_handle(ptr: *mut QcoreEngine) -> bool {
+/// Removes from the live set and returns the registry's strong reference;
+/// `None` when the handle was not live (forged or already freed). The
+/// engine memory itself lives until the last in-flight reference drops.
+fn untrack_handle(ptr: *mut QcoreEngine) -> Option<std::sync::Arc<QcoreEngine>> {
     lock_live_handles().remove(&(ptr as usize))
 }
 
-fn check_handle(handle: *mut QcoreEngine, err_out: *mut *mut QcoreError) -> Result<(), c_int> {
+fn check_handle(
+    handle: *mut QcoreEngine,
+    err_out: *mut *mut QcoreError,
+) -> Result<std::sync::Arc<QcoreEngine>, c_int> {
     if handle.is_null() {
         return Err(fail(err_out, 6, "null engine handle".to_string()));
     }
-    if !handle_is_live(handle) {
-        return Err(fail(
+    match acquire_engine(handle) {
+        Some(engine) => Ok(engine),
+        None => Err(fail(
             err_out,
             6,
             "invalid or freed engine handle".to_string(),
-        ));
+        )),
     }
-    Ok(())
 }
 
 /// FFI runtime sizing knob (#15): clamped, advisory, default 2.
@@ -211,6 +236,11 @@ unsafe fn opt_c_str(ptr: *const c_char) -> Result<Option<String>, String> {
 /// the CLI links, including tor; `qcore-transports` is built with the `tor`
 /// feature for both surfaces).
 ///
+/// On Android, where embedders typically have neither `HOME` nor
+/// `USERPROFILE`, no default config location exists. The caller must pass an
+/// absolute, writable `config_dir` in `config_json`; otherwise this returns 6
+/// naming `config_dir` instead of placing the identity in the process CWD.
+///
 /// `worker_threads` sizes the private FFI runtime (#15 perf batch: the fixed
 /// `worker_threads(2)` ignored host width — embedders driving parallel scans
 /// or multi-hop pumps can raise it; single-session embedders can lower it to
@@ -241,10 +271,13 @@ pub unsafe extern "C" fn qcore_engine_new(
             },
         };
         let str_field = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
-        let dirs = ProfileDirs::resolve(
+        let dirs = match ProfileDirs::try_resolve(
             str_field("config_dir").map(std::path::PathBuf::from),
             str_field("profile_dir").map(std::path::PathBuf::from),
-        );
+        ) {
+            Ok(dirs) => dirs,
+            Err(e) => return fail(err_out, 6, e),
+        };
         if let Err(e) = dirs.ensure_dirs() {
             return fail(err_out, 3, format!("profile dirs unavailable: {e}"));
         }
@@ -284,12 +317,15 @@ pub unsafe extern "C" fn qcore_engine_new(
             Ok(rt) => rt,
             Err(e) => return fail(err_out, 3, format!("runtime unavailable: {e}")),
         };
-        *unsafe { &mut *out } = Box::into_raw(Box::new(QcoreEngine {
+        let engine = std::sync::Arc::new(QcoreEngine {
             engine,
             rt,
             timeout,
-        }));
-        track_handle(*unsafe { &mut *out });
+        });
+        // The handle is the `Arc` allocation's address (stable, opaque to
+        // callers): the registry owns this strong reference, entry points
+        // acquire clones, and `qcore_engine_free` releases the registry's.
+        *unsafe { &mut *out } = track_handle(engine);
         0
     })
 }
@@ -307,12 +343,15 @@ pub unsafe extern "C" fn qcore_engine_free(handle: *mut QcoreEngine) -> c_int {
         if handle.is_null() {
             return 0;
         }
-        if !untrack_handle(handle) {
-            return 6;
-        }
-        // SAFETY: `handle` was live (checked above), so reclaiming it here
-        // is sound; teardown below is bounded by the engine budget.
-        let engine = unsafe { Box::from_raw(handle) };
+        // Untracking removes the registry entry and hands back its strong
+        // reference; any in-flight call on another thread still holds its
+        // own clone, so the engine memory outlives this teardown and
+        // use-after-free cannot occur. Double-free finds nothing and is
+        // the documented usage error.
+        let engine = match untrack_handle(handle) {
+            Some(engine) => engine,
+            None => return 6,
+        };
         let budget = engine.timeout;
         let stopped = engine
             .rt
@@ -341,21 +380,20 @@ pub unsafe extern "C" fn qcore_engine_start(
     err_out: *mut *mut QcoreError,
 ) -> c_int {
     unwind_guard(|| {
-        if let Err(code) = check_handle(handle, err_out) {
-            return code;
-        }
+        let engine = match check_handle(handle, err_out) {
+            Err(code) => return code,
+            Ok(engine) => engine,
+        };
         // SAFETY: `chain_expr` validity is the caller's Safety contract for this entry point.
         let expr = match unsafe { c_str(chain_expr) } {
             Err(e) => return fail(err_out, 6, e),
             Ok(s) => s,
         };
-        let engine = unsafe { &(*handle).engine };
-        let specs = match engine.parse_chain(&expr) {
+        let specs = match engine.engine.parse_chain(&expr) {
             Err(e) => return fail(err_out, 2, e.to_string()),
             Ok(s) => s,
         };
-        let rt = unsafe { &(*handle).rt };
-        match rt.block_on(engine.start(specs)) {
+        match engine.rt.block_on(engine.engine.start(specs)) {
             Err(r) => fail_report(err_out, &r),
             Ok(h) => ok_string(out_session_id, h.id.clone(), err_out),
         }
@@ -375,16 +413,16 @@ pub unsafe extern "C" fn qcore_engine_status_json(
     err_out: *mut *mut QcoreError,
 ) -> c_int {
     unwind_guard(|| {
-        if let Err(code) = check_handle(handle, err_out) {
-            return code;
-        }
+        let engine = match check_handle(handle, err_out) {
+            Err(code) => return code,
+            Ok(engine) => engine,
+        };
         // SAFETY: `session_id` validity is the caller's Safety contract for this entry point.
         let id = match unsafe { c_str(session_id) } {
             Err(e) => return fail(err_out, 6, e),
             Ok(s) => s,
         };
-        let engine = unsafe { &(*handle).engine };
-        match engine.session_report(&id) {
+        match engine.engine.session_report(&id) {
             None => fail(err_out, 3, format!("no such live session `{id}`")),
             Some(report) => ok_string(
                 out_json,
@@ -407,16 +445,15 @@ pub unsafe extern "C" fn qcore_engine_stop(
     err_out: *mut *mut QcoreError,
 ) -> c_int {
     unwind_guard(|| {
-        if let Err(code) = check_handle(handle, err_out) {
-            return code;
-        }
+        let e = match check_handle(handle, err_out) {
+            Err(code) => return code,
+            Ok(e) => e,
+        };
         // SAFETY: `session_id` validity is the caller's Safety contract for this entry point.
         let id = match unsafe { c_str(session_id) } {
             Err(e) => return fail(err_out, 6, e),
             Ok(s) => s,
         };
-        // SAFETY: `handle` is live (checked above).
-        let e = unsafe { &*handle };
         let budget = e.timeout;
         match e
             .rt
@@ -461,8 +498,10 @@ pub unsafe extern "C" fn qcore_scan(
         if out_json.is_null() {
             return fail(err_out, 6, "null out-param".to_string());
         }
-        // SAFETY: `handle` is live (checked above).
-        let e = unsafe { &*handle };
+        let e = match check_handle(handle, err_out) {
+            Err(code) => return code,
+            Ok(e) => e,
+        };
         let dirs = e.engine.config_dirs();
         let profile = match qcore_core::scan::load_profile(&dirs, &profile_name) {
             Err(msg) => return fail(err_out, 6, msg),
@@ -512,7 +551,10 @@ pub unsafe extern "C" fn qcore_import_config(
             Err(e) => return fail(err_out, 6, e),
             Ok(s) => s,
         };
-        let e = unsafe { &*handle };
+        let e = match check_handle(handle, err_out) {
+            Err(code) => return code,
+            Ok(e) => e,
+        };
         let imp = match qcore_core::config::import::ConfigImport::parse(std::path::Path::new(&path))
         {
             Err(msg) => return fail(err_out, 5, msg),
@@ -560,8 +602,10 @@ pub unsafe extern "C" fn qcore_export_config(
             Err(e) => return fail(err_out, 6, e),
             Ok(s) => s,
         };
-        // SAFETY: `handle` is live (checked above).
-        let e = unsafe { &*handle };
+        let e = match check_handle(handle, err_out) {
+            Err(code) => return code,
+            Ok(e) => e,
+        };
         let dirs = e.engine.config_dirs();
         let (stored, secrets) = match qcore_core::config::import::load_import(&dirs, &import_ref) {
             Err(msg) => return fail(err_out, 5, msg),
@@ -613,12 +657,59 @@ pub unsafe extern "C" fn qcore_error_free(err: *mut QcoreError) -> c_int {
     })
 }
 
+/// Thread-local last-error channel for JNI entry points that fail without a
+/// `QcoreError` out-param (e.g. `engineNew` returning handle 0). JNI has no
+/// `err_out` pointer, so named failures (interior NUL in a config, decode
+/// failures) park their message here; `qcore_take_last_error` drains it.
+/// The message is static-shaped (no secrets, never caller-supplied text).
+static LAST_ERROR: std::sync::Mutex<Option<CString>> = std::sync::Mutex::new(None);
+
+/// Park a named failure message for the JNI layer (see [`LAST_ERROR`]).
+/// Best effort: a poisoned/contended channel never panics the caller.
+pub(crate) fn set_last_error_jni(msg: &str) {
+    if let Ok(mut slot) = LAST_ERROR.lock() {
+        *slot = CString::new(msg).ok();
+    }
+}
+
+/// Drain the thread-local last-error message into `out`. Returns 0 with the
+/// message moved out, or 6 when there is nothing parked / the out-param is
+/// null. The caller frees the string with `qcore_string_free`.
+///
+/// # Safety
+/// `out` must be null or a writable pointer.
+#[no_mangle]
+pub unsafe extern "C" fn qcore_take_last_error(out: *mut *mut c_char) -> c_int {
+    unwind_guard(|| {
+        if out.is_null() {
+            return 6;
+        }
+        let taken = LAST_ERROR
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
+            .map(|c| c.into_raw());
+        match taken {
+            Some(s) => {
+                // SAFETY: `out` is non-null (checked above) and points to a
+                // writable caller pointer per the out-param contract.
+                *unsafe { &mut *out } = s;
+                0
+            }
+            None => 6,
+        }
+    })
+}
+
 // Compile-time proof that engine handles are thread-safe: C callers may
-// share a `QcoreEngine` across threads, so `Send + Sync` must hold.
+// share a `QcoreEngine` across threads, so `Send + Sync` must hold — and
+// with it `Arc<QcoreEngine>` (the registry's stored reference and every
+// in-flight clone), which is Send+Sync exactly when `QcoreEngine` is.
 #[allow(dead_code)]
 fn _assert_thread_safe() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<QcoreEngine>();
+    assert_send_sync::<std::sync::Arc<QcoreEngine>>();
 }
 
 /// Android JNI wrapper over this same C ABI (no Android-only core paths).
@@ -809,7 +900,7 @@ mod tests {
             unsafe { qcore_engine_new(cfg.as_ptr(), &mut out as *mut _, &mut err as *mut _) },
             0
         );
-        assert!(handle_is_live(out));
+        assert!(acquire_engine(out).is_some());
         assert_eq!(unsafe { qcore_engine_free(out) }, 0);
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -941,6 +1032,97 @@ mod tests {
             assert_eq!(unsafe { qcore_error_free(serr) }, 0);
         }
         assert_eq!(unsafe { qcore_engine_free(out) }, 0);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn free_during_call_is_safe() {
+        // Registry-level model of the flagged race: an in-flight call holds
+        // the strong ref it acquired under the registry lock while another
+        // thread frees the engine. Free releases the registry's ref, but the
+        // engine memory must stay alive and usable until the in-flight ref
+        // drops (the engine's call cannot be made to block deterministically
+        // in tests, so the clone-out proves the same invariant).
+        let base = std::env::temp_dir().join(format!("qcore-ffi-fdc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let cfg = serde_json::json!({
+            "config_dir": base.join("config").to_str().unwrap(),
+            "profile_dir": base.join("profiles").to_str().unwrap(),
+        })
+        .to_string();
+        let cfg = CString::new(cfg).unwrap();
+        let mut out: *mut QcoreEngine = std::ptr::null_mut();
+        let mut err: *mut QcoreError = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { qcore_engine_new(cfg.as_ptr(), &mut out as *mut _, &mut err as *mut _) },
+            0
+        );
+        let inflight = acquire_engine(out).expect("live handle acquires a strong ref");
+        assert_eq!(
+            std::sync::Arc::strong_count(&inflight),
+            2,
+            "registry + in-flight call own the engine"
+        );
+        assert_eq!(unsafe { qcore_engine_free(out) }, 0);
+        assert_eq!(
+            std::sync::Arc::strong_count(&inflight),
+            1,
+            "registry released its ref; the in-flight call still pins the engine"
+        );
+        assert!(
+            inflight.engine.parse_chain("mock").is_ok(),
+            "engine usable on the in-flight ref after free returned"
+        );
+        assert!(
+            acquire_engine(out).is_none(),
+            "freed handle is dead for new acquires"
+        );
+        let weak = std::sync::Arc::downgrade(&inflight);
+        drop(inflight);
+        assert!(weak.upgrade().is_none(), "engine dropped with the last ref");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn arc_strong_count_lifecycle() {
+        // Strong-count contract of the registry: new → registry owns one
+        // ref; free releases it; the last clone dropping drops the engine.
+        let base = std::env::temp_dir().join(format!("qcore-ffi-arc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let cfg = serde_json::json!({
+            "config_dir": base.join("config").to_str().unwrap(),
+            "profile_dir": base.join("profiles").to_str().unwrap(),
+        })
+        .to_string();
+        let cfg = CString::new(cfg).unwrap();
+        let mut out: *mut QcoreEngine = std::ptr::null_mut();
+        let mut err: *mut QcoreError = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { qcore_engine_new(cfg.as_ptr(), &mut out as *mut _, &mut err as *mut _) },
+            0
+        );
+        let clone = acquire_engine(out).expect("live handle acquires");
+        assert_eq!(
+            std::sync::Arc::strong_count(&clone),
+            2,
+            "registry + clone hold the engine"
+        );
+        assert_eq!(unsafe { qcore_engine_free(out) }, 0);
+        assert_eq!(
+            std::sync::Arc::strong_count(&clone),
+            1,
+            "free dropped the registry's ref"
+        );
+        assert!(
+            acquire_engine(out).is_none(),
+            "freed handle acquires nothing"
+        );
+        let weak = std::sync::Arc::downgrade(&clone);
+        drop(clone);
+        assert!(
+            weak.upgrade().is_none(),
+            "engine drops when the last strong ref drops"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 }

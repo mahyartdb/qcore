@@ -136,15 +136,72 @@ const AWG_KEYS: &[&str] = &[
     "i5",
 ];
 
+/// Hard cap on an imported config file, in bytes. WireGuard-family configs
+/// are a few KiB; a megabyte is generous headroom (the shipped fixtures are
+/// ~400 bytes). Enforced before `read_to_string` (metadata) and again on the
+/// actual text (a file can grow between stat and read, and pseudo-files
+/// report length 0).
+pub const MAX_IMPORT_BYTES: usize = 1024 * 1024;
+
+/// How many `[Peer]` sections are ever materialized. One is valid; the
+/// second exists only so the "multiple [Peer]" rejection has a section to
+/// name. Further sections are rejected at the header and never allocate a
+/// `BTreeMap`/`HashSet` pair, so a hostile 50-peer file stays O(1) peers.
+const MAX_PARSED_PEERS: usize = 2;
+
+/// Cap on collected rejection reasons and unknown-field names. A hostile
+/// file produces one diagnostic per line; the cap bounds the error path's
+/// memory. One extra slot holds the rolling `…and N more` marker.
+const MAX_COLLECTED_DIAGNOSTICS: usize = 20;
+
+/// The single `…and N more` line appended once the diagnostic cap is hit.
+fn truncation_marker(n: usize) -> String {
+    format!("…and {n} more")
+}
+
+fn truncation_count(marker: &str) -> Option<usize> {
+    marker
+        .strip_prefix("…and ")
+        .and_then(|s| s.strip_suffix(" more"))
+        .and_then(|s| s.parse::<usize>().ok())
+}
+
+/// Push a diagnostic under [`MAX_COLLECTED_DIAGNOSTICS`]: the first 20 are
+/// kept verbatim, then exactly one rolling `…and N more` marker occupies the
+/// slot past the cap and is updated in place (never a second marker).
+fn push_capped(out: &mut Vec<String>, item: String) {
+    if out.len() < MAX_COLLECTED_DIAGNOSTICS {
+        out.push(item);
+    } else if out.len() == MAX_COLLECTED_DIAGNOSTICS {
+        out.push(truncation_marker(1));
+    } else if let Some(marker) = out.last_mut() {
+        let n = truncation_count(marker.as_str()).expect("marker slot past the cap");
+        *marker = truncation_marker(n + 1);
+    }
+}
+
 impl ConfigImport {
     /// Parse a config file. `Err` is IO only; content problems are `Rejected`.
+    ///
+    /// A file over [`MAX_IMPORT_BYTES`] is a content rejection (callers map
+    /// `Rejected` to exit 5 / FFI code 5), checked from the metadata before
+    /// the read so a giant file is never loaded.
     pub fn parse(path: &Path) -> Result<Self, String> {
+        let mut imp = Self::empty(path);
+        if let Ok(meta) = std::fs::metadata(path) {
+            let len = usize::try_from(meta.len()).unwrap_or(usize::MAX);
+            if len > MAX_IMPORT_BYTES {
+                imp.reject(too_large_reason(&imp.path, len));
+                return Ok(imp);
+            }
+        }
         let raw = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
         Self::parse_str(&raw, path)
     }
 
-    /// Parse config text with `origin` used for the path/ref derivation.
-    pub fn parse_str(raw: &str, origin: &Path) -> Result<Self, String> {
+    /// Empty accepted shell (ref/path derived from `origin`), the base for
+    /// both the parse path and its early rejections.
+    fn empty(origin: &Path) -> Self {
         let origin = origin.to_path_buf();
         let ref_name = sanitize_ref(
             origin
@@ -152,7 +209,7 @@ impl ConfigImport {
                 .and_then(|s| s.to_str())
                 .unwrap_or("import"),
         );
-        let mut imp = ConfigImport {
+        ConfigImport {
             source_format: SourceFormat::Wireguard,
             path: origin,
             ref_name,
@@ -163,9 +220,24 @@ impl ConfigImport {
             unknown_fields: Vec::new(),
             verdict: ImportVerdict::Accepted,
             reasons: Vec::new(),
-        };
+        }
+    }
+
+    /// Parse config text with `origin` used for the path/ref derivation.
+    pub fn parse_str(raw: &str, origin: &Path) -> Result<Self, String> {
+        let mut imp = Self::empty(origin);
+        // Repeat the size gate on the actual bytes: metadata can under-report
+        // (pseudo-files) or be stale (file growing between stat and read).
+        if raw.len() > MAX_IMPORT_BYTES {
+            imp.reject(too_large_reason(&imp.path, raw.len()));
+            return Ok(imp);
+        }
         let mut section = String::new();
         let mut peer_index = 0usize;
+        // A third+ `[Peer]` header is rejected once and its body skipped, so
+        // the hostile-file cost stays at two section maps (see
+        // MAX_PARSED_PEERS).
+        let mut peer_overflow = false;
         let mut seen_iface = false;
         let mut raw_awg: BTreeMap<String, String> = BTreeMap::new();
         // Duplicate INI keys fail closed (never last-wins): canonical keys
@@ -180,6 +252,16 @@ impl ConfigImport {
             if line.starts_with('[') && line.ends_with(']') {
                 section = line[1..line.len() - 1].trim().to_lowercase();
                 if section == "peer" {
+                    if imp.peers.len() >= MAX_PARSED_PEERS {
+                        if !peer_overflow {
+                            peer_overflow = true;
+                            imp.reject(format!(
+                                "line {}: multiple [Peer] sections (expected exactly one)",
+                                lineno + 1
+                            ));
+                        }
+                        continue;
+                    }
                     imp.peers.push(BTreeMap::new());
                     seen_peer_keys.push(std::collections::HashSet::new());
                     peer_index = imp.peers.len() - 1;
@@ -242,7 +324,7 @@ impl ConfigImport {
                         continue;
                     }
                     if !IFACE_KEYS.contains(&key.as_str()) {
-                        imp.unknown_fields.push(k.to_string());
+                        push_capped(&mut imp.unknown_fields, k.to_string());
                         imp.reject(format!("unknown field `{k}` in [Interface]"));
                         continue;
                     }
@@ -266,6 +348,11 @@ impl ConfigImport {
                     }
                 }
                 "peer" => {
+                    if peer_overflow {
+                        // This section was rejected wholesale at its header;
+                        // its keys must not be attributed to a kept peer.
+                        continue;
+                    }
                     if imp.peers.is_empty() {
                         imp.reject(format!("line {}: key outside any [Peer]", lineno + 1));
                         continue;
@@ -278,7 +365,7 @@ impl ConfigImport {
                         continue;
                     }
                     if !PEER_KEYS.contains(&key.as_str()) {
-                        imp.unknown_fields.push(k.to_string());
+                        push_capped(&mut imp.unknown_fields, k.to_string());
                         imp.reject(format!("unknown field `{k}` in [Peer]"));
                         continue;
                     }
@@ -312,7 +399,7 @@ impl ConfigImport {
         if imp.peers.is_empty() && imp.verdict == ImportVerdict::Accepted {
             imp.reject("missing [Peer] section".to_string());
         }
-        if imp.peers.len() > 1 {
+        if imp.peers.len() > 1 && !peer_overflow {
             imp.reject("multiple [Peer] sections (expected exactly one)".to_string());
         }
         if !imp.secrets.contains_key("interface.private_key")
@@ -322,17 +409,22 @@ impl ConfigImport {
         }
         // Field-level validation (errors collected first: reject() takes
         // &mut while peers are borrowed, so no clone-the-vec workaround).
+        // Capped like every other diagnostic: one `AllowedIPs` line can carry
+        // an unbounded comma list inside the file-size budget.
         let mut field_errors = Vec::new();
         for (i, peer) in imp.peers.iter().enumerate() {
             if let Some(ep) = peer.get("endpoint") {
                 if let Err(e) = check_endpoint(ep) {
-                    field_errors.push(format!("peer {i} `Endpoint`: {e}"));
+                    push_capped(&mut field_errors, format!("peer {i} `Endpoint`: {e}"));
                 }
             }
             if let Some(aips) = peer.get("allowed_ips") {
                 for part in aips.split(',').map(str::trim) {
                     if let Err(e) = check_cidr(part) {
-                        field_errors.push(format!("peer {i} `AllowedIPs` entry `{part}`: {e}"));
+                        push_capped(
+                            &mut field_errors,
+                            format!("peer {i} `AllowedIPs` entry `{part}`: {e}"),
+                        );
                     }
                 }
             }
@@ -366,8 +458,17 @@ impl ConfigImport {
 
     fn reject(&mut self, reason: String) {
         self.verdict = ImportVerdict::Rejected;
-        self.reasons.push(reason);
+        push_capped(&mut self.reasons, reason);
     }
+}
+
+/// Named size-cap rejection: names the file and the cap (a plain "too large"
+/// leaves the operator guessing which limit tripped).
+fn too_large_reason(path: &Path, len: usize) -> String {
+    format!(
+        "config file `{}` is {len} bytes, over the {MAX_IMPORT_BYTES} byte import cap",
+        path.display()
+    )
 }
 
 fn check_cidr(entry: &str) -> Result<(), String> {
@@ -883,8 +984,30 @@ impl StoredImport {
     }
 }
 
+/// Escape a value for a TOML basic string. Backslash and quote are the
+/// obvious pair; control characters matter just as much: a raw `\t`/`\n`/`\r`
+/// inside a basic string makes the record unparseable, so an import would
+/// report success and the next connect would fail on a corrupt record.
+/// Named escapes where TOML has them (`\b \t \n \f \r`), `\u00XX` otherwise
+/// (U+0000–U+001F and U+007F are forbidden raw in basic strings).
 fn toml_escape(v: &str) -> String {
-    v.replace('\\', "\\\\").replace('"', "\\\"")
+    let mut out = String::with_capacity(v.len());
+    for c in v.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\u{08}' => out.push_str("\\b"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\u{0c}' => out.push_str("\\f"),
+            '\r' => out.push_str("\\r"),
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+                out.push_str(&format!("\\u{:04X}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// Load a stored import plus its secrets (in memory only).
@@ -918,6 +1041,24 @@ pub fn load_import(
         }
     }
     Ok((stored, secrets))
+}
+
+/// Newest verified wireguard-family winner honoring the hop family (`dual`
+/// accepts either; otherwise exact match). Reads only the per-transport
+/// winners cache (`scan::cache::read_winners`) — the legacy bare-string
+/// `last_known_good` is never consulted here: it carries no transport tag,
+/// so a masque/tor winner written there would poison wireguard hops with a
+/// foreign endpoint (cross-transport LKG poisoning). Winner keys are the
+/// scan-time transport names; wireguard-family scans record under
+/// `wireguard` / `warp` (see `scan::run_scan_request` call sites).
+fn wireguard_family_winner(dirs: &ProfileDirs, family: &str) -> Option<std::net::SocketAddr> {
+    const WG_FAMILY_KEYS: &[&str] = &["wireguard", "warp"];
+    crate::scan::cache::read_winners(dirs)
+        .into_iter()
+        .filter(|(k, _)| WG_FAMILY_KEYS.contains(&k.as_str()))
+        .filter(|(_, w)| family == "dual" || w.family == family)
+        .max_by_key(|(_, w)| w.verified_at_ms)
+        .and_then(|(_, w)| w.socket_addr())
 }
 
 /// Preflight check (T063 wiring): every wireguard `import=<ref>` in the
@@ -962,8 +1103,11 @@ pub fn check_refs(dirs: &ProfileDirs, hops: &[crate::config::HopSpec]) -> Result
 /// Materialize per-hop factory fields from stored imports (T063 wiring),
 /// with last-known-good endpoint fallback (US4 T068).
 /// Endpoint precedence: explicit chain `endpoint=` > import's `Endpoint` >
-/// cached verified endpoint (family-compatible). Secrets are hex-encoded in
-/// memory only and never touch disk.
+/// cached verified endpoint (family-compatible). The no-import fallback
+/// reads the *per-transport winners cache* scoped to wireguard-family keys
+/// — never the legacy bare-string `last_known_good`, which carries no
+/// transport tag and could name a masque/tor endpoint (cross-transport
+/// poisoning). Secrets are hex-encoded in memory only and never touch disk.
 pub fn materialize(
     dirs: &ProfileDirs,
     hops: &[crate::config::HopSpec],
@@ -979,17 +1123,11 @@ pub fn materialize(
             fields.push(("endpoint".into(), ep));
         }
         let Some(import_ref) = c.import_ref.clone() else {
-            // No import: fall back to the cached verified endpoint.
+            // No import: fall back to the cached verified endpoint of a
+            // wireguard-family winner (winners map, family-filtered).
             if fields.is_empty() {
-                if let Some(lkg) = crate::session::reconnect::last_known_good(dirs) {
-                    let compatible = match c.family.as_str() {
-                        "ipv4" => lkg.is_ipv4(),
-                        "ipv6" => lkg.is_ipv6(),
-                        _ => true,
-                    };
-                    if compatible {
-                        fields.push(("endpoint".into(), lkg.to_string()));
-                    }
+                if let Some(lkg) = wireguard_family_winner(dirs, &c.family) {
+                    fields.push(("endpoint".into(), lkg.to_string()));
                 }
             }
             if !fields.is_empty() {
@@ -1190,6 +1328,127 @@ mod tests {
     fn bad_key_rejected() {
         assert!(b64_decode_32("zz").is_err());
         assert!(b64_decode_32(&b64_encode(&[1u8; 31])).is_err());
+    }
+
+    fn lkg_dirs(tag: &str) -> ProfileDirs {
+        let dir = std::env::temp_dir().join(format!(
+            "qcore-import-lkg-{tag}-{}-{}",
+            std::process::id(),
+            nowish_ms()
+        ));
+        ProfileDirs::resolve(Some(dir.join("config")), Some(dir.join("profiles")))
+    }
+
+    fn cache_winner(dirs: &ProfileDirs, transport: &str, addr: &str, family: &str) {
+        crate::scan::cache::record_winner(
+            dirs,
+            transport,
+            crate::scan::cache::TransportWinner {
+                address: addr.to_string(),
+                profile: "balanced".to_string(),
+                verified_at_ms: crate::identity::model::now_ms(),
+                family: family.to_string(),
+            },
+        )
+        .expect("records winner");
+    }
+
+    fn wg_no_endpoint(id: &str) -> crate::config::HopSpec {
+        crate::config::HopSpec {
+            id: id.to_string(),
+            config: crate::config::HopConfig::Wireguard(crate::config::WireguardConfig {
+                peer: "imported".into(),
+                import_ref: None,
+                obfuscation: None,
+                family: "dual".into(),
+                endpoint: None,
+            }),
+        }
+    }
+
+    /// Cross-transport LKG poisoning: a masque-only winners map plus a
+    /// legacy `last_known_good` pointing at the masque address must NOT feed
+    /// that foreign endpoint into a wireguard hop — the legacy field has no
+    /// transport tag and is no longer read here. Without a wireguard-family
+    /// winner the hop falls back to the normal no-material path.
+    #[test]
+    fn materialize_never_feeds_a_foreign_lkg_into_wireguard() {
+        let dirs = lkg_dirs("poison");
+        dirs.ensure_dirs().expect("dirs");
+        cache_winner(&dirs, "masque", "10.9.8.7:443", "ipv4");
+        // Legacy bare-string LKG poisoned with the masque address (the old
+        // writer followed the newest winner of ANY transport).
+        std::fs::write(
+            dirs.endpoints_file(),
+            serde_json::json!({"last_known_good": "10.9.8.7:443"}).to_string(),
+        )
+        .expect("seeds legacy LKG");
+
+        let hops = vec![wg_no_endpoint("wg-0")];
+        let out = materialize(&dirs, &hops).expect("materializes");
+        assert!(
+            !out.contains_key("wg-0"),
+            "no wireguard-family winner → no endpoint material: {out:?}"
+        );
+        // Belt and braces: the legacy reader still returns the poisoned
+        // value, proving the guard is in materialize, not the cache.
+        assert_eq!(
+            crate::session::reconnect::last_known_good(&dirs),
+            Some("10.9.8.7:443".parse().unwrap()),
+            "legacy field is poisoned but untouched by materialize"
+        );
+        let _ = std::fs::remove_dir_all(dirs.config_dir.parent().unwrap());
+    }
+
+    /// Behavior preserved when only wireguard winners exist: the
+    /// family-compatible winner becomes the endpoint (same address the
+    /// legacy path used to supply).
+    #[test]
+    fn materialize_uses_wireguard_family_winner() {
+        let dirs = lkg_dirs("wg");
+        dirs.ensure_dirs().expect("dirs");
+        cache_winner(&dirs, "wireguard", "162.159.192.1:2408", "ipv4");
+
+        let hops = vec![wg_no_endpoint("wg-0")];
+        let out = materialize(&dirs, &hops).expect("materializes");
+        let fields = &out.get("wg-0").expect("endpoint material").fields;
+        let endpoint = fields
+            .iter()
+            .find(|(k, _)| k == "endpoint")
+            .map(|(_, v)| v.as_str())
+            .expect("endpoint present");
+        assert_eq!(endpoint, "162.159.192.1:2408");
+        let _ = std::fs::remove_dir_all(dirs.config_dir.parent().unwrap());
+    }
+
+    /// Family filtering: an ipv6-only wireguard winner is not fed to an
+    /// ipv4-scoped hop (`dual` accepts either).
+    #[test]
+    fn materialize_family_filters_the_winner() {
+        let dirs = lkg_dirs("family");
+        dirs.ensure_dirs().expect("dirs");
+        cache_winner(&dirs, "warp", "[2001:db8::1]:2408", "ipv6");
+
+        let mut v6 = wg_no_endpoint("wg-6");
+        if let crate::config::HopConfig::Wireguard(c) = &mut v6.config {
+            c.family = "ipv6".into();
+        }
+        let out = materialize(&dirs, &[v6]).expect("materializes");
+        let fields = &out.get("wg-6").expect("ipv6 winner matches").fields;
+        assert!(fields
+            .iter()
+            .any(|(k, v)| k == "endpoint" && v == "[2001:db8::1]:2408"));
+
+        let mut v4 = wg_no_endpoint("wg-4");
+        if let crate::config::HopConfig::Wireguard(c) = &mut v4.config {
+            c.family = "ipv4".into();
+        }
+        let out4 = materialize(&dirs, &[v4]).expect("materializes");
+        assert!(
+            !out4.contains_key("wg-4"),
+            "ipv6 winner is not family-compatible with an ipv4 hop"
+        );
+        let _ = std::fs::remove_dir_all(dirs.config_dir.parent().unwrap());
     }
 
     #[test]
@@ -1451,6 +1710,39 @@ mod tests {
             "names section: {:?}",
             imp.reasons
         );
+
+        // 50 [Peer] sections must not allocate 50 BTreeMap/HashSet pairs:
+        // the third header is rejected and its body skipped.
+        let mut many = format!("[Interface]\nPrivateKey = {priv_b64}\n");
+        for i in 0..50u32 {
+            many.push_str(&format!(
+                "\n[Peer]\nPublicKey = {pub_b64}\nEndpoint = 203.0.113.{}:{}\n",
+                (i % 250) + 1,
+                51820
+            ));
+        }
+        let imp = ConfigImport::parse_str(&many, std::path::Path::new("many.conf"))
+            .expect("verdict, not an error");
+        assert_eq!(imp.verdict, ImportVerdict::Rejected);
+        assert!(
+            imp.peers.len() <= MAX_PARSED_PEERS,
+            "peer maps materialized: {}",
+            imp.peers.len()
+        );
+        assert_eq!(
+            imp.reasons
+                .iter()
+                .filter(|r| r.contains("multiple [Peer]"))
+                .count(),
+            1,
+            "one rejection, not one per section: {:?}",
+            imp.reasons
+        );
+        assert!(
+            imp.reasons.len() <= MAX_COLLECTED_DIAGNOSTICS + 1,
+            "diagnostics stayed capped: {}",
+            imp.reasons.len()
+        );
     }
 
     #[test]
@@ -1588,5 +1880,158 @@ mod tests {
         let awg = imp.awg.expect("awg detected");
         assert_eq!(awg.i1.as_deref(), Some("foo#bar"));
         assert_eq!(awg.i2.as_deref(), Some("foo;bar"));
+    }
+
+    #[test]
+    fn oversized_file_rejected_naming_file_and_cap() {
+        // Unbounded accumulation: a multi-MiB file must die before parsing,
+        // naming the file and the byte cap (callers map Rejected to exit 5).
+        let dir = std::env::temp_dir().join(format!(
+            "qcore-import-big-{}-{}",
+            std::process::id(),
+            nowish_ms()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("oversized.conf");
+        let mut text = String::from("[Interface]\n");
+        text.push_str(&"x".repeat(MAX_IMPORT_BYTES));
+        std::fs::write(&path, &text).expect("writes oversized file");
+
+        let imp = ConfigImport::parse(&path).expect("verdict, not an IO error");
+        assert_eq!(imp.verdict, ImportVerdict::Rejected);
+        let reason = imp.reasons.first().expect("names the rejection");
+        assert!(
+            reason.contains("oversized.conf"),
+            "names the file: {reason}"
+        );
+        assert!(
+            reason.contains(&MAX_IMPORT_BYTES.to_string()),
+            "names the cap: {reason}"
+        );
+        assert!(
+            reason.contains("over the"),
+            "says the limit was exceeded: {reason}"
+        );
+
+        // The text-level gate is the same one (a growing file can slip past
+        // the metadata read).
+        let big = "x".repeat(MAX_IMPORT_BYTES + 1);
+        let imp = ConfigImport::parse_str(&big, std::path::Path::new("big.conf"))
+            .expect("verdict, not an error");
+        assert_eq!(imp.verdict, ImportVerdict::Rejected);
+        assert!(imp.reasons[0].contains("big.conf"), "{:?}", imp.reasons);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn many_peer_sections_are_capped_before_allocation() {
+        // 50 [Peer] sections must not allocate 50 BTreeMap/HashSet pairs:
+        // the third header is rejected and its body skipped.
+        let (priv_b64, pub_b64) = keys();
+        let mut text = format!("[Interface]\nPrivateKey = {priv_b64}\n");
+        for i in 0..50u32 {
+            text.push_str(&format!(
+                "\n[Peer]\nPublicKey = {pub_b64}\nEndpoint = 203.0.113.{}:{}\n",
+                (i % 250) + 1,
+                51820
+            ));
+        }
+        let imp = ConfigImport::parse_str(&text, std::path::Path::new("many.conf"))
+            .expect("verdict, not an error");
+        assert_eq!(imp.verdict, ImportVerdict::Rejected);
+        assert!(
+            imp.peers.len() <= MAX_PARSED_PEERS,
+            "peer maps materialized: {}",
+            imp.peers.len()
+        );
+        assert_eq!(
+            imp.reasons
+                .iter()
+                .filter(|r| r.contains("multiple [Peer]"))
+                .count(),
+            1,
+            "one rejection, not one per section: {:?}",
+            imp.reasons
+        );
+        assert!(
+            imp.reasons.len() <= MAX_COLLECTED_DIAGNOSTICS + 1,
+            "diagnostics stayed capped: {}",
+            imp.reasons.len()
+        );
+    }
+
+    #[test]
+    fn rejection_reasons_are_capped_with_one_more_marker() {
+        // 21 garbage lines produce 22 rejections (one `expected Key = Value`
+        // per line + end-of-parse `missing [Interface] section`): 20 kept
+        // verbatim, one rolling marker for the rest.
+        let text: String = (0..21).map(|i| format!("garbage-line-{i}\n")).collect();
+        let imp = ConfigImport::parse_str(&text, std::path::Path::new("many-bad.conf"))
+            .expect("verdict, not an error");
+        assert_eq!(imp.verdict, ImportVerdict::Rejected);
+        assert_eq!(imp.reasons.len(), MAX_COLLECTED_DIAGNOSTICS + 1);
+        assert_eq!(
+            imp.reasons[MAX_COLLECTED_DIAGNOSTICS],
+            truncation_marker(2),
+            "one marker line, rolling count: {:?}",
+            imp.reasons
+        );
+
+        // 30 lines → 31 rejections; the same marker slot updates in place.
+        let text: String = (0..30).map(|i| format!("garbage-line-{i}\n")).collect();
+        let imp = ConfigImport::parse_str(&text, std::path::Path::new("more-bad.conf"))
+            .expect("verdict, not an error");
+        assert_eq!(imp.reasons.len(), MAX_COLLECTED_DIAGNOSTICS + 1);
+        assert_eq!(
+            imp.reasons[MAX_COLLECTED_DIAGNOSTICS],
+            truncation_marker(11)
+        );
+
+        // Unknown-field names are capped by the same rule.
+        let mut text = String::from("[Interface]\n");
+        for i in 0..25 {
+            text.push_str(&format!("bogus{i} = 1\n"));
+        }
+        let imp = ConfigImport::parse_str(&text, std::path::Path::new("unknowns.conf"))
+            .expect("verdict, not an error");
+        assert_eq!(imp.verdict, ImportVerdict::Rejected);
+        assert_eq!(imp.unknown_fields.len(), MAX_COLLECTED_DIAGNOSTICS + 1);
+        assert_eq!(
+            imp.unknown_fields[MAX_COLLECTED_DIAGNOSTICS],
+            truncation_marker(5)
+        );
+        assert_eq!(imp.reasons.len(), MAX_COLLECTED_DIAGNOSTICS + 1);
+        assert_eq!(imp.reasons[MAX_COLLECTED_DIAGNOSTICS], truncation_marker(5));
+    }
+
+    #[test]
+    fn stored_record_round_trips_control_characters() {
+        // Import success followed by an unloadable record is a data-loss bug:
+        // control chars in a value must be escaped, not written raw into a
+        // TOML basic string.
+        let mut interface = BTreeMap::new();
+        interface.insert(
+            "dns".to_string(),
+            "1.1.1.1\t2.2.2.2\n3.3.3.3\r\u{7}\u{7f}\\\"end".to_string(),
+        );
+        let stored = StoredImport {
+            ref_name: "ctl".to_string(),
+            source_format: SourceFormat::Wireguard,
+            interface,
+            peers: Vec::new(),
+            awg: None,
+        };
+        let text = stored.to_toml();
+        assert!(text.contains("\\t"), "tab escaped: {text}");
+        assert!(text.contains("\\n"), "newline escaped: {text}");
+        assert!(text.contains("\\r"), "carriage return escaped: {text}");
+        assert!(text.contains("\\u0007"), "bell escaped: {text}");
+        assert!(text.contains("\\u007F"), "DEL escaped: {text}");
+        let back = StoredImport::from_toml(&text).expect("escaped record parses");
+        assert_eq!(
+            back.interface.get("dns"),
+            stored.interface.get("dns"),
+            "value survives the round-trip"
+        );
     }
 }

@@ -15,7 +15,7 @@ use qcore_core::api::{Engine, EngineConfig};
 use qcore_core::config::profile_dir::ProfileDirs;
 use qcore_core::session::control;
 use qcore_core::session::report::{self, ConnectionReport};
-use qcore_core::session::{reconnect, Session, SessionState, SessionStatus};
+use qcore_core::session::{reconnect, Session, SessionLock, SessionState, SessionStatus};
 
 #[derive(Parser)]
 #[command(
@@ -79,7 +79,10 @@ struct GlobalOpts {
 fn check_globals(cli: &Cli) -> Result<GlobalOpts, i32> {
     if let Some(d) = cli.max_depth {
         if !(1..=5).contains(&d) {
-            eprintln!("qcore: --max-depth {d} outside 1..=5 (hard limit 5)");
+            exit::diag_exit(
+                exit::USAGE,
+                &format!("--max-depth {d} outside 1..=5 (hard limit 5)"),
+            );
             return Err(exit::USAGE);
         }
     }
@@ -98,6 +101,62 @@ fn check_globals(cli: &Cli) -> Result<GlobalOpts, i32> {
 
 fn cli_dirs(cli: &Cli) -> ProfileDirs {
     ProfileDirs::resolve(cli.config.clone(), cli.profile_dir.clone())
+}
+
+/// Fail-safe bind policy (P1 hardening): `--bind` exposes an
+/// UNAUTHENTICATED SOCKS5 proxy through the tunnel, so a non-loopback
+/// listener is an open relay for the whole LAN unless the operator opted in
+/// with `--expose-lan`. Pure decision fn so the policy is unit-testable.
+fn bind_policy(addr: std::net::SocketAddr, expose_lan: bool) -> Result<(), &'static str> {
+    if addr.ip().is_loopback() || expose_lan {
+        return Ok(());
+    }
+    Err("refusing non-loopback --bind without --expose-lan")
+}
+
+/// The dirs a ConnectOpts carries (the double-start guard reads them before
+/// anything else runs).
+fn dirs_of(o: &ConnectOpts) -> &ProfileDirs {
+    &o.globals_dirs
+}
+
+/// Mirror of `config::import::wireguard_family_winner` (private to the
+/// core): only a cached *wireguard-family* winner may suppress discovery.
+/// The legacy bare `last_known_good` carries no transport tag and can name a
+/// masque/tor endpoint, so reading it here would skip discovery on a
+/// cross-transport poisoning.
+fn wireguard_family_winner_cached(dirs: &ProfileDirs, family: &str) -> bool {
+    const WG_FAMILY_KEYS: &[&str] = &["wireguard", "warp"];
+    qcore_core::scan::cache::read_winners(dirs)
+        .into_iter()
+        .filter(|(k, _)| WG_FAMILY_KEYS.contains(&k.as_str()))
+        .filter(|(_, w)| family == "dual" || w.family == family)
+        .max_by_key(|(_, w)| w.verified_at_ms)
+        .and_then(|(_, w)| w.socket_addr())
+        .is_some()
+}
+
+/// Double-start refusal: usage-class failure, emitted without touching
+/// control.json or session.json. With `--json`, stdout still carries exactly
+/// one failure document (the finish_connect_failure shape, reason included).
+/// `blocker` is the core gate's actionable reason (names the id + remedy).
+fn reject_already_running(json: bool, blocker: &str) -> i32 {
+    let msg = blocker.to_string();
+    exit::diag_exit(exit::USAGE, &msg);
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": false,
+                "layer": qcore_transport_api::FailureLayer::Config.to_string(),
+                "hop_id": "",
+                "kind": "usage",
+                "reason": msg,
+                "cause": msg,
+            })
+        );
+    }
+    exit::USAGE
 }
 
 #[derive(Subcommand)]
@@ -135,6 +194,12 @@ enum Commands {
         /// Local proxy listener through the exit hop (default 127.0.0.1:0).
         #[arg(long, num_args = 0..=1, default_missing_value = "127.0.0.1:0")]
         bind: Option<String>,
+        /// Opt in to a non-loopback --bind listener. The proxy is an
+        /// UNAUTHENTICATED SOCKS5 endpoint through the tunnel: a LAN bind
+        /// lets every reachable peer use your exit. Refused without this
+        /// flag (exit 6).
+        #[arg(long)]
+        expose_lan: bool,
         /// Disable endpoint discovery on connect (default on; scans once
         /// when the chain needs an endpoint and none is cached).
         #[arg(long)]
@@ -245,12 +310,35 @@ enum Commands {
 }
 
 fn main() {
+    #[cfg(windows)]
+    use_utf8_console();
     // Force linkage of every enabled transport so inventory registration
     // reaches the engine registry (static archives only link used objects).
     let _ = qcore_transports::linked_kinds();
     let cli = Cli::parse();
     let code = run(cli);
     std::process::exit(code);
+}
+
+/// Windows consoles default to the OEM code page, so UTF-8 results (JSON
+/// with non-ASCII names, text reports) arrive mojibake. Switch both the
+/// input and output code pages to UTF-8 at startup. No `windows-sys`
+/// dependency: these two kernel32 calls are stable ABI and failure (no
+/// console, e.g. a detached child) is harmless.
+#[cfg(windows)]
+fn use_utf8_console() {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn SetConsoleOutputCP(code_page: u32) -> i32;
+        fn SetConsoleCP(code_page: u32) -> i32;
+    }
+    const CP_UTF8: u32 = 65001;
+    // SAFETY: both calls only set this process's console state; a non-BOOL
+    // return just means no console is attached.
+    unsafe {
+        let _ = SetConsoleOutputCP(CP_UTF8);
+        let _ = SetConsoleCP(CP_UTF8);
+    }
 }
 
 fn run(cli: Cli) -> i32 {
@@ -306,7 +394,7 @@ async fn async_main(cli: Cli) -> i32 {
             ) {
                 Ok(i) => i,
                 Err((code, msg)) => {
-                    eprintln!("qcore: {msg}");
+                    exit::diag_exit(code, &msg);
                     return code;
                 }
             };
@@ -382,6 +470,7 @@ async fn async_main(cli: Cli) -> i32 {
             log_level,
             detach,
             bind,
+            expose_lan,
             child,
             no_scan,
             obfuscation,
@@ -401,6 +490,7 @@ async fn async_main(cli: Cli) -> i32 {
                 log_level,
                 detach,
                 bind,
+                expose_lan,
                 child,
                 scan: !no_scan,
                 obfuscation,
@@ -437,6 +527,8 @@ struct ConnectOpts {
     log_level: String,
     detach: bool,
     bind: Option<String>,
+    /// Explicit opt-in for a non-loopback `--bind` (see `bind_policy`).
+    expose_lan: bool,
     child: bool,
     /// Endpoint discovery on connect (scan once when needed).
     scan: bool,
@@ -470,8 +562,17 @@ async fn run_shortcut(
     let presets = match qcore_core::chain::preset::resolve_presets(&dirs) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("qcore: invalid chain (exit 2)\n  {e}");
-            return exit::INVALID;
+            // Shortcut dispatch runs before any chain input exists, so an
+            // unreadable/unparseable compositions.toml is an environment
+            // (config-read) failure, not an invalid authored chain. The
+            // documented table has no dedicated config-read class; usage
+            // (exit 6) is the agreed mapping — the operator must fix the
+            // file, the same remedy as any other refused invocation.
+            exit::diag_exit(
+                exit::USAGE,
+                &format!("cannot load composition presets: {e}"),
+            );
+            return exit::USAGE;
         }
     };
     let name = args.join(" ");
@@ -501,6 +602,10 @@ async fn run_shortcut(
                 log_level: "info".into(),
                 detach: false,
                 bind: None,
+                // Shortcuts never bind a LAN proxy; --expose-lan has no
+                // surface here (flags after a shortcut token are operands,
+                // exit 6 per grammar).
+                expose_lan: false,
                 child: false,
                 // Match `connect` default: discovery on unless --no-scan.
                 scan: true,
@@ -523,6 +628,9 @@ async fn run_shortcut(
             exit::USAGE
         }
         Err(cmd::shortcuts::ResolveFailure::Invalid(e)) => {
+            // This failure comes from authoring/validation of the expanded
+            // chain (depth cap, parse) — a genuine invalid-chain verdict
+            // (exit 2), not a config-read problem.
             eprintln!("qcore: invalid chain (exit 2)\n  {e}");
             exit::INVALID
         }
@@ -537,8 +645,9 @@ fn check_level(level: &str) -> Result<u8, i32> {
         "debug" => Ok(3),
         "trace" => Ok(4),
         _ => {
-            eprintln!(
-                "qcore: invalid --log-level `{level}` (expected error|warn|info|debug|trace)"
+            exit::diag_exit(
+                exit::USAGE,
+                &format!("invalid --log-level `{level}` (expected error|warn|info|debug|trace)"),
             );
             Err(exit::USAGE)
         }
@@ -546,6 +655,16 @@ fn check_level(level: &str) -> Result<u8, i32> {
 }
 
 async fn run_connect(o: ConnectOpts) -> i32 {
+    // Double-start guard (P1): consult the core start gate
+    // (`SessionStatus::assert_startable`, wave C2) BEFORE touching
+    // control.json or session.json — a Live-looking/Unverifiable record
+    // means another session may still own the control channel. The gate
+    // opens zero sockets; its actionable reason names the blocking id and
+    // the command that clears it.
+    if let Err(blocker) = SessionStatus::assert_startable(dirs_of(&o)) {
+        return reject_already_running(o.json, blocker.reason.as_str());
+    }
+
     // -v bumps the effective level when --log-level is at its default.
     let log_level = if o.globals_verbose > 0 && o.log_level == "info" {
         if o.globals_verbose > 1 {
@@ -572,22 +691,46 @@ async fn run_connect(o: ConnectOpts) -> i32 {
         Some(ref b) => match b.parse() {
             Ok(a) => Some(a),
             Err(_) => {
-                eprintln!("qcore: invalid --bind `{b}` (expected host:port)");
+                exit::diag_exit(
+                    exit::USAGE,
+                    &format!("invalid --bind `{b}` (expected host:port)"),
+                );
                 return exit::USAGE;
             }
         },
         None => None,
     };
+    // Non-loopback --bind is an unauthenticated open proxy on the LAN:
+    // refuse unless --expose-lan opted in (fail-safe default, exit 6).
+    if let Some(addr) = bind_addr {
+        if let Err(msg) = bind_policy(addr, o.expose_lan) {
+            exit::diag_exit(exit::USAGE, msg);
+            return exit::USAGE;
+        }
+    }
 
     // Detached parent: re-spawn self as the session process, wait for UP.
     if o.detach && !o.child {
-        return spawn_detached(o);
+        return spawn_detached(o).await;
     }
+
+    // Session ownership lock (H2.5): taken by the process that actually
+    // becomes the session (foreground connect or the detached CHILD, never
+    // the detach parent) before the first durable write, and held until the
+    // session stops. Closes the startup window where session.json does not
+    // exist yet but two connects could both pass `assert_startable`.
+    let session_lock = match SessionLock::acquire(&dirs) {
+        Ok(lock) => lock,
+        Err(e) => {
+            exit::diag_exit(exit::USAGE, &e);
+            return exit::USAGE;
+        }
+    };
 
     // Cold start (T048): identity first, then chain inputs (zero-config
     // default when nothing was given).
     if let Err(e) = reconnect::ensure_identity(&dirs) {
-        eprintln!("qcore: identity unavailable: {e}");
+        exit::diag_exit(exit::HOP_FAILURE, &format!("identity unavailable: {e}"));
         return exit::HOP_FAILURE;
     }
     let (mut specs, file_depth) = match o.shortcut_specs {
@@ -644,7 +787,7 @@ async fn run_connect(o: ConnectOpts) -> i32 {
     let starting_report = ConnectionReport::new(Vec::new(), STARTING_EXIT_MARKER);
     let shared_report = std::sync::Arc::new(tokio::sync::RwLock::new(starting_report));
     let (control_listener, token, early_rendezvous) = if o.child {
-        match bind_early_rendezvous(&dirs).await {
+        match bind_early_rendezvous(&dirs, &session_lock).await {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("qcore: {e}");
@@ -658,7 +801,9 @@ async fn run_connect(o: ConnectOpts) -> i32 {
     // Provider identities (002 FR-003/004/005): reuse healthy stored
     // identities, auto-register when none is stored, refresh-or-reregister
     // once on refusal, rotate in-window MASQUE credentials. Fail-closed
-    // (exit 2) when the provider is unreachable or refuses.
+    // (exit 3: contracts/cli.md §2 maps connect-side hop failures to hop
+    // failure, never to the invalid-chain code) when the provider is
+    // unreachable or refuses.
     let id_opts = qcore_core::identity::register::ProviderOptions {
         provider_base: qcore_core::identity::register::DEFAULT_PROVIDER_BASE.to_string(),
         timeout_secs: 20,
@@ -698,7 +843,7 @@ async fn run_connect(o: ConnectOpts) -> i32 {
     // the winner. Empty discovery is not fatal here — validation stays the
     // gate and fails closed (exit 2) when an endpoint is truly missing.
     let mut discovery_ran = false;
-    if o.scan && qcore_core::session::reconnect::last_known_good(&dirs).is_none() {
+    if o.scan && !wireguard_family_winner_cached(&dirs, &o.family) {
         let needs_discovery = specs.iter().any(|s| match s {
             qcore_core::chain::ExpandedHop::Preset(_) => true,
             qcore_core::chain::ExpandedHop::Hop(h) => {
@@ -770,6 +915,14 @@ async fn run_connect(o: ConnectOpts) -> i32 {
             return finish_connect_failure(o.json, fail, early_rendezvous, &dirs);
         }
     };
+    // The lock's authority is its token; the engine-assigned id is
+    // diagnostic (the next starter's blocker names it). A failed rewrite
+    // does not weaken the lock.
+    if let Err(e) = session_lock.attach_session_id(&handle.id) {
+        if !o.globals_quiet {
+            eprintln!("qcore: {e} (continuing)");
+        }
+    }
     let mut report = ConnectionReport::new(handle.hop_reports(), handle.exit_hop_id.clone());
     // Active profiles in the report (T068 scan / T073 obfuscation): the exit
     // hop's obfuscation, and the scan profile when discovery ran.
@@ -838,7 +991,7 @@ async fn run_connect(o: ConnectOpts) -> i32 {
     let _ = session.transition(SessionState::Up);
     if session.save(&dirs).is_err() {
         let _ = handle.stop_all().await;
-        eprintln!("qcore: cannot write session state");
+        exit::diag_exit(exit::HOP_FAILURE, "cannot write session state");
         return exit::HOP_FAILURE;
     }
     if let Some(path) = o.report_out.as_deref() {
@@ -859,7 +1012,7 @@ async fn run_connect(o: ConnectOpts) -> i32 {
             .map(|a| a.to_string())
             .unwrap_or_default();
         eprintln!(
-            "qcore: proxy listening on {bound} (exit {})",
+            "qcore: proxy listening on {bound} (via hop {})",
             handle.exit_hop_id
         );
         tokio::spawn(
@@ -889,8 +1042,15 @@ async fn run_connect(o: ConnectOpts) -> i32 {
     }
     let _ = handle.stop_all().await;
     session.state = SessionState::Stopped;
-    let _ = session.save(&dirs);
+    if let Err(e) = session.save(&dirs) {
+        // The tunnel is already down; a failed record write must not turn a
+        // successful stop into a failure (the next `status` re-probes and
+        // converges), but it must not be silent either.
+        eprintln!("qcore: session record save failed: {e} (exit 0)");
+    }
     control::remove_control_file(&dirs);
+    // Clean stop releases ownership only after the durable record landed.
+    drop(session_lock);
     exit::SUCCESS
 }
 
@@ -905,7 +1065,12 @@ const STARTING_EXIT_MARKER: &str = "<starting>";
 /// shared report.
 async fn bind_early_rendezvous(
     dirs: &ProfileDirs,
+    lock: &SessionLock,
 ) -> Result<(Option<tokio::net::TcpListener>, String, bool), String> {
+    // A child may only publish a rendezvous while it owns the session lock:
+    // if another process stole or replaced the lock, this child would be a
+    // second writer for the same control.json.
+    lock.assert_ours(dirs)?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .map_err(|e| format!("control channel unavailable: {e}"))?;
@@ -958,40 +1123,50 @@ fn finish_connect_failure(
 
 /// Detached parent (T046): spawn the session child, wait for UP on the
 /// control channel, then exit. The child owns hops + files from here on.
-fn spawn_detached(o: ConnectOpts) -> i32 {
+async fn spawn_detached(o: ConnectOpts) -> i32 {
     let exe = match std::env::current_exe() {
         Ok(e) => e,
         Err(e) => {
-            eprintln!("qcore: cannot re-spawn for --detach: {e}");
+            exit::diag_exit(
+                exit::HOP_FAILURE,
+                &format!("cannot re-spawn for --detach: {e}"),
+            );
             return exit::HOP_FAILURE;
         }
     };
     let dirs = o.globals_dirs.clone();
     let log_path = dirs.config_dir.join("detached.log");
     let _ = dirs.ensure_dirs();
+    // Unbounded-log cap (P3): the append-only detached log grows forever.
+    // Before reopening it in append mode, rotate a >10 MiB log to a
+    // pid-unique `detached.log.<pid>` (see `rotate_if_oversized`).
+    rotate_if_oversized(&log_path, 10 * 1024 * 1024);
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&log_path);
     let Ok(log_file) = log else {
-        eprintln!("qcore: cannot open log {}", log_path.display());
+        exit::diag_exit(
+            exit::HOP_FAILURE,
+            &format!("cannot open log {}", log_path.display()),
+        );
         return exit::HOP_FAILURE;
     };
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("connect").arg("--child");
-    if let Some(c) = o.shortcut_expr {
+    if let Some(ref c) = o.shortcut_expr {
         cmd.arg("--chain").arg(c);
     } else {
-        if let Some(c) = o.chain {
+        if let Some(ref c) = o.chain {
             cmd.arg("--chain").arg(c);
         }
-        if let Some(f) = o.chain_file {
+        if let Some(ref f) = o.chain_file {
             cmd.arg("--chain-file").arg(f);
         }
-        for h in o.hop {
+        for h in &o.hop {
             cmd.arg("--hop").arg(h);
         }
-        if let Some(f) = o.file {
+        if let Some(ref f) = o.file {
             cmd.arg(f);
         }
     }
@@ -1001,13 +1176,16 @@ fn spawn_detached(o: ConnectOpts) -> i32 {
         .arg(&o.prefer)
         .arg("--log-level")
         .arg(&o.log_level);
-    if let Some(b) = o.bind {
+    if let Some(ref b) = o.bind {
         cmd.arg("--bind").arg(b);
+    }
+    if o.expose_lan {
+        cmd.arg("--expose-lan");
     }
     if !o.scan {
         cmd.arg("--no-scan");
     }
-    if let Some(profile) = o.obfuscation {
+    if let Some(ref profile) = o.obfuscation {
         cmd.arg("--obfuscation").arg(profile);
     }
     // Detached child writes the report itself; forward so --detach keeps
@@ -1020,10 +1198,10 @@ fn spawn_detached(o: ConnectOpts) -> i32 {
         cmd.arg("--max-depth").arg(d.to_string());
     }
     cmd.arg("--timeout").arg(o.globals_timeout.to_string());
-    if let Some(c) = o.globals_config {
+    if let Some(ref c) = o.globals_config {
         cmd.arg("--config").arg(c);
     }
-    if let Some(p) = o.globals_profile_dir {
+    if let Some(ref p) = o.globals_profile_dir {
         cmd.arg("--profile-dir").arg(p);
     }
     if o.globals_quiet {
@@ -1041,21 +1219,42 @@ fn spawn_detached(o: ConnectOpts) -> i32 {
     let stdout_log = match log_file.try_clone() {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("qcore: cannot clone log {}: {e}", log_path.display());
+            exit::diag_exit(
+                exit::HOP_FAILURE,
+                &format!("cannot clone log {}: {e}", log_path.display()),
+            );
             return exit::HOP_FAILURE;
         }
     };
     cmd.stdout(stdout_log).stderr(log_file);
     #[cfg(windows)]
-    {
+    let spawn_res = {
         use std::os::windows::process::CommandExt;
-        // DETACHED_PROCESS | CREATE_NO_WINDOW: no console, outlives parent.
-        cmd.creation_flags(0x00000008 | 0x08000000);
-    }
-    let mut child = match cmd.spawn() {
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        // CREATE_BREAKAWAY_FROM_JOB: without it a child spawned from a job
+        // object (Windows Terminal, some shells/CI runners) is killed when
+        // the parent's job closes, so `--detach` would not outlive the
+        // invoking shell.
+        const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB);
+        match cmd.spawn() {
+            // ERROR_ACCESS_DENIED: the job does not permit breakaway (a
+            // documented fail mode). Retry without it: a child that outlives
+            // the shell until the job ends is still better than no detach.
+            Err(e) if e.raw_os_error() == Some(5) => {
+                cmd.creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW);
+                cmd.spawn()
+            }
+            other => other,
+        }
+    };
+    #[cfg(not(windows))]
+    let spawn_res = cmd.spawn();
+    let mut child = match spawn_res {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("qcore: detach spawn failed: {e}");
+            exit::diag_exit(exit::HOP_FAILURE, &format!("detach spawn failed: {e}"));
             return exit::HOP_FAILURE;
         }
     };
@@ -1081,47 +1280,87 @@ fn spawn_detached(o: ConnectOpts) -> i32 {
     let start = std::time::Instant::now();
     let mut last_progress = start;
     let mut final_report: Option<String> = None;
+    // Stale-rendezvous guard (P1): the parent may poll while the PREVIOUS
+    // session's control.json is still on disk (its port can even be held by
+    // an unrelated listener). Only a control.json that CHANGED after the
+    // spawn proves the child wrote its rendezvous; byte-identical files are
+    // ignored for liveness/UP purposes.
+    let control_snapshot = std::fs::read(control::control_file(&dirs)).ok();
     loop {
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                // Interrupted while waiting for UP: attempt exactly one STOP
+                // through the child's rendezvous, then make sure no
+                // half-started child is left behind and exit non-zero. The
+                // detach success line is never printed on this path.
+                if let Some(info) = control::read_control_file(&dirs) {
+                    let addr = std::net::SocketAddr::new(
+                        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                        info.port,
+                    );
+                    let _ = control::send_stop(addr, &info.token);
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+                clear_reaped_child_lock(&dirs, child.id());
+                exit::diag_exit(
+                    exit::HOP_FAILURE,
+                    "detach interrupted before the session reported UP",
+                );
+                detach_parent_failure(&o, "detach interrupted before the session reported UP");
+                return exit::HOP_FAILURE;
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+        }
         let mut saw_live_child = false;
-        if let Some(info) = control::read_control_file(&dirs) {
-            let addr = std::net::SocketAddr::new(
-                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-                info.port,
-            );
-            match control::query_status(addr, &info.token) {
-                Ok(doc) => {
-                    saw_live_child = true;
-                    last_progress = std::time::Instant::now();
-                    // UP = the live report shape (any real hop report, i.e.
-                    // not the starting marker). Keep the document for the
-                    // parent's own stdout emission.
-                    if doc.contains(STARTING_EXIT_MARKER) {
-                        // still starting: fall through to the alive checks
-                    } else {
-                        final_report = Some(doc);
+        let control_changed = std::fs::read(control::control_file(&dirs))
+            .ok()
+            .map(|cur| control_snapshot.as_deref() != Some(cur.as_slice()))
+            .unwrap_or(false);
+        if control_changed {
+            if let Some(info) = control::read_control_file(&dirs) {
+                let addr = std::net::SocketAddr::new(
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    info.port,
+                );
+                match control::query_status(addr, &info.token) {
+                    Ok(doc) => {
+                        saw_live_child = true;
+                        last_progress = std::time::Instant::now();
+                        // UP = the live report shape (any real hop report, i.e.
+                        // not the starting marker). Keep the document for the
+                        // parent's own stdout emission.
+                        if doc.contains(STARTING_EXIT_MARKER) {
+                            // still starting: fall through to the alive checks
+                        } else {
+                            final_report = Some(doc);
+                        }
                     }
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::ConnectionRefused
+                            || e.kind() == std::io::ErrorKind::TimedOut =>
+                    {
+                        // Rendezvous written but listener not accepting: the
+                        // process-alive check below decides.
+                    }
+                    Err(_) => {}
                 }
-                Err(e)
-                    if e.kind() == std::io::ErrorKind::ConnectionRefused
-                        || e.kind() == std::io::ErrorKind::TimedOut =>
-                {
-                    // No rendezvous yet or listener not accepting: the
-                    // process-alive check below decides.
-                }
-                Err(_) => {}
             }
         }
         if final_report.is_some() {
-            eprintln!("qcore: session detached (pid up)");
             break;
         }
         match child.try_wait() {
             Ok(Some(_)) => {
-                eprintln!(
-                    "qcore: detached child exited before UP (see {})",
-                    log_path.display()
+                clear_reaped_child_lock(&dirs, child.id());
+                exit::diag_exit(
+                    exit::HOP_FAILURE,
+                    &format!(
+                        "detached child exited before UP (see {})",
+                        log_path.display()
+                    ),
                 );
+                detach_parent_failure(&o, "detached child exited before UP");
                 return exit::HOP_FAILURE;
             }
             Ok(None) => saw_live_child = true,
@@ -1132,11 +1371,48 @@ fn spawn_detached(o: ConnectOpts) -> i32 {
         // of waiting forever.
         if start.elapsed() > poll_cap || (!saw_live_child && last_progress.elapsed() > base_budget)
         {
-            eprintln!("qcore: detached child did not report UP in time");
+            exit::diag_exit(
+                exit::HOP_FAILURE,
+                "detached child did not report UP in time",
+            );
             let _ = child.kill();
+            let _ = child.wait();
+            clear_reaped_child_lock(&dirs, child.id());
+            detach_parent_failure(&o, "detached child did not report UP in time");
             return exit::HOP_FAILURE;
         }
     }
+    // A single UP report only proves the child reached Up once. Re-probe
+    // ~1 s later so a child that dies immediately after UP is reported as a
+    // failure, not as a detached session the operator cannot use.
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    let still_live = control::read_control_file(&dirs).is_some_and(|info| {
+        let addr = std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            info.port,
+        );
+        control::query_status(addr, &info.token)
+            .map(|status| !status.contains(STARTING_EXIT_MARKER))
+            .unwrap_or(false)
+    });
+    if !still_live {
+        // A child that reached UP and then stopped answering is unusable and
+        // would hold the session lock: reap it before reporting failure so
+        // the next `connect` is not blocked by a session nobody can reach.
+        let _ = child.kill();
+        let _ = child.wait();
+        clear_reaped_child_lock(&dirs, child.id());
+        exit::diag_exit(
+            exit::HOP_FAILURE,
+            &format!(
+                "detached child stopped right after UP (see {})",
+                log_path.display()
+            ),
+        );
+        detach_parent_failure(&o, "detached child stopped right after UP");
+        return exit::HOP_FAILURE;
+    }
+    eprintln!("qcore: session detached (pid up)");
     // The parent observed UP: forward the child's report so `--json
     // connect --detach` still prints exactly one JSON document on stdout
     // (contract), and text mode gets the same report as foreground.
@@ -1149,6 +1425,62 @@ fn spawn_detached(o: ConnectOpts) -> i32 {
         eprintln!("qcore: session detached (report unavailable)");
     }
     exit::SUCCESS
+}
+
+/// Detach-parent failure: with `--json`, stdout must still carry exactly one
+/// result document (one-document asymmetry fix, P2). The child owns the
+/// report surface in every success path; on parent-side failure there is no
+/// child report, so the parent emits the failure shape itself.
+fn detach_parent_failure(o: &ConnectOpts, reason: &str) {
+    if o.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": false,
+                "layer": qcore_transport_api::FailureLayer::Sidecar.to_string(),
+                "hop_id": "",
+                "kind": "detach",
+                "cause": reason,
+            })
+        );
+    }
+}
+
+/// The session lock token starts with the owner pid (`<pid>-<nanos>-<n>`).
+/// After the parent kills or reaps a child it spawned, clearing that child's
+/// lock keeps the next `connect` from waiting out the 10-minute stale
+/// window. Ownership is proven by that pid prefix, so a live lock from a
+/// different process is never touched.
+fn clear_reaped_child_lock(dirs: &ProfileDirs, child_pid: u32) {
+    let path = qcore_core::session::session_lock_path(dirs);
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let owner = content
+        .lines()
+        .next()
+        .and_then(|token| token.split('-').next())
+        .and_then(|pid| pid.parse::<u32>().ok());
+    if owner == Some(child_pid) {
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// Rotate `detached.log` to a pid-unique `detached.log.<pid>` when it
+/// exceeds `cap` bytes, so the append-only detach log cannot grow unbounded
+/// and two detach parents racing never overwrite each other's copy. Best
+/// effort: rotation failure never blocks the detach itself (the append open
+/// below still succeeds or fails on its own).
+fn rotate_if_oversized(log_path: &std::path::Path, cap: u64) {
+    let oversized = std::fs::metadata(log_path)
+        .map(|m| m.len() > cap)
+        .unwrap_or(false);
+    if !oversized {
+        return;
+    }
+    let mut rotated = log_path.as_os_str().to_owned();
+    rotated.push(format!(".{}", std::process::id()));
+    let _ = std::fs::rename(log_path, std::path::PathBuf::from(rotated));
 }
 
 fn run_status(json: bool, dirs: &ProfileDirs) -> i32 {
@@ -1214,13 +1546,41 @@ fn run_stop(json: bool, dirs: &ProfileDirs) -> i32 {
                 control::remove_control_file(&dirs);
                 mark_stopped(&dirs);
             }
+            Err(e) if is_bad_token(&e) => {
+                // Explicit `ERR bad token` reply: the listener is NOT our
+                // session (stale control.json pointing at an unrelated
+                // process that took the port). That is proof-not-ours, not
+                // an unverifiable session. The core stop-probe (wave C2)
+                // owns the BadToken→Dead record convergence — call it so
+                // the records converge through the shared helper; it is
+                // idempotent with the local cleanup below (it may report a
+                // racing writer's Dead/NoRecord verdict; every conclusive
+                // verdict lands in the same clean-stop outcome).
+                let _ = SessionStatus::stop_probe(&dirs);
+                exit::diag_exit(
+                    exit::SUCCESS,
+                    "stale control file (listener rejected the token); session treated as stopped",
+                );
+                control::remove_control_file(&dirs);
+                mark_stopped(&dirs);
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({"state": "dead", "note": "stale control file; token rejected by listener"})
+                    );
+                }
+                return exit::SUCCESS;
+            }
             Err(e) => {
                 // A timeout or any other IO error is NOT proof of death:
                 // the session may be alive and passing traffic behind a
                 // wedged listener (500 ms connect / 2 s read budgets). Fail
                 // closed as unverifiable and leave control.json untouched
                 // so a retry (or a recovered process) can still answer.
-                eprintln!("qcore: session unverifiable — fail closed (exit 12): {e}");
+                exit::diag_exit(
+                    exit::UNVERIFIABLE,
+                    &format!("session unverifiable — fail closed: {e}"),
+                );
                 return exit::UNVERIFIABLE;
             }
         }
@@ -1257,6 +1617,11 @@ fn run_stop(json: bool, dirs: &ProfileDirs) -> i32 {
             exit::UNVERIFIABLE
         }
         SessionStatus::Live { .. } => {
+            // Unreachable by construction: every path that reaches
+            // SessionStatus::read here has already removed control.json
+            // (refused / bad-token convergence above), so `confirm` cannot
+            // observe a Live session — it sees NotRunning (no rendezvous)
+            // or Dead. Kept fail-closed (exit 12) as the defensive arm.
             if json {
                 println!("{}", serde_json::json!({"state": "live"}));
             } else {
@@ -1267,12 +1632,39 @@ fn run_stop(json: bool, dirs: &ProfileDirs) -> i32 {
     }
 }
 
+/// True when the control-channel error is an explicit `ERR bad token` reply.
+/// `rejection_error` (core control.rs) surfaces it as PermissionDenied with
+/// the fixed text `ERR bad token (listener rejected the token)`; the prefix
+/// match is the documented convergence contract (core `confirm`/`stop_probe`
+/// use the identical `starts_with("ERR bad token")` test). A hostile
+/// listener's own line never reaches this surface (fixed text, no peer
+/// bytes), so the prefix proves OUR channel classified a foreign listener;
+/// only an explicit reply proves it, a bare PermissionDenied-shaped timeout
+/// would not match.
+///
+/// `ControlInfo.pid` is deliberately NOT consulted for liveness here: a
+/// dependency-free Windows check (no `sysinfo`, no `OpenProcess`) would need
+/// either a heavy `tasklist` subprocess or undocumented PID-reuse heuristics,
+/// and pid reuse makes "pid alive" ≢ "our session alive" anyway. The
+/// token-authenticated control channel is the authoritative proof: an
+/// explicit `ERR bad token` is conclusive (ours always holds the token), so
+/// the convergence below needs no pid. The field stays reserved for future
+/// diagnostics-only display.
+fn is_bad_token(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::PermissionDenied && e.to_string().starts_with("ERR bad token")
+}
+
 /// Best-effort convergence: record the session Stopped when its control
-/// process is observably gone.
+/// process is observably gone. The stop contract is already satisfied at
+/// that point; a failed convergence leaves a stale-up record that the next
+/// `status` re-probes and converges, so it warns instead of failing a proven
+/// stop.
 fn mark_stopped(dirs: &ProfileDirs) {
     if let Ok(mut session) = Session::load(dirs) {
         session.state = SessionState::Stopped;
-        let _ = session.save(dirs);
+        if let Err(e) = session.save(dirs) {
+            eprintln!("qcore: session record convergence failed: {e} (exit 0)");
+        }
     }
 }
 
@@ -1343,6 +1735,7 @@ mod tests {
                 log_level: "info".to_string(),
                 detach: false,
                 bind: None,
+                expose_lan: false,
                 child: false,
                 no_scan: true,
                 obfuscation: None,
@@ -1350,6 +1743,68 @@ mod tests {
             false,
         );
         assert_eq!(async_main(cli).await, exit::USAGE);
+    }
+
+    #[test]
+    fn bind_policy_loopback_is_allowed() {
+        let a: std::net::SocketAddr = "127.0.0.1:1080".parse().unwrap();
+        assert!(bind_policy(a, false).is_ok(), "loopback needs no opt-in");
+        assert!(bind_policy(a, true).is_ok());
+    }
+
+    #[test]
+    fn bind_policy_non_loopback_requires_expose_lan() {
+        // The unauthenticated SOCKS listener must refuse LAN/wildcard binds
+        // unless --expose-lan opted in (open-proxy fail-safe default).
+        for addr in ["0.0.0.0:1080", "192.168.1.10:1080", "10.0.0.2:1080"] {
+            let a: std::net::SocketAddr = addr.parse().unwrap();
+            assert_eq!(
+                bind_policy(a, false).err(),
+                Some("refusing non-loopback --bind without --expose-lan"),
+                "{addr} refused without opt-in"
+            );
+            assert!(bind_policy(a, true).is_ok(), "{addr} allowed with opt-in");
+        }
+        // IPv6 loopback and unspecified: loopback allowed, unspecified
+        // (:: binds every interface) requires the opt-in like 0.0.0.0.
+        let v6_loopback: std::net::SocketAddr = "[::1]:1080".parse().unwrap();
+        assert!(bind_policy(v6_loopback, false).is_ok());
+        let v6_any: std::net::SocketAddr = "[::]:1080".parse().unwrap();
+        assert!(bind_policy(v6_any, false).is_err(), ":: is not loopback");
+        assert!(bind_policy(v6_any, true).is_ok());
+    }
+
+    #[test]
+    fn expose_lan_flag_parses_through_clap() {
+        let cli = parse_connect(&["--chain", "mock", "--bind", "0.0.0.0:1080", "--expose-lan"]);
+        match &cli.command {
+            Commands::Connect {
+                bind, expose_lan, ..
+            } => {
+                assert_eq!(bind.as_deref(), Some("0.0.0.0:1080"));
+                assert!(expose_lan, "--expose-lan parses");
+            }
+            _ => panic!("expected connect subcommand"),
+        }
+    }
+
+    #[test]
+    fn rotate_if_oversized_moves_oversized_log() {
+        let dir = std::env::temp_dir().join(format!("qcore-rot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("detached.log");
+        std::fs::write(&log, vec![b'x'; 4096]).unwrap();
+        rotate_if_oversized(&log, 1024);
+        assert!(!log.exists(), "oversized log renamed away");
+        let rotated = dir.join(format!("detached.log.{}", std::process::id()));
+        assert_eq!(std::fs::metadata(&rotated).unwrap().len(), 4096);
+        // Under-cap logs stay in place.
+        std::fs::write(&log, b"small").unwrap();
+        rotate_if_oversized(&log, 1024);
+        assert!(log.exists(), "under-cap log untouched");
+        assert_eq!(std::fs::metadata(&log).unwrap().len(), 5);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

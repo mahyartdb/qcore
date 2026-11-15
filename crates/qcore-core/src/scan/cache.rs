@@ -2,17 +2,16 @@
 //! `EndpointCacheEntry`).
 //!
 //! `endpoints.json` gains a `winners` map (transport → winner) beside the
-//! legacy top-level `last_known_good`, which is kept updated for the
-//! pre-002 reader (`reconnect::last_known_good`). Rule: a cached winner is
-//! re-verified (fast TCP path) before use; failure evicts that transport's
-//! entry and the caller runs a full scan (FR-008) — but only when the probe
-//! could actually speak the transport's carrier language (see
-//! `tcp_probeable`): the data-plane probe is TCP-only, so a TCP refusal
-//! proves nothing about a UDP-carried endpoint, and such winners miss
-//! WITHOUT eviction. Every read-modify-write + fs operation reachable from
-//! async contexts is wrapped in `tokio::task::spawn_blocking` at the async
-//! call sites; the std mutex below is only ever held inside blocking
-//! closures (it never blocks an executor thread).
+//! legacy top-level `last_known_good`. Rule: a cached winner is re-verified
+//! (fast probe path) before use; failure evicts that transport's entry and
+//! the caller runs a full scan (FR-008) — but only when the probe speaks the
+//! language the transport *declared* for its endpoint
+//! ([`qcore_transport_api::EndpointProbe`], default none): an undeclared
+//! endpoint proves nothing under any probe, so such winners miss WITHOUT
+//! eviction (review wave C1). Every read-modify-write + fs operation
+//! reachable from async contexts is wrapped in `tokio::task::spawn_blocking`
+//! at the async call sites; the std mutex below is only ever held inside
+//! blocking closures (it never blocks an executor thread).
 
 use crate::config::profile_dir::ProfileDirs;
 use crate::identity::model::now_ms;
@@ -24,7 +23,7 @@ use std::time::Duration;
 
 /// One cached winner. `address` is text (`ip:port`) so the file stays
 /// hand-inspectable; unparseable entries read as absent.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransportWinner {
     pub address: String,
     pub profile: String,
@@ -76,7 +75,7 @@ fn write_file(dirs: &ProfileDirs, file: &CacheFile) -> Result<(), String> {
     let path = dirs.endpoints_file();
     let tmp = path.with_file_name(format!(".endpoints.{}.tmp", std::process::id()));
     std::fs::write(&tmp, body).map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())
+    crate::session::control::rename_with_retry(&tmp, &path).map_err(|e| e.to_string())
 }
 
 /// All cached winners (tolerant: missing/corrupt file → empty, never fatal).
@@ -93,22 +92,42 @@ pub async fn read_winners_async(dirs: &ProfileDirs) -> BTreeMap<String, Transpor
         .unwrap_or_default()
 }
 
-/// True when a TCP connect+echo probe can meaningfully verify an endpoint of
-/// this transport: the probe opens a TCP stream to the endpoint, so the
-/// transport must terminate a TCP carrier at that address. Only the
-/// registry descriptor decides (no kind matching — FR-006); an unregistered
-/// or unknown transport is not TCP-probeable (fail closed: no eviction on
-/// a probe that cannot work).
+/// The endpoint-probe contract a transport declares for its endpoint
+/// address (review wave C1): `TcpEcho` only when the endpoint really
+/// terminates a TCP stream. Undeclared (`None`) and unregistered kinds are
+/// not probeable (fail closed: no endpoint sockets opened, no eviction on a
+/// probe that cannot work). This reads the registry *contract*, not
+/// `accepts_tcp_carrier` — that capability is a nesting property (hop data
+/// plane rides TCP) and says nothing about the endpoint's protocol; the old
+/// derivation probed WireGuard's UDP endpoints over TCP and always failed.
 fn tcp_probeable(transport: &str) -> bool {
-    let Some(desc) = TransportRegistry::global().get(transport) else {
+    let Some(factory) = TransportRegistry::global().factory(transport) else {
         return false;
     };
-    desc.capabilities.accepts_tcp_carrier
+    factory.endpoint_probe() == qcore_transport_api::EndpointProbe::TcpEcho
+}
+
+/// Legacy top-level `last_known_good` consumers (`reconnect`, import
+/// materialize, discovery gate) resolve *wireguard-family* endpoints, so
+/// only wireguard/warp winners may update it (review wave C1): a
+/// non-wireguard winner written into the legacy field poisons every
+/// wireguard reader with a foreign endpoint (cross-transport winner
+/// poisoning). The per-transport `winners` map stays the source of truth
+/// for all transports.
+const LEGACY_LKG_FAMILIES: &[&str] = &["wireguard", "warp"];
+
+/// True when `transport`'s winner may update the legacy top-level
+/// `last_known_good` field. Pub-crate visibility: the pipeline's
+/// `persist_verified` applies the same scoping to its legacy write.
+pub(crate) fn feeds_legacy_lkg(transport: &str) -> bool {
+    LEGACY_LKG_FAMILIES.contains(&transport)
 }
 
 /// Record a transport's winner, preserving other transports. The legacy
-/// top-level `last_known_good` follows the newest winner for old readers.
-/// Serialized against concurrent same-process writers (see `CACHE_LOCK`).
+/// top-level `last_known_good` follows only wireguard-family winners (see
+/// [`feeds_legacy_lkg`]); every transport's winner lands in the winners
+/// map regardless. Serialized against concurrent same-process writers (see
+/// `CACHE_LOCK`).
 pub fn record_winner(
     dirs: &ProfileDirs,
     transport: &str,
@@ -116,7 +135,9 @@ pub fn record_winner(
 ) -> Result<(), String> {
     let _guard = lock_cache();
     let mut file = read_file(dirs);
-    file.last_known_good = Some(winner.address.clone());
+    if feeds_legacy_lkg(transport) {
+        file.last_known_good = Some(winner.address.clone());
+    }
     file.winners.insert(transport.to_string(), winner);
     write_file(dirs, &file)
 }
@@ -132,13 +153,15 @@ pub fn persist_last_known_good(dirs: &ProfileDirs, addr: SocketAddr) -> Result<(
     write_file(dirs, &file)
 }
 
-/// Fast path: TCP re-verify the cached winner for `transport`+`family`.
-/// Hit returns the address plus connect latency; a mismatched family misses
-/// WITHOUT evicting (the entry belongs to another family's scan, which never
-/// probed it), and so does a non-TCP-probeable transport's winner: the
-/// data-plane probe is TCP-only, so a TCP refusal proves nothing about a
-/// UDP-carried endpoint and must not destroy it (see module docs; UDP
-/// transports are verified by successful session bring-up). Winners were
+/// Fast path: re-verify the cached winner for `transport`+`family` in the
+/// language its endpoint contract declares (TCP echo today). Hit returns the
+/// address plus connect latency; a mismatched family misses WITHOUT evicting
+/// (the entry belongs to another family's scan, which never probed it).
+/// A non-probeable transport's winner skips the fast path entirely — no
+/// probe attempt, no eviction, the verdict stays as cached (review wave C1:
+/// an undeclared endpoint cannot be re-verified by any probe this scanner
+/// can speak, so a refusal or timeout proves nothing; such endpoints are
+/// verified by successful session bring-up instead). Winners were
 /// traffic-verified when recorded; the re-verify is a reachability
 /// confirmation, not a re-proof.
 pub async fn verify_winner_first(
@@ -147,17 +170,20 @@ pub async fn verify_winner_first(
     family: &str,
     timeout: Duration,
 ) -> Option<(SocketAddr, u64)> {
+    // Non-probeable kinds: skip the fast path before touching the cache or
+    // opening any socket (review wave C1) — no probe attempt, no eviction.
+    if !tcp_probeable(transport) {
+        return None;
+    }
     let winner = read_winners_async(dirs).await.get(transport)?.clone();
     if family != "dual" && winner.family != family {
         return None;
     }
     let addr = winner.socket_addr()?;
-    if !tcp_probeable(transport) {
-        return None;
-    }
     let t0 = std::time::Instant::now();
     // Any unsuccessful re-verify (refused, timeout, reset) evicts: a winner
-    // that does not answer quickly is not a fast path.
+    // that does not answer quickly is not a fast path. Reachable only for
+    // contract-declared probeable kinds.
     let ok = tokio::time::timeout(timeout, tokio::net::TcpStream::connect(addr))
         .await
         .map(|r| r.is_ok())
@@ -184,10 +210,11 @@ fn evict_winner(dirs: &ProfileDirs, transport: &str) {
 /// empty scan, preserving siblings — and preserving any winner whose family
 /// the scan never probed: `family` is the scan's scope; a winner of a
 /// different family only gets evicted by a `"dual"` scan (which probes both
-/// families). The legacy `last_known_good` follows a remaining winner when
-/// one exists (so reconnect keeps working); it is cleared only when no
-/// winners remain. Deletes the file when fully empty (legacy-only stale
-/// files included).
+/// families). The legacy `last_known_good` follows a remaining
+/// wireguard-family winner when one exists (so reconnect keeps working; a
+/// non-wireguard winner never feeds it — review wave C1); it is cleared when
+/// no legacy-feeder winners remain. Deletes the file when fully empty
+/// (legacy-only stale files included).
 pub fn evict_stale_transport(
     dirs: &ProfileDirs,
     transport: &str,
@@ -211,9 +238,14 @@ pub fn evict_stale_transport(
         .values()
         .any(|w| Some(&w.address) == file.last_known_good.as_ref())
     {
-        if let Some((_, w)) = file.winners.first_key_value() {
-            file.last_known_good = Some(w.address.clone());
-        }
+        // Repair the legacy field from a wireguard-family winner when one
+        // exists (review wave C1 scoping); non-wireguard winners never feed
+        // it (see `feeds_legacy_lkg`).
+        file.last_known_good = file
+            .winners
+            .iter()
+            .find(|(k, _)| feeds_legacy_lkg(k))
+            .map(|(_, w)| w.address.clone());
     }
     if file.winners.is_empty() && file.last_known_good.is_none() {
         let path = dirs.endpoints_file();
@@ -309,10 +341,11 @@ mod tests {
         let map = read_winners(&d);
         assert_eq!(map.len(), 2);
         assert_eq!(map["warp"].address, "127.0.0.1:2408");
-        // Legacy reader still sees the newest winner.
+        // Legacy reader keeps the wireguard-family winner (FIX 2, wave C1):
+        // a masque record must not overwrite it.
         assert_eq!(
             crate::session::reconnect::last_known_good(&d),
-            Some("127.0.0.1:443".parse().unwrap())
+            Some("127.0.0.1:2408".parse().unwrap())
         );
         let _ = std::fs::remove_dir_all(&d.config_dir);
     }
@@ -430,7 +463,10 @@ mod tests {
             "async LKG persist reaches the legacy reader"
         );
         // Family-scoped eviction keeps the sibling-family winner (FIX 1),
-        // dual evicts (async path).
+        // dual evicts (async path). Wave C1 scoping: the only remaining
+        // winner is `masque` (non-wireguard family), so the legacy field
+        // stays cleared — read the file directly instead of asserting
+        // through `reconnect::last_known_good`.
         evict_stale_transport_async(&d, "warp", "ipv6")
             .await
             .expect("async evict");
@@ -442,6 +478,95 @@ mod tests {
             .await
             .expect("async evict");
         assert!(!read_winners(&d).contains_key("warp"), "dual scan evicted");
+        let raw = std::fs::read_to_string(d.endpoints_file()).unwrap();
+        assert!(
+            !raw.contains("2408"),
+            "non-wireguard survivor never feeds the legacy field: {raw}"
+        );
+        let _ = std::fs::remove_dir_all(&d.config_dir);
+    }
+
+    /// FIX 2 (review wave C1): a non-wireguard-family winner must not
+    /// overwrite the legacy top-level `last_known_good` — every legacy
+    /// reader (`reconnect`, import materialize, discovery gate) resolves a
+    /// *wireguard* endpoint, so a masque winner there poisons wireguard
+    /// with a foreign address. The winners map keeps both entries.
+    #[test]
+    fn non_wireguard_winner_never_overwrites_legacy_lkg() {
+        let d = dirs("lkg-poison");
+        record_winner(&d, "warp", winner("127.0.0.1:2408")).unwrap();
+        let poisoned = TransportWinner {
+            family: "ipv4".to_string(),
+            ..winner("10.9.8.7:443")
+        };
+        record_winner(&d, "masque", poisoned).unwrap();
+        let map = read_winners(&d);
+        assert_eq!(map["masque"].address, "10.9.8.7:443", "winner recorded");
+        assert_eq!(
+            crate::session::reconnect::last_known_good(&d),
+            Some("127.0.0.1:2408".parse().unwrap()),
+            "legacy LKG stays the wireguard-family winner"
+        );
+        // Pre-existing poisoning is not repaired retroactively by
+        // `record_winner` — only new wireguard winners overwrite it — so
+        // also assert a fresh wireguard record reclaims the field.
+        record_winner(&d, "warp", winner("127.0.0.1:2409")).unwrap();
+        assert_eq!(
+            crate::session::reconnect::last_known_good(&d),
+            Some("127.0.0.1:2409".parse().unwrap()),
+            "wireguard winner updates the legacy field"
+        );
+        let _ = std::fs::remove_dir_all(&d.config_dir);
+    }
+
+    /// FIX 2 (review wave C1): when the last legacy-feeder winner is
+    /// evicted, the legacy field clears (no silent reuse of the dead
+    /// address); a remaining non-wireguard winner never repairs it.
+    #[test]
+    fn lkg_repair_after_eviction_scopes_to_wireguard_family() {
+        let d = dirs("lkg-repair");
+        record_winner(&d, "warp", winner("127.0.0.1:2408")).unwrap();
+        record_winner(&d, "masque", winner("10.9.8.7:443")).unwrap();
+        evict_stale_transport(&d, "warp", "dual").unwrap();
+        let map = read_winners(&d);
+        assert!(!map.contains_key("warp"), "warp evicted: {map:?}");
+        assert_eq!(
+            map.get("masque").map(|w| w.address.as_str()),
+            Some("10.9.8.7:443"),
+            "sibling winner survives: {map:?}"
+        );
+        assert!(
+            !crate::session::reconnect::last_known_good(&d)
+                .is_some_and(|a| a.to_string() == "127.0.0.1:2408"),
+            "stale warp address never survives eviction"
+        );
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(d.endpoints_file()).unwrap()).unwrap();
+        assert!(
+            raw.get("last_known_good").unwrap().is_null(),
+            "no legacy-feeder winner left: legacy field clears, never repairs from masque: {raw}"
+        );
+        let _ = std::fs::remove_dir_all(&d.config_dir);
+    }
+
+    /// FIX 1 (review wave C1): the fast-path skip for a non-probeable kind
+    /// happens before any cache read or probe attempt — a registered
+    /// UDP-endpoint transport (wireguard declares no endpoint contract;
+    /// its real endpoints are UDP) keeps its winner byte-identical across a
+    /// `verify_winner_first` call.
+    #[tokio::test]
+    async fn registered_udp_endpoint_winner_skips_fast_path_untouched() {
+        let d = dirs("wg-skip");
+        let w = winner("127.0.0.1:2408");
+        record_winner(&d, "wireguard", w.clone()).unwrap();
+        let before = read_winners(&d)["wireguard"].clone();
+        let hit = verify_winner_first(&d, "wireguard", "ipv4", Duration::from_secs(2)).await;
+        assert!(hit.is_none(), "non-probeable winner never fast-path-hits");
+        assert_eq!(
+            read_winners(&d)["wireguard"],
+            before,
+            "winner untouched: no probe attempt, no eviction, no touch"
+        );
         let _ = std::fs::remove_dir_all(&d.config_dir);
     }
 }

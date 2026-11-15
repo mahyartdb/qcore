@@ -25,9 +25,19 @@ fn every_registered_kind_has_canonical_spec() {
 fn canonical_specs_preflight_clean() {
     let _ = qcore_transports::linked_kinds();
     let engine = Engine::new(EngineConfig::default());
+    // The old body silently `continue`d over unregistered kinds, so a
+    // registry GC / factory miss could run zero assertions and still pass.
+    // Inverted: every canonical spec whose factory IS linked must preflight
+    // clean, >0 must run, and the set that ran must include the default
+    // transports. A kind that is NOT linked (tor under default features —
+    // covered feature-gated by tor_preflight.rs) is a counted skip, never a
+    // silent one: this binary links all six via tests-conformance's direct
+    // deps, so the skip list is normally empty here.
+    let mut ran: Vec<&str> = Vec::new();
+    let mut skipped: Vec<&str> = Vec::new();
     for (kind, line) in canonical_specs() {
-        // Skip kinds whose test doubles are not linked into this binary.
         if TransportRegistry::global().get(kind).is_none() {
+            skipped.push(kind);
             continue;
         }
         match engine.preflight(parse_canonical(line)) {
@@ -38,7 +48,28 @@ fn canonical_specs_preflight_clean() {
                 panic!("canonical spec for `{kind}` rejected: {e}")
             }
         }
+        ran.push(kind);
     }
+    for expected in ["mock", "wireguard", "masque", "relay", "psiphon"] {
+        assert!(
+            ran.contains(&expected),
+            "`{expected}` canonical spec never preflighted (ran: {ran:?}, \
+             skipped: {skipped:?}) — the matrix gate silently degraded"
+        );
+    }
+    assert!(
+        !ran.is_empty(),
+        "canonical-spec preflight ran zero assertions"
+    );
+    // A skip is only legitimate for kinds whose feature is off; everything
+    // else in the canonical table must have preflighted. When tor's feature
+    // lands (FFI builds, CI), it preflights here too.
+    assert!(
+        skipped
+            .iter()
+            .all(|k| canonical_specs().iter().any(|(kind, _)| kind == k)),
+        "skipped kinds must come from the canonical table: {skipped:?}"
+    );
 }
 
 #[test]

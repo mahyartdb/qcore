@@ -23,6 +23,38 @@ pub struct Capabilities {
     pub dials_udp: bool,
 }
 
+/// Endpoint-probe contract (review wave C1): what the endpoint scanner is
+/// allowed to assume about a hop's *endpoint address* — the address scan
+/// probes and the winner cache re-verifies.
+///
+/// This is deliberately separate from [`Capabilities`]: `accepts_tcp_carrier`
+/// describes the hop's data plane (what carrier the tunnel rides), which is a
+/// nesting property. WireGuard/MASQUE accept a TCP carrier on some hops while
+/// their endpoints speak UDP/QUIC only, so the endpoint probe contract cannot
+/// be derived from it — assuming it there made `qcore scan --transport warp`
+/// TCP-probe UDP ports and always report empty (exit 4).
+///
+/// Default (undeclared) is no endpoint probe: the scanner has no protocol
+/// assumption it may open sockets with, so endpoints are reported unverified
+/// (handshake-tier honesty) and cached winners are never evicted on probe
+/// failure. Declaring [`EndpointProbe::TcpEcho`] opts a transport into the
+/// connect+nonce-echo sieve at its endpoint address (loopback/test doubles,
+/// and any transport whose endpoint really terminates a TCP stream).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndpointProbe {
+    /// No declared endpoint protocol: the scanner opens no endpoint sockets.
+    None,
+    /// The endpoint terminates a TCP stream and echoes bytes back (the
+    /// scan.toml data-plane probe's exact language).
+    TcpEcho,
+}
+
+/// The undeclared default: `EndpointProbe::None` without naming it at every
+/// declaration site. Descriptors opt in with `endpoint_probe()` returning
+/// something else; until then scan stays conservative for every transport,
+/// including ones compiled before this field existed.
+const UNDECLARED_ENDPOINT_PROBE: EndpointProbe = EndpointProbe::None;
+
 /// Obfuscation family. Source of truth for profile compatibility (FR-021).
 ///
 /// Version window (map #7): hardening this enum (`#[non_exhaustive]` or a
@@ -139,6 +171,14 @@ pub trait RunningHop: Send + Sync {
 #[async_trait::async_trait]
 pub trait HopFactory: Send + Sync + std::panic::RefUnwindSafe {
     fn descriptor(&self) -> &'static TransportDescriptor;
+    /// Endpoint-probe contract for scan (see [`EndpointProbe`]). Defaulted
+    /// (never breaking): undeclared transports get `EndpointProbe::None`, so
+    /// the scanner probes nothing at their endpoints and verdicts stay
+    /// honest. Declare `TcpEcho` only when the endpoint address really
+    /// terminates a TCP stream (loopback test doubles do).
+    fn endpoint_probe(&self) -> EndpointProbe {
+        UNDECLARED_ENDPOINT_PROBE
+    }
     async fn build(
         &self,
         cfg: HopConfig,

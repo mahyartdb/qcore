@@ -41,7 +41,7 @@ impl IdentityRole {
 }
 
 /// Identity record file for a role (field names are contractual —
-/// contracts/profiles.md).
+/// see profiles/README.md for the record layout).
 pub fn identity_file(dirs: &ProfileDirs, role: IdentityRole) -> std::path::PathBuf {
     dirs.config_dir.join(role.file_name())
 }
@@ -300,9 +300,21 @@ fn atomic_write_0600(path: &std::path::Path, bytes: &[u8]) -> Result<(), String>
     }
     #[cfg(not(unix))]
     {
-        std::fs::write(&tmp, bytes).map_err(|e| format!("identity write failed: {e}"))?;
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)
+            .map_err(|e| format!("identity write failed: {e}"))?;
+        f.write_all(bytes)
+            .map_err(|e| format!("identity write failed: {e}"))?;
+        // Same durability contract as the unix branch: sync before the
+        // rename, or a power loss leaves the rotated secret without a record.
+        f.sync_all()
+            .map_err(|e| format!("identity write failed: {e}"))?;
     }
-    if let Err(e) = std::fs::rename(&tmp, path) {
+    if let Err(e) = crate::session::control::rename_with_retry(&tmp, path) {
         // Do not litter `*.tmp.*` files on the rename error path.
         let _ = std::fs::remove_file(&tmp);
         return Err(format!("identity commit failed: {e}"));

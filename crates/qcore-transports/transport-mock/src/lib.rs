@@ -43,6 +43,13 @@ impl qcore_transport_api::HopFactory for MockFactory {
         &DESCRIPTOR
     }
 
+    // Wave C1 (descriptor-probe bits only): mock's loopback scan endpoints
+    // are TCP echo servers, so the scanner needs this opt-in. No other
+    // mock behavior changes hands in this wave.
+    fn endpoint_probe(&self) -> qcore_transport_api::EndpointProbe {
+        qcore_transport_api::EndpointProbe::TcpEcho
+    }
+
     async fn build(
         &self,
         cfg: HopConfig,
@@ -51,11 +58,11 @@ impl qcore_transport_api::HopFactory for MockFactory {
         // Strict like real factories: the grammar gates fields, but
         // embedder-built configs bypass it — garbage must fail here, not
         // silently ride a test double into a false-green chain.
-        if let Some(k) = cfg
-            .fields
-            .keys()
-            .find(|k| k.as_str() != "hop_id" && k.as_str() != "family")
-        {
+        if let Some(k) = cfg.fields.keys().find(|k| {
+            k.as_str() != "hop_id"
+                && k.as_str() != "family"
+                && k.as_str() != "fail_after_first_health_check"
+        }) {
             return Err(HopError::new(
                 qcore_transport_api::HopErrorKind::Config,
                 Some(cfg.get("hop_id").unwrap_or("mock-0").to_string()),
@@ -67,10 +74,21 @@ impl qcore_transport_api::HopFactory for MockFactory {
         let _ = tx.send(HopEvent::Started {
             hop_id: hop_id.clone(),
         });
+        // Configurable failure mode (conformance/engine tests): the field
+        // `fail_after_first_health_check=true` makes the FIRST `health()`
+        // call report Healthy (bring-up's readiness probe passes) and every
+        // later call report Failed — the shape of a mid-session transport
+        // death. Strict field gate above stays authoritative otherwise.
+        let fail_after_first = matches!(
+            cfg.get("fail_after_first_health_check"),
+            Some("true") | Some("1")
+        );
         Ok(Arc::new(MockHop {
             hop_id,
             dialer: Arc::new(MockDialer { carrier }),
             events: tx,
+            fail_after_first,
+            health_checks: std::sync::atomic::AtomicU64::new(0),
         }))
     }
 }
@@ -112,6 +130,10 @@ struct MockHop {
     hop_id: String,
     dialer: Arc<MockDialer>,
     events: tokio::sync::broadcast::Sender<HopEvent>,
+    /// Failure mode (see `MockFactory::build`): the first `health()` call is
+    /// Healthy (bring-up readiness passes), every later one Failed.
+    fail_after_first: bool,
+    health_checks: std::sync::atomic::AtomicU64,
 }
 
 #[async_trait::async_trait]
@@ -125,6 +147,14 @@ impl RunningHop for MockHop {
     }
 
     fn health(&self) -> HopHealth {
+        if self.fail_after_first {
+            let n = self
+                .health_checks
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n >= 1 {
+                return HopHealth::Failed;
+            }
+        }
         HopHealth::Healthy
     }
 

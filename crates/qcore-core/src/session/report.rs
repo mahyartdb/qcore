@@ -99,6 +99,10 @@ pub fn to_json(r: &ConnectionReport) -> String {
     let mut redacted = r.clone();
     if let Some(f) = redacted.failure.as_mut() {
         f.cause = masked_value("cause", &f.cause);
+        // Same masking as the text sink (`masked_failure_line` masks hop_id):
+        // a secret-shaped hop id must not leak through `--json` stdout or the
+        // FFI status buffer.
+        f.hop_id = masked_value("hop_id", &f.hop_id);
     }
     serde_json::to_string(&redacted).unwrap_or_else(|_| encode_fallback())
 }
@@ -160,9 +164,16 @@ pub fn emit_report(r: &ConnectionReport, json: bool) {
 }
 
 /// Emit a failure to stderr; returns the mapped exit code. The cause is
-/// redacted via the shared helper: stderr is an unredacted sink.
+/// redacted via the shared helper: stderr is an unredacted sink. The
+/// `(exit N)` suffix is the contract's diagnostic shape (contracts/cli.md
+/// §1) — every stderr failure line carries it, and this is the primary
+/// connect-failure path.
 pub fn emit_failure(r: &FailureReport) -> i32 {
-    eprintln!("qcore: {}", masked_failure_line(r));
+    eprintln!(
+        "qcore: {} (exit {})",
+        masked_failure_line(r),
+        exit_code_for_failure(r)
+    );
     exit_code_for_failure(r)
 }
 
@@ -187,6 +198,29 @@ mod tests {
         assert_eq!(t(FailureLayer::Sidecar), EXIT_HOP_FAILURE);
         assert_eq!(t(FailureLayer::Config), EXIT_HOP_FAILURE);
         assert_eq!(t(FailureLayer::Scan), EXIT_SCAN_EMPTY);
+    }
+
+    #[test]
+    fn emit_failure_line_carries_exit_suffix() {
+        // contracts/cli.md §1: stderr failure lines are `qcore: <msg>
+        // (exit N)` — emit_failure is the primary connect-failure path and
+        // must print the same shape the CLI's other diagnostics do. The
+        // expected line is built exactly as emit_failure builds it, so the
+        // suffix pin lives beside the format string that must keep it.
+        let r = FailureReport::new(
+            FailureLayer::Transport,
+            "wg-0",
+            "connection refused",
+            "transport",
+        );
+        let code = exit_code_for_failure(&r);
+        let line = format!("qcore: {} (exit {code})", masked_failure_line(&r));
+        assert_eq!(
+            line,
+            "qcore: layer=transport hop=wg-0 kind=transport cause=connection refused (exit 3)",
+            "emit_failure's stderr shape must keep the (exit N) suffix"
+        );
+        assert_eq!(emit_failure(&r), code, "returns the mapped exit code");
     }
 
     #[test]
@@ -274,6 +308,49 @@ mod tests {
         let back_cause = back.failure.expect("failure round-trips").cause;
         assert!(!back_cause.contains(SECRET), "leaked after round-trip");
         assert!(back_cause.contains("<redacted>"), "got: {back_cause}");
+    }
+
+    #[test]
+    fn json_failure_masks_secret_like_hop_id() {
+        // Uniformity across sinks (redact.rs pins that both `cause` and
+        // `hop_id` mask): the text sink masks hop_id via
+        // `masked_failure_line`, so the JSON sink must too.
+        const SECRET: &str = "xT4vN7qW2zR5uY8iO1pA3sD6fG9hJ0kL2mN4bV6cX8dE0gH2==";
+        let r = ConnectionReport {
+            failure: Some(FailureReport::new(
+                FailureLayer::Transport,
+                SECRET,
+                "connection refused",
+                "transport",
+            )),
+            ..ConnectionReport::new(vec![], "wg-0")
+        };
+        let doc = to_json(&r);
+        assert!(!doc.contains(SECRET), "secret-like hop_id leaked: {doc}");
+        let back: ConnectionReport = serde_json::from_str(&doc).unwrap();
+        assert_eq!(
+            back.failure.expect("failure round-trips").hop_id,
+            "<redacted>",
+            "masked identically to the text sink"
+        );
+        let text = to_text(&r);
+        assert!(!text.contains(SECRET), "text sink leaked: {text}");
+        assert!(text.contains("hop=<redacted>"), "text sink masks: {text}");
+        // Ordinary hop ids survive untouched in both sinks.
+        let plain = ConnectionReport {
+            failure: Some(FailureReport::new(
+                FailureLayer::Transport,
+                "wg-0",
+                "refused",
+                "transport",
+            )),
+            ..ConnectionReport::new(vec![], "wg-0")
+        };
+        let plain_doc = to_json(&plain);
+        assert!(
+            plain_doc.contains("\"hop_id\":\"wg-0\""),
+            "ordinary hop id must not be masked: {plain_doc}"
+        );
     }
 
     #[test]

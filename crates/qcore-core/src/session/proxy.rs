@@ -16,6 +16,31 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// Ceiling on concurrent proxied connections (Slowloris backstop).
 const MAX_CONNECTIONS: usize = 128;
+/// Overall relay budget. A bound is needed because `copy_bidirectional`
+/// otherwise keeps the task (and its slot) alive forever for a peer that
+/// holds the socket open without moving data. The honest simple bound is a
+/// generous total time, not idle tracking: legitimate proxied sessions are
+/// minutes-scale, hostile holds are indefinite, and 30 minutes covers the
+/// former while capping the latter.
+const RELAY_TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Peer filter: who may CONNECT through the proxy. `LoopbackOnly` (default)
+/// keeps the listener a localhost service even when bound non-locally; `Any`
+/// is the explicit opt-in for network-facing deployments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PeerPolicy {
+    #[default]
+    LoopbackOnly,
+    Any,
+}
+
+/// True when `peer` may use the proxy under `policy`.
+fn peer_allowed(peer: &SocketAddr, policy: PeerPolicy) -> bool {
+    match policy {
+        PeerPolicy::Any => true,
+        PeerPolicy::LoopbackOnly => peer.ip().is_loopback(),
+    }
+}
 
 async fn read_exact_timeout(
     socket: &mut tokio::net::TcpStream,
@@ -35,7 +60,7 @@ async fn read_exact_timeout(
 /// targets are accepted at the SOCKS layer and the exit dialer enforces the
 /// chain policy. Prefer [`serve_socks_via_dialer_with_policy`] when the
 /// session family policy is known so IPv4-only sessions refuse IPv6 with
-/// `0x08` before dialing.
+/// `0x08` before dialing. Peers are filtered loopback-only by default.
 pub async fn serve_socks_via_dialer(
     listener: tokio::net::TcpListener,
     dialer: Arc<dyn Dialer>,
@@ -43,11 +68,22 @@ pub async fn serve_socks_via_dialer(
     serve_socks_via_dialer_with_policy(listener, dialer, FamilyPolicy::default()).await
 }
 
-/// [`serve_socks_via_dialer`] with an explicit family policy for IPv6 gating.
+/// [`serve_socks_via_dialer`] with an explicit family policy for IPv6 gating
+/// (and the default loopback-only peer filter).
 pub async fn serve_socks_via_dialer_with_policy(
     listener: tokio::net::TcpListener,
     dialer: Arc<dyn Dialer>,
     policy: FamilyPolicy,
+) -> std::io::Result<()> {
+    serve_socks(listener, dialer, policy, PeerPolicy::default()).await
+}
+
+/// [`serve_socks_via_dialer_with_policy`] plus an explicit [`PeerPolicy`].
+pub async fn serve_socks(
+    listener: tokio::net::TcpListener,
+    dialer: Arc<dyn Dialer>,
+    policy: FamilyPolicy,
+    peers: PeerPolicy,
 ) -> std::io::Result<()> {
     let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     loop {
@@ -55,13 +91,17 @@ pub async fn serve_socks_via_dialer_with_policy(
         // is still Up (contrast: the old `?` returned and left the session
         // reporting Up with a dead proxy and no log). The sleep keeps a
         // persistent failure from busy-spinning a core.
-        let (socket, _) = match listener.accept().await {
+        let (socket, peer) = match listener.accept().await {
             Ok(v) => v,
             Err(_) => {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 continue;
             }
         };
+        if !peer_allowed(&peer, peers) {
+            drop(socket);
+            continue;
+        }
         let dialer = dialer.clone();
         let policy = policy.clone();
         // Unbounded spawn is a task-exhaustion primitive: shed load by
@@ -130,7 +170,19 @@ async fn handle_connect(
         }
     };
     write_reply(&mut socket, 0x00).await?;
-    tokio::io::copy_bidirectional(&mut socket, &mut upstream).await?;
+    // Relay bound: see RELAY_TOTAL_TIMEOUT for why a total timeout beats
+    // idle tracking here. On expiry both sockets drop (client sees EOF).
+    tokio::time::timeout(
+        RELAY_TOTAL_TIMEOUT,
+        tokio::io::copy_bidirectional(&mut socket, &mut upstream),
+    )
+    .await
+    .map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "relay exceeded its total time budget",
+        )
+    })??;
     Ok(())
 }
 
@@ -403,5 +455,66 @@ mod tests {
         let mut hdr = [0u8; 10];
         c.read_exact(&mut hdr).await.unwrap();
         assert_eq!(hdr[1], 0x08, "ipv4-only refuses IPv6 at the SOCKS layer");
+    }
+
+    /// The peer filter (pure half): loopback peers allowed, everything else
+    /// rejected. The integration half (a real non-loopback TCP peer gets
+    /// 0x02) lives in conformance; unit-level we pin the decision table and
+    /// the wire behavior for allowed peers.
+    #[test]
+    fn peer_filter_decision_table() {
+        assert!(peer_allowed(
+            &"127.0.0.1:5000".parse().unwrap(),
+            PeerPolicy::LoopbackOnly
+        ));
+        assert!(peer_allowed(
+            &"[::1]:5000".parse().unwrap(),
+            PeerPolicy::LoopbackOnly
+        ));
+        for denied in ["10.1.2.3:5000", "192.168.0.5:9999", "[fe80::1]:443"] {
+            assert!(
+                !peer_allowed(&denied.parse().unwrap(), PeerPolicy::LoopbackOnly),
+                "{denied}"
+            );
+            assert!(
+                peer_allowed(&denied.parse().unwrap(), PeerPolicy::Any),
+                "Any must accept {denied}"
+            );
+        }
+    }
+
+    /// Default policy is loopback-only: a non-loopback *peer* (the local end
+    /// of the proxied connection) is refused with 0x02 before any dial —
+    /// the proxy must not be an open relay for other hosts on the LAN.
+    /// Integration coverage for a genuinely non-loopback source address is
+    /// in tests-conformance (a unit test would need raw socket binding to a
+    /// specific interface).
+    #[tokio::test]
+    async fn loopback_peer_is_accepted_and_relayed() {
+        // Echo target.
+        let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = echo.accept().await.unwrap();
+            let (mut r, mut w) = s.split();
+            tokio::io::copy(&mut r, &mut w).await.ok();
+        });
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        tokio::spawn(serve_socks_via_dialer(proxy, Arc::new(DirectDialer)));
+
+        let mut c = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        socks_greet(&mut c).await;
+        let ip = match echo_addr.ip() {
+            IpAddr::V4(v4) => v4.octets(),
+            _ => unreachable!(),
+        };
+        let mut req = vec![0x05u8, 0x01, 0x00, 0x01];
+        req.extend_from_slice(&ip);
+        req.extend_from_slice(&echo_addr.port().to_be_bytes());
+        c.write_all(&req).await.unwrap();
+        let mut hdr = [0u8; 10];
+        c.read_exact(&mut hdr).await.unwrap();
+        assert_eq!(hdr[1], 0x00, "loopback peer passes the default filter");
     }
 }

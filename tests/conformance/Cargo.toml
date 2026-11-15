@@ -39,6 +39,17 @@ path = "tests/masque.rs"
 name = "tor_psiphon"
 path = "tests/tor_psiphon.rs"
 
+# Tor zero-coverage fix (fix wave E): the conformance crate's default
+# qcore-transports features exclude `tor`, so the matrix tests above
+# silently skipped the tor kind ("skip kinds whose test doubles are not
+# linked"). This dedicated target turns the feature on explicitly: it only
+# builds where tor builds (CI Windows builds tor — FFI links it), and
+# nextest skips the target elsewhere instead of weakening the matrix gate.
+[[test]]
+name = "tor_preflight"
+path = "tests/tor_preflight.rs"
+required-features = ["qcore-transports/tor"]
+
 [[test]]
 name = "relay"
 path = "tests/relay.rs"

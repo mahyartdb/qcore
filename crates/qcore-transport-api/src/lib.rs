@@ -13,6 +13,7 @@ pub use inventory;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Carrier/egress capability, known WITHOUT building an instance (FR-006a).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,6 +144,26 @@ pub trait Dialer: Send + Sync {
     fn nested_mtu(&self) -> Option<u16> {
         None
     }
+    /// Dial a hostname:port target, resolving INSIDE the transport's tunnel
+    /// (the name never reaches the OS resolver). Defaulted (never breaking):
+    /// the `Err` IS the capability signal — only transports that can resolve
+    /// hostnames themselves (e.g. Tor, whose exit does the DNS) override it.
+    /// Callers use this before any resolver-based fallback, so a transport
+    /// without hostname support keeps domain targets fail-closed instead of
+    /// leaking the name through a side channel.
+    async fn dial_host(
+        &self,
+        host: &str,
+        port: u16,
+        timeout: Duration,
+    ) -> Result<Box<dyn ByteStream>, HopError> {
+        let _ = (host, port, timeout);
+        Err(HopError::new(
+            HopErrorKind::Validation,
+            None,
+            "transport cannot dial hostnames (no in-tunnel resolution)",
+        ))
+    }
 }
 
 /// A built hop: handle, health, event stream, stop.
@@ -226,4 +247,49 @@ macro_rules! register_plugin {
             $crate::PluginEntry($e)
         }
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A dialer that overrides nothing: the defaulted `dial_host` must fail
+    /// closed — the `Err` is the capability signal callers rely on before
+    /// falling back to a resolver (no invented success, no OS resolution).
+    struct NoHostDialer;
+
+    #[async_trait::async_trait]
+    impl Dialer for NoHostDialer {
+        async fn dial_tcp(&self, _dst: SocketAddr) -> Result<Box<dyn ByteStream>, HopError> {
+            Err(HopError::transport("test", "not needed"))
+        }
+        async fn dial_udp(&self, _dst: SocketAddr) -> Result<Box<dyn UdpFlow>, HopError> {
+            Err(HopError::transport("test", "not needed"))
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                accepts_tcp_carrier: true,
+                accepts_udp_carrier: true,
+                dials_tcp: true,
+                dials_udp: false,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dial_host_defaults_to_fail_closed() {
+        let d = NoHostDialer;
+        let err = match d
+            .dial_host("example.test", 443, Duration::from_secs(1))
+            .await
+        {
+            Ok(_) => panic!("default dial_host must refuse"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind, HopErrorKind::Validation);
+        assert!(
+            err.message.contains("cannot dial hostnames"),
+            "error names the missing capability: {err}"
+        );
+    }
 }

@@ -31,7 +31,7 @@ Exactly two output streams, with disjoint duties:
 | 3 | `HOP_FAILURE` | A hop failed (transport / chain / sidecar / config build). Includes scan-pipeline errors. | `connect`, `scan`, `import` IO beyond the target file |
 | 4 | `SCAN_EMPTY` | Scan found nothing reachable. In JSON mode the shape `{"ok":false,...,"candidates":[]}` goes to stdout; in table mode stdout stays silent and stderr carries `qcore: scan found nothing reachable (exit 4)`. Never a silent last-known-good fallback. | `scan` |
 | 5 | `IMPORT_REJECTED` | Config import rejected: content problems name every offending field. A missing/unreadable target file is usage (6), not 5. | `import`, `export` |
-| 6 | `USAGE` | Usage error: unknown command/kind, conflicting chain sources, out-of-range globals (`--max-depth`, `--timeout`), `--json` on a command that cannot honor it, missing required values under `--non-interactive`. | any command |
+| 6 | `USAGE` | Usage error: unknown command/kind, conflicting chain sources, out-of-range globals (`--max-depth`, `--timeout`), `--json` on a command that cannot honor it, missing required values under `--non-interactive`. Also: connect's pre-start proxy-bind failures — a malformed `--bind`/`--http-proxy` address, a non-loopback listener without `--expose-lan`, or a taken/unavailable port (no hop has started; §4). | any command |
 | 10 | `NO_SESSION` | No session: no `session.json` record (fresh profile). | `status`, `stop` |
 | 12 | `UNVERIFIABLE` | Fail closed: the state is not provably alive or dead. Present-but-unparseable `session.json`, unreadable record, control-channel timeout/EOF, or a live-looking record whose control answer cannot be parsed. Never a false green. | `status`, `stop` |
 
@@ -96,6 +96,19 @@ intact for a retry.
   field; unreadable file is exit 6.
 - `connect` (alias `up`): chain-source conflicts are usage errors (exit 6);
   content problems are validation errors (exit 2).
+- Local proxy surface (`--bind`): a SOCKS5 listener (RFC 1928, no-auth)
+  serving CONNECT and UDP ASSOCIATE through the exit hop. UDP relay egress
+  is capability-gated by the exit hop's UDP support (an ASSOCIATE on an
+  exit without it answers `0x07`); ATYP=domain targets resolve through the
+  tunnel-routed DNS resolver (never the OS resolver; refused fail-closed
+  without one). Peers are loopback-only by default; a LAN-facing listener
+  requires the explicit `--expose-lan` opt-in (exit 6 without it).
+  `--http-proxy <addr>` adds an HTTP/1.1 CONNECT listener (RFC 7231 §4.3.6;
+  CONNECT only, other methods answer 405) with the same services and the
+  same exposure policy. Bind failures (`--bind` / `--http-proxy` address
+  taken or unavailable) are PRE-START failures: they map to usage (exit 6)
+  like the malformed-address and non-loopback refusals, never to hop
+  failure (3) — no hop has started when the listener binds.
 - Unknown subcommand/shortcut: exit 6 (`qcore: unknown command or shortcut ...`).
 - Global options are validated before any work: `--max-depth` outside 1..=5
   and `--timeout` < 1s are exit 6.

@@ -6,27 +6,28 @@
 //! - SOCKS5 (RFC 1928, no-auth): CONNECT and UDP ASSOCIATE. The UDP relay
 //!   binds a local datagram socket, answers with BND.ADDR/BND.PORT, and
 //!   ferries datagrams between the client and per-destination [`UdpFlow`]s
-//!   dialed through the exit hop; FRAG != 0 is refused with `0x07`
-//!   (fragmentation is not supported).
+//!   dialed through the exit hop; FRAG != 0 datagrams are dropped (the
+//!   association survives — 0x07 is reserved for request rejection).
 //! - HTTP/1.1 CONNECT tunneling (RFC 7231 §4.3.6) via [`serve_http_proxy`].
 //!   CONNECT only — other methods answer `405` with `Connection: close`
 //!   (plain-HTTP proxying is out of scope).
 //!
 //! ATYP=domain targets (CONNECT requests and UDP datagrams both) resolve
 //! through the session-scoped [`TunnelResolver`] (tunnel-routed DNS — the
-//! domain name never reaches the OS resolver); without a resolver they
-//! refuse fail-closed.
+//! domain name never reaches the OS resolver); a hostname-capable exit
+//! ([`Dialer::dial_host`], e.g. tor resolving remote-side) dials the name
+//! directly instead. Without either, domain targets refuse fail-closed.
 //!
 //! Peer filtering happens at accept time, before any protocol bytes: a
 //! rejected peer is closed without a reply (no SOCKS reply is possible
 //! before the greeting) and diagnosed on stderr.
 //!
-//! The CLI currently serves SOCKS only; [`serve_http_proxy`] is ready for
-//! a second listener next to it (CLI wiring owned by the CLI wave).
+//! The CLI serves SOCKS (`--bind`) and HTTP CONNECT (`--http-proxy`) with
+//! a second listener through the same dial path.
 
 use super::net::{FamilyMode, FamilyPolicy};
 use super::resolver::{ResolverError, TunnelResolver};
-use qcore_transport_api::{unspecified_bind, ByteStream, Dialer, UdpFlow};
+use qcore_transport_api::{unspecified_bind, ByteStream, Dialer, HopErrorKind, UdpFlow};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -80,6 +81,9 @@ const UDP_RELAY_QUEUE: usize = 64;
 /// Request-head cap for the HTTP CONNECT listener: a peer streaming a head
 /// without terminating it is dropped, never buffered unboundedly.
 const HTTP_HEAD_LIMIT: usize = 8 * 1024;
+/// Budget for the hostname-capable dial path ([`Dialer::dial_host`]):
+/// matches the transports' own dial budget (tor dials with 15 s).
+const DIAL_HOST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Peer filter: who may CONNECT through the proxy. `LoopbackOnly` (default)
 /// keeps the listener a localhost service even when bound non-locally; `Any`
@@ -354,9 +358,36 @@ async fn handle_tcp_connect(
     // resolver wired (the exit hop has no UDP egress, or none was built) or
     // the resolution itself failing both refuse before any dial; the reply
     // code distinguishes capability (0x08) from resolution failure (0x01).
+    // A hostname-capable exit (e.g. tor resolves remote-side) dials the
+    // name directly: the defaulted `dial_host`'s Validation Err is the
+    // capability signal (no kind matching); only without that capability
+    // does the resolver fallback apply.
     let target = match target {
         SocksTarget::Ip(addr) => addr,
         SocksTarget::Domain(host, port) => {
+            match dialer.dial_host(&host, port, DIAL_HOST_TIMEOUT).await {
+                Ok(upstream) => {
+                    write_reply(&mut socket, 0x00).await?;
+                    return relay_with_idle_bounds(
+                        socket,
+                        upstream,
+                        RELAY_IDLE_TIMEOUT,
+                        RELAY_TOTAL_BACKSTOP,
+                        RELAY_WATCHDOG_POLL,
+                    )
+                    .await;
+                }
+                // Capability signal (default method) or target-shape
+                // refusal: fall through to tunnel-DNS resolution below.
+                Err(e) if e.kind == HopErrorKind::Validation => {}
+                Err(e) => {
+                    write_reply(&mut socket, 0x05).await.ok();
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionRefused,
+                        e.message,
+                    ));
+                }
+            }
             let Some(resolver) = resolver else {
                 write_reply(&mut socket, 0x08).await.ok();
                 return Err(std::io::Error::new(
@@ -406,12 +437,14 @@ async fn handle_tcp_connect(
 /// datagrams between the client and the exit hop's [`UdpFlow`] egress.
 ///
 /// Shape (lifted from transport-psiphon/socks.rs, read-only reference): the
-/// first datagram's source pins the associating client; other sources are
-/// dropped. Each distinct destination gets one `dial_udp` flow (bounded by
+/// associating client is pinned to the control connection's peer IP —
+/// datagrams from that IP (any port) relay; other sources are dropped. Each
+/// distinct destination gets one `dial_udp` flow (bounded by
 /// [`UDP_MAX_FLOWS`]; at the cap further destinations are dropped, never
 /// evicted — evicting would silently break a live return path). FRAG != 0
-/// is refused with 0x07 on the control connection (fragmentation is not
-/// supported) and ends the association. Domain ATYPs resolve through the
+/// datagrams are dropped (fragmentation is not supported; the association
+/// survives — 0x07 is a request rejection, so it fires only when the
+/// ASSOCIATE request itself is invalid). Domain ATYPs resolve through the
 /// tunnel resolver — without one they drop fail-closed (no OS fallback,
 /// same policy as CONNECT); UDP has no per-datagram error channel, so
 /// undeliverable datagrams are dropped silently.
@@ -459,6 +492,15 @@ async fn handle_udp_associate(
 
     let (reply_tx, mut reply_rx) = mpsc::channel::<(SocketAddr, Vec<u8>)>(UDP_RELAY_QUEUE);
     let mut flows: HashMap<SocketAddr, Arc<dyn UdpFlow>> = HashMap::new();
+    // Client pin (S2.6): the TCP control connection's peer IP is the
+    // associating client's identity — datagrams are accepted only from that
+    // IP (any port: NAT reprices ports mid-association). First-datagram-wins
+    // would let a LAN host racing the real client become the client with
+    // free egress under PeerPolicy::Any. Under LoopbackOnly the control peer
+    // is loopback, so behavior is unchanged there.
+    let client_ip = peer.ip();
+    // Latest accepted datagram's source (its IP is the pin-checked one):
+    // the return path for encapsulated replies, repriced along with NAT.
     let mut client_addr: Option<SocketAddr> = None;
     let mut buf = vec![0u8; UDP_DATAGRAM_BUF];
     let mut ctl = [0u8; 1];
@@ -483,23 +525,23 @@ async fn handle_udp_associate(
             }
             datagram = relay.recv_from(&mut buf) => {
                 let (n, from) = datagram?;
-                if client_addr.is_none() {
-                    client_addr = Some(from);
-                }
-                if Some(from) != client_addr {
+                if from.ip() != client_ip {
                     continue;
                 }
+                client_addr = Some(from);
                 idle_sleep.as_mut().reset(
                     tokio::time::Instant::now() + UDP_ASSOCIATION_IDLE,
                 );
                 match parse_udp_datagram(&buf[..n]) {
                     None => continue, // malformed: drop, never guess
                     Some(UdpDatagram::Fragmented) => {
-                        write_reply(&mut socket, 0x07).await.ok();
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidInput,
-                            "fragmented UDP datagrams are not supported (FRAG != 0)",
-                        ));
+                        // FRAG != 0: fragmentation is not supported. RFC 1928
+                        // frames 0x07 as a request rejection, so killing the
+                        // association here would over-punish one unsupported
+                        // datagram: drop it like the malformed case and
+                        // answer 0x07 only when the ASSOCIATE request itself
+                        // is invalid.
+                        continue;
                     }
                     Some(UdpDatagram::To { dst, payload_at }) => {
                         let Some(dst_addr) =
@@ -757,7 +799,35 @@ async fn handle_http_connect(
         }
         SocksTarget::Domain(host, port) => {
             // Same fail-closed DNS policy as SOCKS: the domain name must not
-            // leak around the tunnel via the OS resolver.
+            // leak around the tunnel via the OS resolver. A hostname-capable
+            // exit (dial_host, e.g. tor) dials the name directly; the
+            // Validation Err is the capability signal and falls through to
+            // the tunnel resolver.
+            match dialer.dial_host(&host, port, DIAL_HOST_TIMEOUT).await {
+                Ok(upstream) => {
+                    socket
+                        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                        .await?;
+                    return relay_with_idle_bounds(
+                        socket,
+                        upstream,
+                        RELAY_IDLE_TIMEOUT,
+                        RELAY_TOTAL_BACKSTOP,
+                        RELAY_WATCHDOG_POLL,
+                    )
+                    .await;
+                }
+                Err(e) if e.kind == HopErrorKind::Validation => {}
+                Err(e) => {
+                    write_http_reply(&mut socket, 502, "Bad Gateway", "")
+                        .await
+                        .ok();
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionRefused,
+                        e.message,
+                    ));
+                }
+            }
             let Some(resolver) = resolver else {
                 write_http_reply(&mut socket, 501, "Not Implemented", "")
                     .await
@@ -1063,17 +1133,69 @@ async fn write_reply_with_bind(
     socket.write_all(&out).await
 }
 
+/// Session relay byte aggregate: `tx` = client → exit, `rx` = exit →
+/// client; live-incremented by [`CountingStream`] on the client side
+/// (each byte counted once, Relaxed like the watchdog counter).
+#[derive(Debug, Default)]
+pub struct RelayCounters {
+    pub tx: AtomicU64,
+    pub rx: AtomicU64,
+}
+
+/// The process's current aggregate: `Engine::start` attaches one per
+/// session (one session per process — the CLI session lock); `None` =
+/// no serving session (relays count into a detached sink).
+static CURRENT_RELAY_COUNTERS: std::sync::RwLock<Option<Arc<RelayCounters>>> =
+    std::sync::RwLock::new(None);
+
+/// Attach a fresh aggregate as the current one (once per `Engine::start`).
+/// The engine files the returned Arc under the session id; the relay path
+/// reaches the same Arc through the process-global above.
+pub fn attach_relay_counters() -> Arc<RelayCounters> {
+    let counters = Arc::new(RelayCounters::default());
+    *CURRENT_RELAY_COUNTERS
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(counters.clone());
+    counters
+}
+
+/// Current aggregate for the relay path; a detached sink when unattached
+/// (the bytes are counted, never misattributed to a session).
+fn current_relay_counters() -> Arc<RelayCounters> {
+    CURRENT_RELAY_COUNTERS
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+        .unwrap_or_default()
+}
+
+/// Current relay byte totals for the report path (`rx`, `tx`): the
+/// process-wide aggregate — the CLI serves exactly one session per process
+/// (session lock), so this IS the session's counters.
+pub fn relay_byte_totals() -> (u64, u64) {
+    let c = current_relay_counters();
+    (c.rx.load(Ordering::Relaxed), c.tx.load(Ordering::Relaxed))
+}
+
 /// Wraps a stream and counts every byte moved through it — the input for
 /// the relay watchdog's idle bound (activity detection only, so Relaxed
 /// ordering suffices: the counter only ever needs "did it change").
 struct CountingStream<S> {
     inner: S,
     moved: Arc<AtomicU64>,
+    /// Session aggregate (client side only): tx on read (client → exit),
+    /// rx on write (exit → client). The upstream side counts into a
+    /// detached sink so each byte is counted exactly once.
+    counters: Arc<RelayCounters>,
 }
 
 impl<S> CountingStream<S> {
-    fn new(inner: S, moved: Arc<AtomicU64>) -> Self {
-        CountingStream { inner, moved }
+    fn new(inner: S, moved: Arc<AtomicU64>, counters: Arc<RelayCounters>) -> Self {
+        CountingStream {
+            inner,
+            moved,
+            counters,
+        }
     }
 }
 
@@ -1086,6 +1208,9 @@ impl<S: AsyncRead + Unpin> AsyncRead for CountingStream<S> {
         let result = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
         if matches!(result, std::task::Poll::Ready(Ok(()))) {
             self.moved
+                .fetch_add(buf.filled().len() as u64, Ordering::Relaxed);
+            self.counters
+                .tx
                 .fetch_add(buf.filled().len() as u64, Ordering::Relaxed);
         }
         result
@@ -1101,6 +1226,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for CountingStream<S> {
         let result = std::pin::Pin::new(&mut self.inner).poll_write(cx, buf);
         if let std::task::Poll::Ready(Ok(n)) = &result {
             self.moved.fetch_add(*n as u64, Ordering::Relaxed);
+            self.counters.rx.fetch_add(*n as u64, Ordering::Relaxed);
         }
         result
     }
@@ -1137,11 +1263,13 @@ async fn relay_with_idle_bounds(
     poll: std::time::Duration,
 ) -> std::io::Result<()> {
     let moved = Arc::new(AtomicU64::new(0));
+    let counters = current_relay_counters();
     let mut copy = {
         let moved = moved.clone();
         tokio::spawn(async move {
-            let mut client = CountingStream::new(client, moved.clone());
-            let mut upstream = CountingStream::new(upstream, moved);
+            let mut client = CountingStream::new(client, moved.clone(), counters);
+            let mut upstream =
+                CountingStream::new(upstream, moved, Arc::new(RelayCounters::default()));
             tokio::io::copy_bidirectional(&mut client, &mut upstream).await
         })
     };
@@ -1216,6 +1344,150 @@ mod tests {
                 dials_udp: false,
             }
         }
+    }
+
+    /// Test dialer with hostname support: records every host it is asked
+    /// to dial (the assertion target), then serves plain OS TCP.
+    struct HostCapableDialer {
+        hosts: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Dialer for HostCapableDialer {
+        async fn dial_tcp(&self, _dst: SocketAddr) -> Result<Box<dyn ByteStream>, HopError> {
+            Err(HopError::transport("test", "hosts only"))
+        }
+
+        async fn dial_udp(&self, _dst: SocketAddr) -> Result<Box<dyn UdpFlow>, HopError> {
+            Err(HopError::transport("test", "tcp only"))
+        }
+
+        async fn dial_host(
+            &self,
+            host: &str,
+            port: u16,
+            _timeout: std::time::Duration,
+        ) -> Result<Box<dyn ByteStream>, HopError> {
+            self.hosts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(format!("{host}:{port}"));
+            // One-shot echo: a fresh listener per dial, served inline by a
+            // spawned task the dialed stream drives to EOF (no shared
+            // listener to race across dials).
+            let echo = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .map_err(HopError::from)?;
+            let addr = echo.local_addr().map_err(HopError::from)?;
+            tokio::spawn(async move {
+                if let Ok((mut s, _)) = echo.accept().await {
+                    let (mut r, mut w) = s.split();
+                    tokio::io::copy(&mut r, &mut w).await.ok();
+                }
+            });
+            let stream = tokio::net::TcpStream::connect(addr)
+                .await
+                .map_err(HopError::from)?;
+            Ok(Box::new(DirectStream { inner: stream }))
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                accepts_tcp_carrier: true,
+                accepts_udp_carrier: true,
+                dials_tcp: true,
+                dials_udp: false,
+            }
+        }
+    }
+
+    // --- relay byte counters (S3.1) ----------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn relay_counters_advance_after_a_round_trip() {
+        // Attach an aggregate (Engine::start's role) so the serve path
+        // increments THIS session's counters.
+        let counters = attach_relay_counters();
+        assert_eq!(counters.tx.load(Ordering::Relaxed), 0);
+
+        // Echo target + proxy under test.
+        let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = echo.accept().await.unwrap();
+            let (mut r, mut w) = s.split();
+            tokio::io::copy(&mut r, &mut w).await.ok();
+        });
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        tokio::spawn(serve_socks_via_dialer(proxy, Arc::new(DirectDialer)));
+
+        let mut c = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        socks_greet(&mut c).await;
+        let ip = match echo_addr.ip() {
+            IpAddr::V4(v4) => v4.octets(),
+            _ => unreachable!(),
+        };
+        let mut req = vec![0x05u8, 0x01, 0x00, 0x01];
+        req.extend_from_slice(&ip);
+        req.extend_from_slice(&echo_addr.port().to_be_bytes());
+        c.write_all(&req).await.unwrap();
+        let mut hdr = [0u8; 10];
+        c.read_exact(&mut hdr).await.unwrap();
+        assert_eq!(hdr[1], 0x00);
+        c.write_all(b"counted").await.unwrap();
+        let mut back = [0u8; 7];
+        c.read_exact(&mut back).await.unwrap();
+        assert_eq!(&back, b"counted");
+        // Counters advance live (before the relay even closes): the client
+        // stream's poll_read counts tx (client → exit), poll_write rx.
+        let (rx, tx) = relay_byte_totals();
+        assert!(tx >= 7, "client → exit bytes counted (tx={tx})");
+        assert!(rx >= 7, "exit → client bytes counted (rx={rx})");
+        let _ = c.shutdown().await;
+        let _ = counters;
+    }
+
+    // --- hostname-capable exits (S3.2) --------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn domain_connect_reaches_dial_host_unmodified_without_a_resolver() {
+        let dialer = Arc::new(HostCapableDialer {
+            hosts: std::sync::Mutex::new(Vec::new()),
+        });
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        // No resolver wired: the dial_host capability alone must serve.
+        tokio::spawn(serve_socks_via_dialer_with_services(
+            proxy,
+            dialer.clone() as Arc<dyn Dialer>,
+            FamilyPolicy::default(),
+            PeerPolicy::default(),
+            None,
+        ));
+
+        let mut c = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        let hdr = socks_request_domain(&mut c, "example.test", 443).await;
+        assert_eq!(hdr[1], 0x00, "hostname-capable exit serves domain CONNECT");
+        // The host reached dial_host EXACTLY as the client sent it.
+        let dialed = dialer
+            .hosts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(
+            dialed,
+            vec!["example.test:443".to_string()],
+            "the host passed through unmodified (no resolution, no rewriting)"
+        );
+        // And the tunnel is live end-to-end.
+        c.write_all(b"via-host").await.unwrap();
+        let mut back = [0u8; 8];
+        tokio::time::timeout(std::time::Duration::from_secs(2), c.read_exact(&mut back))
+            .await
+            .expect("echo within deadline")
+            .expect("read");
+        assert_eq!(&back, b"via-host");
     }
 
     struct DirectStream {
@@ -1794,7 +2066,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn fragmented_udp_datagram_refuses_07_on_the_control_connection() {
+    async fn fragmented_udp_datagram_is_dropped_and_the_association_survives() {
+        let echo = udp_echo_on(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)).await;
         let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
         tokio::spawn(serve_socks_via_dialer(proxy, Arc::new(ProxyDialer)));
@@ -1807,14 +2080,74 @@ mod tests {
         frag[2] = 1; // FRAG = 1
         udp.send_to(&frag, relay).await.unwrap();
 
-        // FRAG != 0 is refused on the control connection (0x07), not
-        // silently dropped.
-        let mut hdr = [0u8; 10];
-        tokio::time::timeout(std::time::Duration::from_secs(2), c.read_exact(&mut hdr))
+        // FRAG != 0 drops the datagram (like the malformed case) — no
+        // control-connection reply, association still live: a normal
+        // datagram after the fragmented one round-trips through the echo.
+        udp.send_to(&udp_datagram(&echo, b"after-frag"), relay)
             .await
-            .expect("reply within deadline")
-            .expect("read");
-        assert_eq!(hdr[1], 0x07, "FRAG != 0 refused with command-not-supported");
+            .unwrap();
+        let mut buf = vec![0u8; 2048];
+        let (n, _from) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), udp.recv_from(&mut buf))
+                .await
+                .expect("echo reply within deadline")
+                .expect("recv");
+        let (_src, got) = parse_udp_reply(&buf[..n]).expect("encapsulated reply");
+        assert_eq!(
+            got, b"after-frag",
+            "association survived the fragmented datagram"
+        );
+    }
+
+    /// A foreign-IP sender (datagrams whose source IP differs from the TCP
+    /// control peer's IP) is dropped and the association stays pinned to the
+    /// real client: 127.0.0.2 races the control peer 127.0.0.1, its datagram
+    /// never pins nor flows, and the real client's datagram still round-trips.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn datagrams_from_a_foreign_ip_are_dropped() {
+        let echo = udp_echo_on(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)).await;
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        tokio::spawn(serve_socks_via_dialer(proxy, Arc::new(ProxyDialer)));
+
+        let mut c = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        let relay = socks_associate(&mut c).await;
+
+        // The "LAN racer": same loopback range but a different IP than the
+        // control connection's peer (127.0.0.1).
+        let racer = tokio::net::UdpSocket::bind("127.0.0.2:0").await.unwrap();
+        racer
+            .send_to(&udp_datagram(&echo, b"race-pin"), relay)
+            .await
+            .unwrap();
+
+        // The real client (control peer's IP) still relays.
+        let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        udp.send_to(&udp_datagram(&echo, b"real-client"), relay)
+            .await
+            .unwrap();
+
+        // Only the real client's echo must arrive — the racer's datagram is
+        // dropped, so exactly one payload ever comes back through the relay.
+        let mut buf = vec![0u8; 2048];
+        let (n, _from) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), udp.recv_from(&mut buf))
+                .await
+                .expect("echo reply within deadline")
+                .expect("recv");
+        let (_src, got) = parse_udp_reply(&buf[..n]).expect("encapsulated reply");
+        assert_eq!(got, b"real-client", "the real client's datagram flows");
+        // The racer gets no reply: its datagram was dropped before any flow.
+        let mut racer_buf = vec![0u8; 2048];
+        let race_reply = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            racer.recv_from(&mut racer_buf),
+        )
+        .await;
+        assert!(
+            race_reply.is_err(),
+            "foreign-IP datagram must be dropped, not answered"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

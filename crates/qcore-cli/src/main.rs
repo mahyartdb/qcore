@@ -194,6 +194,12 @@ enum Commands {
         /// Local proxy listener through the exit hop (default 127.0.0.1:0).
         #[arg(long, num_args = 0..=1, default_missing_value = "127.0.0.1:0")]
         bind: Option<String>,
+        /// Local HTTP CONNECT proxy listener (RFC 7231 §4.3.6) served next
+        /// to `--bind` through the same exit hop: CONNECT only — plain-HTTP
+        /// proxying answers 405. Same exposure policy as `--bind`:
+        /// loopback-only unless `--expose-lan` (exit 6 otherwise).
+        #[arg(long = "http-proxy")]
+        http_proxy: Option<String>,
         /// Opt in to a non-loopback --bind listener. The proxy is an
         /// UNAUTHENTICATED SOCKS5 endpoint through the tunnel: a LAN bind
         /// lets every reachable peer use your exit. Refused without this
@@ -482,6 +488,7 @@ async fn async_main(cli: Cli) -> i32 {
             detach,
             bind,
             expose_lan,
+            http_proxy,
             child,
             no_scan,
             obfuscation,
@@ -504,6 +511,7 @@ async fn async_main(cli: Cli) -> i32 {
                 detach,
                 bind,
                 expose_lan,
+                http_proxy,
                 child,
                 scan: !no_scan,
                 obfuscation,
@@ -544,6 +552,9 @@ struct ConnectOpts {
     bind: Option<String>,
     /// Explicit opt-in for a non-loopback `--bind` (see `bind_policy`).
     expose_lan: bool,
+    /// Local HTTP CONNECT listener address (raw argv form; parsed in
+    /// `run_connect`, exit 6 on failure). `None` = no HTTP listener.
+    http_proxy: Option<String>,
     child: bool,
     /// Endpoint discovery on connect (scan once when needed).
     scan: bool,
@@ -625,6 +636,7 @@ async fn run_shortcut(
                 log_level: "info".into(),
                 detach: false,
                 bind: None,
+                http_proxy: None,
                 // Shortcuts never bind a LAN proxy; --expose-lan has no
                 // surface here (flags after a shortcut token are operands,
                 // exit 6 per grammar).
@@ -730,6 +742,34 @@ async fn run_connect(o: ConnectOpts) -> i32 {
     if let Some(addr) = bind_addr {
         if let Err(msg) = bind_policy(addr, o.expose_lan) {
             exit::diag_exit(exit::USAGE, msg);
+            return exit::USAGE;
+        }
+    }
+
+    // --http-proxy parses and gates exactly like --bind: a malformed
+    // address is a usage error (exit 6), and a non-loopback listener is the
+    // same unauthenticated open relay, so bind_policy applies unchanged.
+    // Parsing happens before the detach re-spawn so a bad value never
+    // spawns a child.
+    let http_proxy_addr: Option<std::net::SocketAddr> = match o.http_proxy {
+        Some(ref h) => match h.parse() {
+            Ok(a) => Some(a),
+            Err(_) => {
+                exit::diag_exit(
+                    exit::USAGE,
+                    &format!("invalid --http-proxy `{h}` (expected host:port)"),
+                );
+                return exit::USAGE;
+            }
+        },
+        None => None,
+    };
+    if let Some(addr) = http_proxy_addr {
+        if bind_policy(addr, o.expose_lan).is_err() {
+            exit::diag_exit(
+                exit::USAGE,
+                "refusing non-loopback --http-proxy without --expose-lan",
+            );
             return exit::USAGE;
         }
     }
@@ -965,8 +1005,23 @@ async fn run_connect(o: ConnectOpts) -> i32 {
         Some(addr) => match tokio::net::TcpListener::bind(addr).await {
             Ok(l) => Some(l),
             Err(e) => {
-                eprintln!("qcore: --bind {addr} unavailable: {e}");
-                return exit::HOP_FAILURE;
+                // Pre-start failure, not a hop failure: no hop has started,
+                // so the usage code (6) matches --bind syntax/policy above
+                // (contracts/cli.md §4, proxy surface row).
+                eprintln!("qcore: --bind {addr} unavailable: {e} (exit 6)");
+                return exit::USAGE;
+            }
+        },
+        None => None,
+    };
+    // The HTTP CONNECT listener binds beside the SOCKS one, before any hop
+    // starts, under the same pre-start semantics.
+    let http_listener = match http_proxy_addr {
+        Some(addr) => match tokio::net::TcpListener::bind(addr).await {
+            Ok(l) => Some(l),
+            Err(e) => {
+                eprintln!("qcore: --http-proxy {addr} unavailable: {e} (exit 6)");
+                return exit::USAGE;
             }
         },
         None => None,
@@ -988,6 +1043,9 @@ async fn run_connect(o: ConnectOpts) -> i32 {
         }
     }
     let mut report = ConnectionReport::new(handle.hop_reports(), handle.exit_hop_id.clone());
+    // A proxy is bound iff either listener survived the bind gate (captured
+    // before the listeners move into their serve tasks).
+    let proxy_bound = bind_listener.is_some() || http_listener.is_some();
     // Active profiles in the report (T068 scan / T073 obfuscation): the exit
     // hop's obfuscation, and the scan profile when discovery ran.
     report.active_obfuscation = report
@@ -998,6 +1056,17 @@ async fn run_connect(o: ConnectOpts) -> i32 {
     if discovery_ran {
         report.active_scan_profile =
             Some(qcore_core::session::reconnect::default_scan_profile(&dirs));
+    }
+    // Relay byte counters (S3.1): the live report slot's sole writer is this
+    // CLI, so populating here is the only surface for status over the
+    // control channel. Counters advance live as relays move bytes (the
+    // status-refresh loop below keeps the slot current after this snapshot).
+    if proxy_bound {
+        let (rx, tx) = qcore_core::session::proxy::relay_byte_totals();
+        if rx > 0 || tx > 0 {
+            report.bytes_in = Some(rx);
+            report.bytes_out = Some(tx);
+        }
     }
     // Publish the shared report slot onto the handle (R1.5): the watchdog's
     // publish_report writes degrade/reconnect fields into it, so STATUS over
@@ -1078,6 +1147,16 @@ async fn run_connect(o: ConnectOpts) -> i32 {
     report::emit_report(&report, o.json);
 
     let listener = control_listener.expect("control listener bound above");
+    // Peer policy mirrors the bind gate: loopback binds serve loopback
+    // peers only; the explicit `--expose-lan` opt-in (which the bind gate
+    // required for a non-loopback bind) also opts the peer filter out —
+    // otherwise a LAN bind would refuse every LAN peer at accept time and
+    // the flag would be a no-op (R1.4). Both proxy listeners share it.
+    let peers = if o.expose_lan {
+        qcore_core::session::proxy::PeerPolicy::Any
+    } else {
+        qcore_core::session::proxy::PeerPolicy::LoopbackOnly
+    };
     if let Some(binder) = bind_listener {
         let bound = binder
             .local_addr()
@@ -1087,16 +1166,6 @@ async fn run_connect(o: ConnectOpts) -> i32 {
             "qcore: proxy listening on {bound} (via hop {})",
             handle.exit_hop_id
         );
-        // Peer policy mirrors the bind gate: loopback binds serve loopback
-        // peers only; the explicit `--expose-lan` opt-in (which the bind
-        // gate required for a non-loopback bind) also opts the peer filter
-        // out — otherwise a LAN bind would refuse every LAN peer at accept
-        // time and the flag would be a no-op (R1.4).
-        let peers = if o.expose_lan {
-            qcore_core::session::proxy::PeerPolicy::Any
-        } else {
-            qcore_core::session::proxy::PeerPolicy::LoopbackOnly
-        };
         // Per-connection egress read (R1.1): the serve loop captures ONE
         // dialer for its lifetime, so it must be the live adapter — every
         // dial delegates to the handle's CURRENT exit, and after a watchdog
@@ -1126,11 +1195,61 @@ async fn run_connect(o: ConnectOpts) -> i32 {
             ),
         );
     }
+    if let Some(http_binder) = http_listener {
+        let bound = http_binder
+            .local_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_default();
+        eprintln!(
+            "qcore: http proxy listening on {bound} (via hop {}, CONNECT only)",
+            handle.exit_hop_id
+        );
+        // Same services + peer policy as the SOCKS listener (the resolver
+        // rides the same live dialer and UDP-egress gate; see the SOCKS
+        // block above for the rebuild semantics).
+        tokio::spawn(qcore_core::session::proxy::serve_http_proxy(
+            http_binder,
+            handle.live_dialer(),
+            session.family_policy.clone(),
+            peers,
+            dns_resolver
+                .filter(|_| handle.dialer().capabilities().dials_udp)
+                .map(|ip| {
+                    std::sync::Arc::new(qcore_core::session::resolver::TunnelResolver::new(
+                        handle.live_dialer(),
+                        ip,
+                    ))
+                }),
+        ));
+    }
 
     // Serve control until STOP or Ctrl-C or the watchdog gives up, then
     // tear down. Detached children have been serving since before identity;
-    // the accept loop is owned here from now on either way.
+    // the accept loop is owned here from now on either way. The status slot
+    // refreshes on a loop: relay byte counters move continuously, and a
+    // start-snapshot slot would serve zeros forever. The loop watches the
+    // SLOT (dropped with the control serve task) for shutdown instead of
+    // owning the stop sender.
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+    let status_slot = shared_report.clone();
+    let status_proxy_bound = proxy_bound;
+    let status_refresh = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            if !status_proxy_bound {
+                continue;
+            }
+            let (rx, tx) = qcore_core::session::proxy::relay_byte_totals();
+            let mut fresh = status_slot.read().await.clone();
+            if rx > 0 || tx > 0 {
+                fresh.bytes_in = Some(rx);
+                fresh.bytes_out = Some(tx);
+            }
+            *status_slot.write().await = fresh;
+        }
+    });
     tokio::spawn(control::serve_control_shared(
         listener,
         token,
@@ -1166,6 +1285,7 @@ async fn run_connect(o: ConnectOpts) -> i32 {
                 });
             eprintln!("qcore: session failed and could not be recovered");
             let _ = handle.stop_all().await;
+            status_refresh.abort();
             control::remove_control_file(&dirs);
             // The record is already Failed (watchdog wrote it); release the
             // lock so the next start is not blocked by a dead holder.
@@ -1175,12 +1295,14 @@ async fn run_connect(o: ConnectOpts) -> i32 {
         }
     }
     let _ = handle.stop_all().await;
+    status_refresh.abort();
     session.state = SessionState::Stopped;
     if let Err(e) = session.save(&dirs) {
         // The tunnel is already down; a failed record write must not turn a
         // successful stop into a failure (the next `status` re-probes and
-        // converges), but it must not be silent either.
-        eprintln!("qcore: session record save failed: {e} (exit 0)");
+        // converges), but it must not be silent either. Informational note,
+        // not the `(exit N)` failure shape: the stop still exits 0.
+        eprintln!("qcore: note: session record save failed (stop succeeded): {e}");
     }
     control::remove_control_file(&dirs);
     // Clean stop releases ownership only after the durable record landed.
@@ -1312,6 +1434,9 @@ async fn spawn_detached(o: ConnectOpts) -> i32 {
         .arg(&o.log_level);
     if let Some(ref b) = o.bind {
         cmd.arg("--bind").arg(b);
+    }
+    if let Some(ref h) = o.http_proxy {
+        cmd.arg("--http-proxy").arg(h);
     }
     if o.expose_lan {
         cmd.arg("--expose-lan");
@@ -1803,7 +1928,9 @@ fn mark_stopped(dirs: &ProfileDirs) {
     if let Ok(mut session) = Session::load(dirs) {
         session.state = SessionState::Stopped;
         if let Err(e) = session.save(dirs) {
-            eprintln!("qcore: session record convergence failed: {e} (exit 0)");
+            // Informational note, not the `(exit N)` failure shape: the stop
+            // contract is already satisfied and exits 0.
+            eprintln!("qcore: note: session record convergence failed (stop succeeded): {e}");
         }
     }
 }
@@ -1876,6 +2003,7 @@ mod tests {
                 detach: false,
                 bind: None,
                 expose_lan: false,
+                http_proxy: None,
                 child: false,
                 no_scan: true,
                 obfuscation: None,
@@ -1928,6 +2056,42 @@ mod tests {
             }
             _ => panic!("expected connect subcommand"),
         }
+    }
+
+    #[test]
+    fn http_proxy_flag_parses_through_clap() {
+        // Default off: a plain connect carries no HTTP listener.
+        let cli = parse_connect(&["--chain", "mock"]);
+        match &cli.command {
+            Commands::Connect { http_proxy, .. } => {
+                assert_eq!(http_proxy.as_deref(), None, "--http-proxy default off");
+            }
+            _ => panic!("expected connect subcommand"),
+        }
+        // Explicit value parses as-is (127.0.0.1:0 = ephemeral port).
+        let cli = parse_connect(&["--chain", "mock", "--http-proxy", "127.0.0.1:0"]);
+        match &cli.command {
+            Commands::Connect { http_proxy, .. } => {
+                assert_eq!(http_proxy.as_deref(), Some("127.0.0.1:0"));
+            }
+            _ => panic!("expected connect subcommand"),
+        }
+    }
+
+    #[test]
+    fn http_proxy_policy_matches_bind_policy() {
+        // Non-loopback --http-proxy is refused without --expose-lan, allowed
+        // with it — the same fail-safe open-proxy rule as --bind.
+        let lan: std::net::SocketAddr = "192.168.1.10:8080".parse().unwrap();
+        assert_eq!(
+            bind_policy(lan, false).err(),
+            Some("refusing non-loopback --bind without --expose-lan"),
+            "non-loopback http-proxy refused without opt-in (shared bind_policy)"
+        );
+        assert!(bind_policy(lan, true).is_ok(), "opt-in allows the LAN bind");
+        // Loopback never needs the opt-in.
+        let lo: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        assert!(bind_policy(lo, false).is_ok());
     }
 
     #[test]

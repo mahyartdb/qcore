@@ -222,6 +222,53 @@ impl Dialer for TorDialer {
         ))
     }
 
+    /// Hostname dial: the Tor EXIT resolves the name (in-tunnel DNS — the
+    /// name never reaches the OS resolver), so domain CONNECT targets work
+    /// without any tunnel resolver. Uses arti's `connect` with a
+    /// `host:port` string (its `IntoTorAddr` impl resolves remote-side);
+    /// the same 15 s dial budget and stopped-flag contract as [`Self::dial_tcp`].
+    async fn dial_host(
+        &self,
+        host: &str,
+        port: u16,
+        timeout: Duration,
+    ) -> Result<Box<dyn ByteStream>, HopError> {
+        if self.stopped.load(Ordering::SeqCst) {
+            return Err(HopError::new(
+                HopErrorKind::Transport,
+                Some(self.hop_id.clone()),
+                "tor hop is stopped",
+            ));
+        }
+        // The SOCKS layer guarantees this shape, but dial_host is a public
+        // API: an embedded `:` or empty host would silently mis-parse the
+        // target, so refuse instead of dialing the wrong endpoint.
+        if host.is_empty() || host.contains(':') {
+            return Err(HopError::new(
+                HopErrorKind::Validation,
+                Some(self.hop_id.clone()),
+                format!("invalid hostname target `{host}` (empty or malformed)"),
+            ));
+        }
+        let stream = tokio::time::timeout(timeout, self.client.connect((host, port)))
+            .await
+            .map_err(|_| {
+                HopError::new(
+                    HopErrorKind::Transport,
+                    Some(self.hop_id.clone()),
+                    format!("tor connect to {host}:{port} timed out (unreachable transport)"),
+                )
+            })?
+            .map_err(|e| {
+                HopError::new(
+                    HopErrorKind::Transport,
+                    Some(self.hop_id.clone()),
+                    format!("tor connect to {host}:{port}: {e}"),
+                )
+            })?;
+        Ok(Box::new(TorStream { inner: stream }))
+    }
+
     fn capabilities(&self) -> Capabilities {
         DESCRIPTOR.capabilities
     }
@@ -354,5 +401,99 @@ mod tests {
             Err(e) => e,
         };
         assert!(err.message.contains("stopped"), "stopped reason: {err}");
+    }
+
+    /// Unbootstrapped client + `dial_host`: the pre-stop dial may fail, but
+    /// it must fail with a transport error naming the target — never the
+    /// defaulted "cannot dial hostnames" validation refusal (tor IS
+    /// hostname-capable; the capability must survive construction), and
+    /// never hang past the caller's timeout budget.
+    #[tokio::test]
+    async fn dial_host_is_hostname_capable_and_respects_the_timeout() {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::SeqCst);
+        let base = std::env::temp_dir().join(format!("qcore-tor-host-{}-{n}", std::process::id()));
+        let state = base.join("state");
+        let cache = base.join("cache");
+        std::fs::create_dir_all(&state).expect("state dir");
+        std::fs::create_dir_all(&cache).expect("cache dir");
+        let config = arti_client::config::TorClientConfigBuilder::from_directories(&state, &cache)
+            .build()
+            .expect("tor client config");
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let client = TorClient::builder()
+            .config(config)
+            .bootstrap_behavior(arti_client::BootstrapBehavior::Manual)
+            .create_unbootstrapped()
+            .expect("unbootstrapped tor client (no network in tests)");
+        let dialer = TorDialer {
+            hop_id: "tor-host-0".to_string(),
+            client,
+            stopped: Arc::new(AtomicBool::new(false)),
+        };
+
+        // Pre-bootstrap: resolution cannot complete, so the dial must fail
+        // WITHIN the budget — a hang here would mean the timeout contract
+        // is broken. The failure must be tor's transport error, not the
+        // default-method capability refusal.
+        let err = match tokio::time::timeout(
+            Duration::from_secs(10),
+            dialer.dial_host("localhost", 80, Duration::from_millis(500)),
+        )
+        .await
+        .expect("dial_host returns within the outer budget (timeout contract)")
+        {
+            Ok(_) => panic!("unbootstrapped client cannot resolve"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind, HopErrorKind::Transport, "{err}");
+        assert!(
+            err.message.contains("tor connect to localhost:80"),
+            "names the target and the transport: {err}"
+        );
+        assert!(
+            !err.message.contains("cannot dial hostnames"),
+            "tor must not fall through to the default capability refusal: {err}"
+        );
+    }
+
+    /// The stopped flag gates `dial_host` too (same stopped-stays-stopped
+    /// invariant as dial_tcp/dial_udp).
+    #[tokio::test]
+    async fn dial_host_refuses_after_stop() {
+        let dialer = TorDialer {
+            hop_id: "tor-host-stop".to_string(),
+            client: stopped_client(),
+            stopped: Arc::new(AtomicBool::new(true)),
+        };
+        let err = match dialer
+            .dial_host("localhost", 80, Duration::from_secs(1))
+            .await
+        {
+            Ok(_) => panic!("stopped hop must refuse"),
+            Err(e) => e,
+        };
+        assert!(err.message.contains("stopped"), "{err}");
+    }
+
+    /// Minimal stopped-flag dialer fixture (no dirs needed: nothing dials).
+    fn stopped_client() -> Arc<TorClient<tor_rtcompat::PreferredRuntime>> {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::SeqCst);
+        let base =
+            std::env::temp_dir().join(format!("qcore-tor-stopcli-{}-{n}", std::process::id()));
+        let state = base.join("state");
+        let cache = base.join("cache");
+        std::fs::create_dir_all(&state).expect("state dir");
+        std::fs::create_dir_all(&cache).expect("cache dir");
+        let config = arti_client::config::TorClientConfigBuilder::from_directories(&state, &cache)
+            .build()
+            .expect("tor client config");
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        TorClient::builder()
+            .config(config)
+            .bootstrap_behavior(arti_client::BootstrapBehavior::Manual)
+            .create_unbootstrapped()
+            .expect("unbootstrapped tor client (no network in tests)")
     }
 }

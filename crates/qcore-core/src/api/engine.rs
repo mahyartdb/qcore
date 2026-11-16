@@ -76,6 +76,11 @@ pub struct Engine {
     registry: TransportRegistry,
     events: tokio::sync::broadcast::Sender<HopEvent>,
     live: crate::session::watchdog::LiveMap,
+    /// Per-session relay byte aggregate (counter plumbing, S3.1): the Arc
+    /// the proxy serve path increments (attached via
+    /// `proxy::attach_relay_counters` at start), filed by session id so
+    /// `session_report` surfaces bytes_in/bytes_out for THIS session.
+    relay_counters: std::sync::Mutex<HashMap<String, Arc<crate::session::proxy::RelayCounters>>>,
 }
 
 impl Engine {
@@ -96,6 +101,7 @@ impl Engine {
             registry: TransportRegistry::global(),
             events,
             live: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            relay_counters: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -242,6 +248,14 @@ impl Engine {
             self.events.clone(),
         );
         handle.wire_exit(started, exit_dialer, resolver);
+        // Counter plumbing (S3.1): attach the session's relay-byte
+        // aggregate — the CLI proxy serve path increments it, and
+        // `session_report` reads this same Arc by session id.
+        let relay_counters = crate::session::proxy::attach_relay_counters();
+        self.relay_counters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(handle.id.clone(), relay_counters);
         // F2 watchdog: subscribe to the session bus; on any hop Failed it
         // degrades honestly and rebuilds through the same primitives with a
         // bounded budget. The abort handle rides the handle so `stop_all`
@@ -296,10 +310,18 @@ impl Engine {
     /// stop), the entry is removed from `live` so a dead session cannot
     /// linger forever. The report is still returned once (the final report
     /// — callers learn *what* died); the next call reports `None`.
+    ///
+    /// A degraded session (watchdog rebuild in flight) is never reaped here:
+    /// the rebuild's unwind takes every hop down first, so "all hops
+    /// failed" mid-rebuild is the rebuild's doing, not the session's death —
+    /// an embedder polling status must not reap the entry the watchdog is
+    /// about to swap back in (the next `lock_entry` miss would force a
+    /// false terminal Failed even if the network recovered).
     pub fn session_report(&self, id: &str) -> Option<crate::session::report::ConnectionReport> {
         let handle = { self.lock_live().get(id).cloned() }?;
         let reports = handle.hop_reports();
-        if self_dead(&reports) {
+        let degrading = handle.degraded.load(std::sync::atomic::Ordering::SeqCst);
+        if !degrading && self_dead(&reports) {
             self.lock_live().remove(id);
         }
         let mut report =
@@ -310,6 +332,24 @@ impl Engine {
         if handle.degraded.load(std::sync::atomic::Ordering::SeqCst) {
             report.session_state = Some("degraded".to_string());
             report.reconnects = Some(handle.reconnects.load(std::sync::atomic::Ordering::SeqCst));
+        }
+        // Relay byte counters (S3.1): surfaced once relay traffic was
+        // observed for this session (zero-traffic/mock sessions keep the
+        // field-free Up shape — `None`, byte-identical JSON contract).
+        if let Some(c) = self
+            .relay_counters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(id)
+        {
+            let (tx, rx) = (
+                c.tx.load(std::sync::atomic::Ordering::Relaxed),
+                c.rx.load(std::sync::atomic::Ordering::Relaxed),
+            );
+            if tx > 0 || rx > 0 {
+                report.bytes_out = Some(tx);
+                report.bytes_in = Some(rx);
+            }
         }
         Some(report)
     }
@@ -1066,6 +1106,58 @@ mod tests {
         );
     }
 
+    /// (S1.3) A degraded (rebuild-in-flight) session is never reaped by
+    /// `session_report`, even when the watchdog's unwind has every hop
+    /// reporting failed/stopped: an embedder polling status mid-rebuild must
+    /// not reap the entry the watchdog is about to swap (the next
+    /// `lock_entry` miss would force a false terminal Failed even if the
+    /// network recovered). With the degraded flag clear, reaping behaves
+    /// exactly as before.
+    #[test]
+    fn session_report_spares_a_degraded_session_whose_hops_report_failed() {
+        let engine = test_engine();
+        engine.lock_live().insert(
+            "rebuilding".to_string(),
+            handle_with_health("rebuilding", qcore_transport_api::HopHealth::Failed),
+        );
+        // Mark the rebuild-in-flight window (the watchdog holds this true
+        // between degrade and swap/give-up).
+        let handle = engine
+            .lock_live()
+            .get("rebuilding")
+            .cloned()
+            .expect("entry");
+        handle.degraded.store(true, Ordering::SeqCst);
+        // All hops report failed, but the session is degrading: no reap.
+        let report = engine
+            .session_report("rebuilding")
+            .expect("degraded session serves");
+        assert_eq!(report.ordered_chain[0].status, "failed");
+        assert_eq!(
+            report.session_state.as_deref(),
+            Some("degraded"),
+            "degraded honesty fields present"
+        );
+        assert!(
+            engine.lock_live().get("rebuilding").is_some(),
+            "a degraded session must NOT be reaped mid-rebuild"
+        );
+        // Clear the flag (rebuild gave up or finished): reaping resumes.
+        handle.degraded.store(false, Ordering::SeqCst);
+        let final_report = engine
+            .session_report("rebuilding")
+            .expect("final report served once after degrade clears");
+        assert_eq!(final_report.ordered_chain[0].status, "failed");
+        assert!(
+            engine.lock_live().get("rebuilding").is_none(),
+            "reaping resumes once the degraded flag is clear"
+        );
+        assert!(
+            engine.session_report("rebuilding").is_none(),
+            "reaped session reports None afterwards"
+        );
+    }
+
     #[test]
     fn session_report_keeps_alive_and_partial_sessions() {
         let engine = test_engine();
@@ -1088,6 +1180,60 @@ mod tests {
             .session_report("degraded")
             .expect("degraded session serves");
         assert!(engine.lock_live().get("degraded").is_some());
+    }
+
+    // --- relay byte counters in the report (S3.1) ---------------------------
+
+    #[test]
+    fn session_report_without_relay_traffic_keeps_the_counter_free_shape() {
+        // A session whose counters never saw traffic (mock chain, no proxy
+        // serving) reports neither field: the Up-shape JSON stays
+        // byte-identical to the pre-counter contract.
+        let engine = test_engine();
+        engine
+            .lock_live()
+            .insert("idle".to_string(), dummy_handle("idle"));
+        let report = engine.session_report("idle").expect("serves");
+        assert_eq!(report.bytes_in, None);
+        assert_eq!(report.bytes_out, None);
+        assert!(
+            !crate::session::report::to_json(&report).contains("bytes_"),
+            "counter-free report must not carry byte fields"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_report_surfaces_bytes_after_relay_traffic() {
+        // Engine::start's attach step (mirrored): the serve path increments
+        // the CURRENT aggregate, the engine files the same Arc by id.
+        let engine = test_engine();
+        let counters = crate::session::proxy::attach_relay_counters();
+        engine
+            .relay_counters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert("serving".to_string(), counters.clone());
+        engine
+            .lock_live()
+            .insert("serving".to_string(), dummy_handle("serving"));
+
+        // Simulated relay traffic through the attached aggregate (the
+        // proxy round-trip path itself is proven in proxy.rs tests).
+        counters.tx.fetch_add(512, Ordering::Relaxed);
+        counters.rx.fetch_add(1024, Ordering::Relaxed);
+
+        let report = engine.session_report("serving").expect("serves");
+        assert_eq!(report.bytes_out, Some(512), "client → exit bytes");
+        assert_eq!(report.bytes_in, Some(1024), "exit → client bytes");
+
+        // A DIFFERENT session (no counters entry) stays counter-free even
+        // while this process has traffic: per-session, not global, surface.
+        engine
+            .lock_live()
+            .insert("other".to_string(), dummy_handle("other"));
+        let other = engine.session_report("other").expect("serves");
+        assert_eq!(other.bytes_in, None);
+        assert_eq!(other.bytes_out, None);
     }
 
     #[test]

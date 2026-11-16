@@ -89,6 +89,16 @@ pub struct ConnectionReport {
     /// count is observable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reconnects: Option<u32>,
+    /// Aggregate relay bytes observed for this session (additive field):
+    /// `bytes_in` = delivered to local SOCKS/HTTP clients (exit → client),
+    /// `bytes_out` = sent from clients through the exit (client → exit).
+    /// Serialized only when relay traffic was observed (both `None` keeps
+    /// the Up-shape document byte-identical — same discipline as the F2
+    /// fields above); sessions that never served a proxy report neither.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_in: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_out: Option<u64>,
 }
 
 impl ConnectionReport {
@@ -102,6 +112,8 @@ impl ConnectionReport {
             failure: None,
             session_state: None,
             reconnects: None,
+            bytes_in: None,
+            bytes_out: None,
         }
     }
 }
@@ -392,6 +404,38 @@ mod tests {
             !doc.contains("session_state") && !doc.contains("reconnects"),
             "Up-shape report must not carry F2 fields: {doc}"
         );
+    }
+
+    #[test]
+    fn byte_counter_fields_serialize_only_when_observed() {
+        // Additive-shape stability (S3.1): a report without relay traffic
+        // carries neither `bytes_in` nor `bytes_out` — the Up-shape document
+        // stays byte-identical to pre-counter reports.
+        let r = ConnectionReport::new(vec![], "wg-0");
+        let doc = to_json(&r);
+        assert!(
+            !doc.contains("bytes_in") && !doc.contains("bytes_out"),
+            "counter-free report must not carry byte fields: {doc}"
+        );
+        // Observed traffic serializes into the exact additive fields, and
+        // round-trips (serde default: pre-counter readers ignore nothing —
+        // the fields are simply present; legacy documents without them
+        // still parse on this reader).
+        let mut r = ConnectionReport::new(vec![], "wg-0");
+        r.bytes_in = Some(1234);
+        r.bytes_out = Some(5678);
+        let doc = to_json(&r);
+        assert!(doc.contains("\"bytes_in\":1234"), "{doc}");
+        assert!(doc.contains("\"bytes_out\":5678"), "{doc}");
+        let back: ConnectionReport = serde_json::from_str(&doc).expect("round-trips");
+        assert_eq!(back.bytes_in, Some(1234));
+        assert_eq!(back.bytes_out, Some(5678));
+        let legacy: ConnectionReport = serde_json::from_str(
+            "{\"ordered_chain\":[],\"exit_hop_id\":\"x\",\"secret_redaction\":true,\"active_scan_profile\":null,\"active_obfuscation\":null,\"failure\":null}",
+        )
+        .expect("legacy doc parses");
+        assert_eq!(legacy.bytes_in, None);
+        assert_eq!(legacy.bytes_out, None);
     }
 
     #[test]

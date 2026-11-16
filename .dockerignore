@@ -1,0 +1,22 @@
+# Build context: only what the workspace build needs. Everything else is
+# churn that invalidates the dependency cache or bloats the context upload.
+
+.git
+.github
+.target
+target
+**/target
+docs
+specs
+contracts
+*.md
+!README.md
+!Cargo.toml
+Cargo.lock.orig
+denlylist.toml
+denylist.toml
+rustfmt.toml
+clippy.toml
+.coderabbit*
+Dockerfile
+.dockerignore

@@ -19,6 +19,11 @@
 //! the address. In-flight calls on other threads finish on the last strong
 //! reference before the engine drops. Forged/double-free handles remain a
 //! usage error (6).
+//!
+//! Tombstone bound (`FREED_TOMBSTONE_CAP` = 1024): when the ring is full the
+//! oldest tombstones are cleared, so an ABA hit requires 1024 create/free
+//! cycles while holding a stale pointer to the SAME reused address — not a
+//! realistic embedder loop, hence acceptable as-is.
 
 use qcore_core::api::{Engine, EngineConfig};
 use qcore_core::config::profile_dir::ProfileDirs;

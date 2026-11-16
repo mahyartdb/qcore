@@ -134,6 +134,15 @@ impl TunnelResolver {
         }
     }
 
+    /// The upstream DNS endpoint this resolver queries. Read only by the
+    /// watchdog swap-consistency test (that test lives in
+    /// `session::watchdog`), so the lib build flags it dead unless
+    /// silenced — deliberate, with the consumer named.
+    #[allow(dead_code)]
+    pub(crate) fn server(&self) -> SocketAddr {
+        self.server
+    }
+
     /// Resolve `host` to one address under the session's family policy:
     /// single-stack modes query their family only; `dual` prefers A and
     /// falls back to AAAA on NODATA. Results are cached 300 s, bounded at

@@ -47,7 +47,29 @@ qcore stop                            # tear down
 `--bind` serves a loopback SOCKS5 proxy through the exit hop; hostname
 targets resolve via tunnel-routed DNS (default resolver 1.1.1.1 inside the
 tunnel, override with `--dns <ip>`) so domain names never reach the OS
-resolver.
+resolver. Exits that resolve hostnames themselves (tor, via remote-side
+DNS) dial the name directly.
+
+## Docker
+
+Multi-stage build (builder pinned to the `rust-toolchain.toml` toolchain,
+runtime on `debian:bookworm-slim`, non-root user):
+
+```sh
+docker build -t qcore .
+# Bind 0.0.0.0 INSIDE the container (loopback there is unreachable from
+# the host); publish the port instead. Container localhost ≠ host
+# localhost, so --expose-lan is not needed for a published port.
+docker run --rm -p 1080:1080 qcore connect --chain warp --bind 0.0.0.0:1080
+```
+
+Status/stop from the host need the control port published too; run in the
+foreground (`--detach` only detaches inside the container). Note the proxy
+is an UNAUTHENTICATED endpoint for anything that can reach the published
+port — the same warning as `--expose-lan` on the host applies, and the
+container adds nothing to the peer filter's reach. Never publish it on an
+untrusted network. HEALTHCHECK is omitted by design: a bare TCP probe
+cannot authenticate against the control channel, so it would lie.
 
 ### Exit codes
 

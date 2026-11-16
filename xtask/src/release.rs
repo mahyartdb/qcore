@@ -5,8 +5,7 @@
 //! `qcore.h` + `abi-version.txt`), `SHA256SUMS`, `sbom-<ver>.cdx.json`
 //! (CycloneDX 1.5 over the FULL `cargo metadata` package graph — first-party
 //! plus every transitive crate, name+version, sorted deterministically; no
-//! extra tool needed), cosign keyless
-//! signatures (`.sig`) plus SLSA attestation when those tools are present.
+//! extra tool needed), cosign keyless signatures (`.sig`).
 //! The container format comes from the target's `delivery` field in
 //! `targets.toml` (`cli-zip` → zip, `cli-targz`/`termux-cli` → tar.gz); a
 //! package without the built CLI binary or the cdylib fails closed instead

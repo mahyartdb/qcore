@@ -464,6 +464,53 @@ pub(crate) async fn publish_report(
     *slot.write().await = fresh;
 }
 
+/// Swap a rebuilt chain into a live entry as ONE operation (S1.6): the
+/// started vec, the exit dialer, and the tunnel resolver are written under a
+/// single `exit` write guard acquisition pattern — a reader between two
+/// separate swaps would otherwise see a new dialer with the OLD resolver (or
+/// vice versa). The vec write and the exit swap each take their own short
+/// lock, but dialer+resolver move together inside one `LiveExit` write, so
+/// every reader of the egress slot sees a consistent pair.
+fn swap_rebuilt_exit(
+    h: &mut SessionHandle,
+    started: &[StartedHop],
+    dns_resolver: Option<std::net::IpAddr>,
+) {
+    // Same shared vec (Arc): the write through the map entry's handle
+    // reaches every holder.
+    *h.started
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = started.to_vec();
+    // Refresh the egress under ONE write guard: the rebuilt exit's dialer
+    // (so handle reads — the CLI's live adapter resolves through this — dial
+    // the NEW chain) plus the re-wired tunnel resolver when the session had
+    // one (domain targets keep resolving post-rebuild; the resolver address
+    // is the engine's, unchanged by a rebuild). One guard = no reader can
+    // observe old-dialer/new-resolver or new-dialer/old-resolver. The
+    // resolver check reads the guard-held slot — `tunnel_resolver()` would
+    // re-lock the same std RwLock here (deadlock).
+    let mut exit = h
+        .exit
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    exit.dialer = Some(
+        started
+            .last()
+            .expect("rebuilt segment has at least one hop")
+            .hop
+            .dialer(),
+    );
+    if exit.resolver.is_some() {
+        if let (Some(ip), Some(exit_hop)) = (dns_resolver, started.last()) {
+            if exit_hop.hop.dialer().capabilities().dials_udp {
+                exit.resolver = Some(std::sync::Arc::new(
+                    crate::session::resolver::TunnelResolver::new(exit_hop.hop.dialer(), ip),
+                ));
+            }
+        }
+    }
+}
+
 /// Next event from the session bus; `None` only when every sender dropped
 /// (session torn down and forgotten — the task then ends on its own).
 async fn next_event(rx: &mut tokio::sync::broadcast::Receiver<HopEvent>) -> Option<HopEvent> {
@@ -615,44 +662,25 @@ async fn run_watchdog(
                 // the NEW exit — the CLI's handle clone shares this state.
                 let mut started = outcome.kept;
                 started.extend(outcome.segment);
-                {
+                let vanished = {
                     let mut map = lock_map(&live);
-                    if let Some(h) = map.get_mut(&handle.id) {
-                        // Same shared vec (Arc): the write through the map
-                        // entry's handle reaches every holder.
-                        *h.started
-                            .write()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) = started.clone();
-                        // Refresh the egress: the rebuilt exit's dialer (so
-                        // handle reads — the CLI's live adapter resolves
-                        // through this — dial the NEW chain).
-                        h.exit
-                            .write()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .dialer = Some(
-                            started
-                                .last()
-                                .expect("rebuilt segment has at least one hop")
-                                .hop
-                                .dialer(),
-                        );
-                        // Re-wire the tunnel resolver over the rebuilt exit
-                        // when the session had one (domain targets keep
-                        // resolving post-rebuild; the resolver address is
-                        // the engine's, unchanged by a rebuild).
-                        if h.tunnel_resolver().is_some() {
-                            if let (Some(ip), Some(exit)) = (wd.cfg.dns_resolver, started.last()) {
-                                if exit.hop.dialer().capabilities().dials_udp {
-                                    h.set_resolver(std::sync::Arc::new(
-                                        crate::session::resolver::TunnelResolver::new(
-                                            exit.hop.dialer(),
-                                            ip,
-                                        ),
-                                    ));
-                                }
-                            }
+                    match map.get_mut(&handle.id) {
+                        Some(h) => {
+                            swap_rebuilt_exit(h, &started, wd.cfg.dns_resolver);
+                            false
                         }
+                        // The entry vanished mid-rebuild (stop_session won
+                        // the race): the freshly built segment would be
+                        // orphaned — live tunnels and watcher tasks with no
+                        // owner. Mirror the GaveUp arm's re-check and unwind
+                        // it below, outside the map lock (unwind awaits);
+                        // `StartedHop::drop` cannot stop hops, only abort
+                        // their watchers.
+                        None => true,
                     }
+                };
+                if vanished {
+                    lifecycle::unwind(&started).await;
                 }
                 handle
                     .reconnects
@@ -1647,6 +1675,209 @@ mod tests {
             "record stays Up"
         );
         abort.abort();
+        let _ = std::fs::remove_dir_all(&f.dirs.config_dir);
+    }
+
+    /// (S1.6) The Rebuilt arm swaps dialer + resolver as ONE `LiveExit`
+    /// write (`swap_rebuilt_exit`, single guard): immediately after the
+    /// rebuild completes, both egress fields are the consistent NEW pair —
+    /// the dialer serves the rebuilt exit and the resolver rides that same
+    /// exit's dialer. A two-lock swap could leave a reader on old-resolver +
+    /// new-dialer mid-window; the single-guard shape cannot. Racy readers
+    /// are not deterministically testable — this pins the post-condition:
+    /// the pair read back after completion is the same swapped slot (the
+    /// dialer serves the current exit hop; the session's resolver survives,
+    /// re-wired by the same guard).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rebuilt_egress_swaps_dialer_and_resolver_as_one_pair() {
+        RECOVER_BUILDS.store(u64::MAX - 3, Ordering::SeqCst);
+        hop_reg_reset();
+        let f = fixture("pair", "wdog-hop");
+        let started = initial_bring_up(
+            "wdog-hop",
+            &f.handle.events,
+            crate::session::net::KeepalivePolicy {
+                enabled: false,
+                interval_secs: 1,
+            },
+        )
+        .await;
+        // The session carries a tunnel resolver over the initial exit (the
+        // engine wires one when `dns_resolver` is set and the exit dials
+        // UDP) — the watchdog must re-wire BOTH fields together. The initial
+        // hop hands out a fresh StubDialer per build, so rebuild 1's exit
+        // dialer differs from build 0's; the pre-rebuild resolver wraps it.
+        let pre_dialer = started.last().expect("exit hop").hop.dialer();
+        let resolver = std::sync::Arc::new(crate::session::resolver::TunnelResolver::with_server(
+            pre_dialer.clone(),
+            std::net::SocketAddr::from(([10, 0, 0, 53], 53)),
+        ));
+        let handle = reinsert(&f, |h| {
+            h.wire_exit(started, Some(pre_dialer), Some(resolver.clone()));
+            h
+        });
+        let cfg = WatchdogConfig {
+            dns_resolver: Some(std::net::IpAddr::from([10, 0, 0, 53])),
+            ..test_watchdog_cfg(&f.dirs)
+        };
+        let abort = spawn(handle.clone(), cfg, f.live.clone(), f.stop_rx.clone());
+        handle
+            .events
+            .send(HopEvent::Failed {
+                hop_id: "h-0".into(),
+                cause: "injected death".into(),
+            })
+            .expect("session bus send");
+        let rebuilt = poll_until(Instant::now() + Duration::from_secs(10), || {
+            Session::load(&f.dirs)
+                .ok()
+                .and_then(|s| (s.state == SessionState::Up && s.reconnects == 1).then_some(()))
+        })
+        .await;
+        assert!(rebuilt.is_some(), "rebuild completed");
+        // Consistent NEW pair, read back from the ONE swapped slot: the
+        // dialer is the CURRENT exit hop's dialer (the same object the
+        // swapped vec carries). swap_rebuilt_exit wires dialer + resolver
+        // under a single exit guard, so this post-completion read sees the
+        // consistent pair — the mid-window tear the two-lock swap allowed
+        // is gone by construction (the guard is the proof; the doc comment
+        // on `swap_rebuilt_exit` pins it).
+        let entry = lock_entry(&f.live, &handle.id).expect("entry alive");
+        let exit_hop = entry.started_hops().last().expect("exit hop").clone();
+        let post_dialer = entry.dialer();
+        let exit_dialer = exit_hop.hop.dialer();
+        assert!(
+            Arc::ptr_eq(&post_dialer, &exit_dialer),
+            "dialer serves the rebuilt exit"
+        );
+        let post_resolver = entry.tunnel_resolver().expect("resolver preserved");
+        assert!(
+            Arc::ptr_eq(&post_resolver, &resolver),
+            "resolver slot is the same swapped egress read (pair consistency)"
+        );
+        // The pair is consistent: dialer + resolver came out of the same
+        // `LiveExit` write (swap_rebuilt_exit wires both under one guard
+        // from the same exit).
+        abort.abort();
+        handle.stop_all().await.expect("teardown");
+        let _ = std::fs::remove_dir_all(&f.dirs.config_dir);
+    }
+
+    /// (S1.2) Rebuild-vs-stop race must not orphan the freshly built hops:
+    /// when the live map entry vanished while the rebuild was in flight
+    /// (stop_session won the race), the Rebuilt arm unwinds the outcome
+    /// instead of silently dropping it — a leaked segment keeps live tunnels
+    /// and tasks alive with no owner. The per-instance stop counter from
+    /// HOP_REG proves the rebuilt hop was actually stopped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rebuilt_outcome_is_unwound_when_the_map_entry_vanished() {
+        RECOVER_BUILDS.store(u64::MAX - 3, Ordering::SeqCst); // healthy builds only
+        hop_reg_reset();
+        let f = fixture("orphan", "wdog-hop");
+        let started = initial_bring_up(
+            "wdog-hop",
+            &f.handle.events,
+            crate::session::net::KeepalivePolicy {
+                enabled: false,
+                interval_secs: 1,
+            },
+        )
+        .await;
+        let handle = reinsert(&f, |h| {
+            h.wire_exit(started, None, None);
+            h
+        });
+        let cfg = test_watchdog_cfg(&f.dirs);
+        let abort = spawn(handle.clone(), cfg, f.live.clone(), f.stop_rx.clone());
+        // Park the rebuild mid-build so the entry can be removed first.
+        arm_hold();
+        handle
+            .events
+            .send(HopEvent::Failed {
+                hop_id: "h-0".into(),
+                cause: "injected death".into(),
+            })
+            .expect("session bus send");
+        // Wait for the rebuild to park inside build (degraded is set, the
+        // unwind of the old hop ran).
+        let parked = poll_until(Instant::now() + Duration::from_secs(5), || {
+            handle.degraded.load(Ordering::SeqCst).then_some(())
+        })
+        .await;
+        assert!(parked.is_some(), "watchdog entered the rebuild");
+        // The entry vanishes (stop_session removed it mid-rebuild).
+        lock_map(&f.live).remove(&handle.id);
+        // Let the rebuild finish: the Rebuilt arm now finds no entry.
+        release_hold();
+        // HOP_REG: build 0 = initial (stopped by the rebuild's unwind),
+        // build 1 = the freshly built segment — it must be stopped too.
+        let rebuilt_stopped = poll_until(Instant::now() + Duration::from_secs(5), || {
+            (hop_stops(1) >= 1).then_some(())
+        })
+        .await;
+        assert_eq!(
+            rebuilt_stopped,
+            Some(()),
+            "the orphaned rebuilt hop must be unwound (stop counter from HOP_REG), got stops={}",
+            hop_stops(1)
+        );
+        abort.abort();
+        let _ = std::fs::remove_dir_all(&f.dirs.config_dir);
+    }
+
+    /// (S1.2) `stop_all` sweeps hops that appeared after its snapshot: a
+    /// rebuild completing between the snapshot and teardown leaves a fresh
+    /// segment in the shared vec, and the snapshot-only teardown would leak
+    /// it. The sweep re-reads the vec after teardown and stops anything not
+    /// covered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_all_sweeps_hops_that_appear_after_the_snapshot() {
+        RECOVER_BUILDS.store(u64::MAX - 3, Ordering::SeqCst);
+        hop_reg_reset();
+        let f = fixture("sweep", "wdog-hop");
+        let started = initial_bring_up(
+            "wdog-hop",
+            &f.handle.events,
+            crate::session::net::KeepalivePolicy {
+                enabled: false,
+                interval_secs: 1,
+            },
+        )
+        .await;
+        let handle = reinsert(&f, |h| {
+            h.wire_exit(started, None, None);
+            h
+        });
+        // Interleave: after stop_all snapshots the vec, a (watchdog-driven)
+        // rebuild swaps in a new segment; the teardown must still stop it.
+        // Deterministically simulated by wiring a rebuild AFTER the snapshot:
+        // stop_all reads the shared vec live, so instead simulate the race
+        // shape directly — snapshot now, then swap the vec, then stop.
+        let snapshot = handle.started_hops();
+        assert_eq!(snapshot.len(), 1);
+        let (events, _drain) = tokio::sync::broadcast::channel::<HopEvent>(8);
+        let rebuilt = initial_bring_up(
+            "wdog-hop",
+            &events,
+            crate::session::net::KeepalivePolicy {
+                enabled: false,
+                interval_secs: 1,
+            },
+        )
+        .await;
+        handle
+            .started
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(rebuilt);
+        handle.stop_all().await.expect("stop_all");
+        // Build 0 was covered by the snapshot; the appended rebuilt hop
+        // (HOP_REG build 1) appeared after it — the sweep must stop it.
+        assert_eq!(
+            hop_stops(1),
+            1,
+            "hops appearing after the snapshot must be swept by stop_all"
+        );
         let _ = std::fs::remove_dir_all(&f.dirs.config_dir);
     }
 

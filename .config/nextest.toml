@@ -3,6 +3,11 @@
 # with a named test instead of wedging CI until the runner timeout, and a
 # nightly profile for the ignored-only lane (live-network tests are slow
 # and flaky by nature, so retries are on there only).
+#
+# Effective per-attempt cap: slow-timeout 60s + terminate-after 2 = a test
+# gets at most ~120s before it is killed and counted as failed. This is the
+# assumed ceiling for the live-network nightly legs: any ignored test that
+# legitimately needs longer must split or shrink, not outgrow this cap.
 [profile.default]
 slow-timeout = { period = "60s", terminate-after = 2 }
 

@@ -21,7 +21,7 @@ use crate::session::lifecycle::StartedHop;
 use crate::session::net::FamilyPolicy;
 use crate::session::report::{health_status, HopReport};
 use qcore_transport_api::{
-    ByteStream, Capabilities, Dialer, FailureReport, HopError, HopEvent, UdpFlow,
+    ByteStream, Capabilities, Dialer, FailureReport, HopError, HopErrorKind, HopEvent, UdpFlow,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -305,6 +305,35 @@ pub struct LiveExit {
     pub resolver: Option<Arc<crate::session::resolver::TunnelResolver>>,
 }
 
+/// Egress for a session whose hops are gone (watchdog give-up cleared the
+/// started vec and reset the exit slot): every dial fails closed with a
+/// clear cause instead of panicking on the missing-hop fallback. Per-hop
+/// capabilities honestly report "dials nothing", so the proxy's UDP gate
+/// refuses and per-connection SOCKS tasks reply 0x01 cleanly.
+struct DeadDialer;
+
+const DEAD_EGRESS_MSG: &str = "session exited: egress is dead (watchdog gave up)";
+
+#[async_trait::async_trait]
+impl Dialer for DeadDialer {
+    async fn dial_tcp(&self, _dst: std::net::SocketAddr) -> Result<Box<dyn ByteStream>, HopError> {
+        Err(HopError::new(HopErrorKind::Shutdown, None, DEAD_EGRESS_MSG))
+    }
+
+    async fn dial_udp(&self, _dst: std::net::SocketAddr) -> Result<Box<dyn UdpFlow>, HopError> {
+        Err(HopError::new(HopErrorKind::Shutdown, None, DEAD_EGRESS_MSG))
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            accepts_tcp_carrier: false,
+            accepts_udp_carrier: false,
+            dials_tcp: false,
+            dials_udp: false,
+        }
+    }
+}
+
 /// Egress adapter that stays live across watchdog rebuilds (R1.1): the proxy
 /// serve path captures ONE dialer for the session's lifetime, so it must
 /// consult the handle's CURRENT exit per dial — a once-evaluated `Arc<dyn
@@ -410,11 +439,6 @@ impl SessionHandle {
         *self.write_exit() = LiveExit { dialer, resolver };
     }
 
-    /// Re-wire the tunnel resolver (watchdog post-rebuild path).
-    pub(crate) fn set_resolver(&self, resolver: Arc<crate::session::resolver::TunnelResolver>) {
-        self.write_exit().resolver = Some(resolver);
-    }
-
     /// Sender half of the give-up signal (watchdog terminal path).
     pub(crate) fn give_up_sender(&self) -> Arc<tokio::sync::watch::Sender<bool>> {
         self.give_up_tx.clone()
@@ -466,7 +490,11 @@ impl SessionHandle {
 
     /// Egress of the CURRENT exit hop (fresh Arc per call): after a watchdog
     /// rebuild this is the rebuilt exit, so per-connection reads in the
-    /// proxy serve path always dial the live chain.
+    /// proxy serve path always dial the live chain. When the session's hops
+    /// are gone (give-up cleared the vec and reset the exit slot) this fails
+    /// closed with a dead dialer — between give-up and process exit,
+    /// per-connection tasks holding the handle get a clean dial error, never
+    /// a panic.
     pub fn dialer(&self) -> Arc<dyn Dialer> {
         if let Some(d) = self
             .exit
@@ -477,11 +505,10 @@ impl SessionHandle {
         {
             return d;
         }
-        self.started_hops()
-            .last()
-            .expect("session has at least one hop")
-            .hop
-            .dialer()
+        if let Some(hop) = self.started_hops().last() {
+            return hop.hop.dialer();
+        }
+        Arc::new(DeadDialer)
     }
 
     /// Tunnel resolver over the CURRENT exit hop's UDP egress, if one was
@@ -535,6 +562,8 @@ impl SessionHandle {
         // The CURRENT hop set (shared vec): a post-rebuild teardown stops
         // the rebuilt hops, not the pre-rebuild ones (R1.2).
         let started = self.started_hops();
+        let stopped_ids: std::collections::HashSet<String> =
+            started.iter().map(|s| s.hop_id.clone()).collect();
         for s in started.iter() {
             if let Some(keepalive) = &s.keepalive {
                 keepalive.abort();
@@ -548,6 +577,36 @@ impl SessionHandle {
             if let Err(e) = s.hop.stop().await {
                 if first_err.is_none() {
                     first_err = Some(e);
+                }
+            }
+        }
+        // Sweep the race window (S1.2): a rebuild completing between the
+        // snapshot above and teardown swaps a fresh segment into the shared
+        // vec — snapshot-only teardown would orphan it (live tunnels, no
+        // owner). Re-read the vec and stop anything the snapshot did not
+        // cover (matched by hop id; a same-id rebuild replaced hops the
+        // snapshot already stopped). Best effort like the main loop: the
+        // sweep never abandons remaining hops on an error.
+        let late = self.started_hops();
+        let late_uncovered: Vec<&crate::session::lifecycle::StartedHop> = late
+            .iter()
+            .filter(|s| !stopped_ids.contains(&s.hop_id))
+            .collect();
+        if !late_uncovered.is_empty() {
+            for s in late_uncovered.iter() {
+                if let Some(keepalive) = &s.keepalive {
+                    keepalive.abort();
+                }
+                if let Some(forwarder) = &s.forwarder {
+                    forwarder.abort();
+                }
+            }
+            tokio::task::yield_now().await;
+            for s in late_uncovered.into_iter().rev() {
+                if let Err(e) = s.hop.stop().await {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
                 }
             }
         }
@@ -1395,6 +1454,75 @@ mod tests {
         assert!(
             inner_stopped.load(std::sync::atomic::Ordering::SeqCst),
             "inner stop still ran after exit failure"
+        );
+    }
+
+    /// (S1.1) Post-give-up egress fails closed: the watchdog's GaveUp arm
+    /// clears the started vec and resets the exit slot, so `dialer()` has no
+    /// hop to fall back on. Per-connection SOCKS tasks holding the handle
+    /// between give-up and process exit must get a dialer that returns a
+    /// clear error — never a panic. The dead dialer keeps the Dialer shape
+    /// (capabilities) so the proxy's UDP gating answers honestly (nothing
+    /// dials), and dial_tcp/dial_udp fail with "session exited" so the SOCKS
+    /// path replies 0x01 cleanly.
+    #[tokio::test]
+    async fn dialer_after_give_up_fails_closed_never_panics() {
+        let (events, _drain) = tokio::sync::broadcast::channel(8);
+        let handle = SessionHandle::bare(
+            "s-dead",
+            "exit",
+            ChainSer {
+                hops: vec![],
+                max_depth: 3,
+            },
+            vec![],
+            events,
+        );
+        // The exact shape the GaveUp arm leaves behind: hops cleared, exit
+        // slot reset to default before the map entry is removed.
+        handle.wire_exit(Vec::new(), None, None);
+        let d = handle.dialer();
+        assert_eq!(
+            d.capabilities(),
+            Capabilities {
+                accepts_tcp_carrier: false,
+                accepts_udp_carrier: false,
+                dials_tcp: false,
+                dials_udp: false,
+            },
+            "dead egress admits it dials nothing (UDP gate refuses honestly)"
+        );
+        let dst = std::net::SocketAddr::from(([127, 0, 0, 1], 80));
+        let tcp = match d.dial_tcp(dst).await {
+            Err(e) => e,
+            Ok(_) => panic!("dead egress must refuse TCP"),
+        };
+        assert!(
+            tcp.message.contains("session exited"),
+            "error names the cause: {tcp:?}"
+        );
+        let udp = match d.dial_udp(dst).await {
+            Err(e) => e,
+            Ok(_) => panic!("dead egress must refuse UDP"),
+        };
+        assert!(
+            udp.message.contains("session exited"),
+            "error names the cause: {udp:?}"
+        );
+        // The LiveDialer adapter (the proxy's captured egress) resolves
+        // through the same fail-closed path per call.
+        let live = handle.live_dialer();
+        let err = match live.dial_tcp(dst).await {
+            Err(e) => e,
+            Ok(_) => panic!("adapter must fail closed too"),
+        };
+        assert!(
+            err.message.contains("session exited"),
+            "adapter error names the cause: {err:?}"
+        );
+        assert!(
+            !live.capabilities().dials_udp,
+            "adapter capabilities follow the dead egress"
         );
     }
 

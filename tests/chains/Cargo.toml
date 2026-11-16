@@ -10,6 +10,7 @@ qcore-transport-api = { version = "0.2.0", path = "../../crates/qcore-transport-
 qcore-transports = { version = "0.1.0", path = "../../crates/qcore-transports", features = ["tor", "wireguard", "mock"] }
 transport-mock = { version = "0.1.0", package = "qcore-transport-mock", path = "../../crates/qcore-transports/transport-mock" }
 transport-wireguard = { version = "0.1.0", package = "qcore-transport-wireguard", path = "../../crates/qcore-transports/transport-wireguard" }
+boringtun = { workspace = true }
 tokio = { workspace = true }
 
 [[test]]

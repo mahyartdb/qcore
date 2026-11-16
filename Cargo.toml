@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+  "third_party/boringtun",
   "crates/qcore-transport-api",
   "crates/qcore-core",
   "crates/qcore-transports",
@@ -54,6 +55,12 @@ h2 = "0.4"
 arti-client = { version = "0.46", default-features = false, features = ["tokio", "rustls"] }
 tor-rtcompat = "=0.46.0"
 libsqlite3-sys = { version = "0.37", features = ["bundled"] }
+
+# AmneziaWG wire transforms need handshake-plane access inside boringtun;
+# the in-tree copy is 0.7.1 plus those patches (see
+# third_party/boringtun/QCORE_PATCHES.md).
+[patch.crates-io]
+boringtun = { path = "third_party/boringtun" }
 
 [profile.release]
 lto = true

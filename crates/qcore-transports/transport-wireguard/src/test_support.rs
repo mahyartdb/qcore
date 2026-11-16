@@ -54,7 +54,7 @@ impl WgResponder {
                 }
                 let action = {
                     let mut tunnel = tunnel.lock().unwrap();
-                    match tunnel.decapsulate(Some(src.ip()), &buf[..n], &mut plain) {
+                    match tunnel.decapsulate(Some(src.ip()), &mut buf[..n], &mut plain) {
                         TunnResult::WriteToTunnelV4(data, _)
                         | TunnResult::WriteToTunnelV6(data, _) => {
                             if std::env::var("QCORE_WG_TRACE").is_ok() {

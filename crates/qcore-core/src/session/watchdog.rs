@@ -1798,13 +1798,17 @@ mod tests {
                 cause: "injected death".into(),
             })
             .expect("session bus send");
-        // Wait for the rebuild to park inside build (degraded is set, the
-        // unwind of the old hop ran).
-        let parked = poll_until(Instant::now() + Duration::from_secs(5), || {
-            handle.degraded.load(Ordering::SeqCst).then_some(())
+        // Wait until the rebuild has unwound the failed hop. `degraded` is
+        // set BEFORE `attempt_rebuild` snapshots the live entry, so waiting
+        // on it let the test remove the entry first: the rebuild then found
+        // no entry and gave up without building anything, and the rebuilt-
+        // hop stop assertion never fired under load. The unwind's stop
+        // counter (HOP_REG) is the explicit post-snapshot signal.
+        let unwound = poll_until(Instant::now() + Duration::from_secs(5), || {
+            (hop_stops(0) >= 1).then_some(())
         })
         .await;
-        assert!(parked.is_some(), "watchdog entered the rebuild");
+        assert!(unwound.is_some(), "watchdog unwound the failed hop");
         // The entry vanishes (stop_session removed it mid-rebuild).
         lock_map(&f.live).remove(&handle.id);
         // Let the rebuild finish: the Rebuilt arm now finds no entry.

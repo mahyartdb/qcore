@@ -9,6 +9,7 @@ pub mod hop;
 pub mod import;
 pub mod obfuscation;
 pub mod profile_dir;
+pub mod routing;
 pub mod secret;
 
 pub use hop::{

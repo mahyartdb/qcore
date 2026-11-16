@@ -19,6 +19,9 @@ tokio = { workspace = true }
 async-trait = { workspace = true }
 qcore-ffi = { version = "0.1.0", path = "../../crates/qcore-ffi" }
 base64 = { workspace = true }
+# AWG test double (`src/awg_peer.rs`) installs the same vendored transforms as
+# the hop under test; transport-wireguard does not re-export `Tunn`.
+boringtun = { workspace = true }
 
 [dev-dependencies]
 rcgen = { workspace = true }

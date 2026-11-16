@@ -13,6 +13,7 @@ pub mod proxy;
 pub mod reconnect;
 pub mod report;
 pub mod resolver;
+pub mod routing;
 pub mod watchdog;
 
 use crate::chain::Chain;

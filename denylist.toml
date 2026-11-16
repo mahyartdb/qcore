@@ -40,7 +40,6 @@ deny = [
 # line(s) so any NEW duplicate still fails the gate. Reassess on subtree upgrades.
 skip = [
     { crate = "atomic@0.5.3", reason = "older line pinned by transitive subtree; newest 0.6.1 stays enforced" },
-    { crate = "base64@0.22.1", reason = "older line pinned by boringtun 0.7; newest 0.23.1 stays enforced" },
     { crate = "bitflags@1.3.2", reason = "lock-level duplicate: defmt 1.1 optional bitflags 1.x dep (chrono/jiff/tinyvec/enumset features); only 2.x resolves in any target graph — skip guards the name against new duplicates (deny-sync contract)" },
     { crate = "indexmap@1.9.3", reason = "lock-level duplicate: serde_with 3.23 optional indexmap 1.x dep + sharded-slab 0.1 (tracing-subscriber dev-tree); only 2.x resolves — skip guards the name against new duplicates (deny-sync contract)" },
     { crate = "schemars@0.9.0", reason = "lock-level duplicate: serde_with 3.23 optional schemars 0.9 dep; only 1.x resolves — skip guards the name against new duplicates (deny-sync contract)" },

@@ -11,6 +11,7 @@ use qcore_core::api::{Engine, EngineConfig, Preflight};
 use qcore_core::chain::ExpandedHop;
 use qcore_core::config::import::{store_import, ConfigImport};
 use qcore_core::config::profile_dir::ProfileDirs;
+use transport_wireguard::awg::AwgParams;
 use transport_wireguard::test_support::{generate_keypair, WgResponder};
 
 fn b64(data: &[u8]) -> String {
@@ -100,9 +101,23 @@ async fn awg_alone_establishes_with_exit_egress() {
     let dir = work("awg");
     let (c_sk, c_pk) = generate_keypair();
     let (s_sk, s_pk) = generate_keypair();
-    let responder = WgResponder::spawn("127.0.0.1".parse().unwrap(), s_sk, c_pk)
-        .await
-        .unwrap();
+    // Real AWG params demand a peer carrying the same transforms: since the
+    // handshake-plane work, a stock WireGuard responder refuses (by design —
+    // the transforms change the wire format). Spawn a vendored-boringtun
+    // responder with the conf's S/H values installed.
+    let params = AwgParams {
+        s1: 24,
+        s2: 18,
+        s3: 30,
+        s4: 16,
+        h1: 1234567,
+        h2: 2345678,
+        h3: 3456789,
+        h4: 4567890,
+        i1: Some("quic".to_string()),
+        ..AwgParams::default()
+    };
+    let responder = awg_responder("127.0.0.1".parse().unwrap(), s_sk, c_pk, params).await;
     let r = import_conf(
         &dir,
         "awg-home.conf",
@@ -112,9 +127,62 @@ async fn awg_alone_establishes_with_exit_egress() {
     let handle = engine
         .start(vec![imported_hop("awg", &r, "awg-0")])
         .await
-        .expect("AWG establishes (plain handshake; obfuscation lands in US5)");
+        .expect("AWG establishes against an AWG peer");
     assert_eq!(handle.exit_hop_id, "awg-0", "exit is the declared hop");
     handle.stop_all().await.expect("clean stop");
+}
+
+/// Handshake-only AWG responder (same shape as the conformance double in
+/// `tests/conformance/src/awg_peer.rs`; kept local because tests-chains
+/// cannot depend on the conformance crate).
+async fn awg_responder(
+    bind_ip: std::net::IpAddr,
+    private_key: [u8; 32],
+    peer_public_key: [u8; 32],
+    params: AwgParams,
+) -> AwgPeer {
+    let udp = tokio::net::UdpSocket::bind(std::net::SocketAddr::new(bind_ip, 0))
+        .await
+        .unwrap();
+    let addr = udp.local_addr().unwrap();
+    let mut tunnel = boringtun::noise::Tunn::new(
+        boringtun::x25519::StaticSecret::from(private_key),
+        boringtun::x25519::PublicKey::from(peer_public_key),
+        None,
+        None,
+        0,
+        None,
+    );
+    tunnel
+        .set_awg_params(Some(params.to_wire()))
+        .expect("AWG params accepted");
+    let tunnel = std::sync::Arc::new(std::sync::Mutex::new(tunnel));
+    let sock = std::sync::Arc::new(udp);
+    let task = tokio::spawn(async move {
+        let mut buf = vec![0u8; 65535];
+        let mut plain = vec![0u8; 65535];
+        loop {
+            let Ok((n, src)) = sock.recv_from(&mut buf).await else {
+                break;
+            };
+            let action = {
+                let mut tunnel = tunnel.lock().unwrap();
+                match tunnel.decapsulate(Some(src.ip()), &mut buf[..n], &mut plain) {
+                    boringtun::noise::TunnResult::WriteToNetwork(reply) => Some(reply.to_vec()),
+                    _ => None,
+                }
+            };
+            if let Some(bytes) = action {
+                sock.send_to(&bytes, src).await.ok();
+            }
+        }
+    });
+    AwgPeer { addr, _task: task }
+}
+
+struct AwgPeer {
+    addr: std::net::SocketAddr,
+    _task: tokio::task::JoinHandle<()>,
 }
 
 #[tokio::test]

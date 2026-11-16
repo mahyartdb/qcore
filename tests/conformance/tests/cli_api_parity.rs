@@ -265,3 +265,52 @@ fn shortcuts_reparse_through_public_grammar() {
         "canonical reparse is stable via public API"
     );
 }
+
+#[test]
+fn routing_rules_are_public_data() {
+    // `connect --routing` / `<profile-dir>/routing.toml`: parsing and the
+    // first-match decision live in the public session layer; the CLI only
+    // loads the file and hands the `Router` to the proxy.
+    use qcore_core::session::routing::{Action, Router};
+
+    let dirs = work("routing");
+    dirs.ensure_dirs().expect("dirs");
+    std::fs::write(
+        dirs.profile_dir.join("routing.toml"),
+        r#"
+[[rules]]
+match = { domain = "example.com", port = 443 }
+action = "block"
+
+[[rules]]
+match = { cidr = "10.0.0.0/8" }
+action = "direct"
+"#,
+    )
+    .expect("writes routing file");
+
+    let router = Router::load_optional(&dirs).expect("parses via public API");
+    assert!(!router.is_empty(), "the profile dir file is picked up");
+    assert_eq!(
+        router.decide(Some("a.example.com"), None, 443),
+        Action::Block,
+        "first matching rule decides on a domain label boundary"
+    );
+    assert_eq!(
+        router.decide(Some("notexample.com"), None, 443),
+        Action::Proxy,
+        "an absent rule keeps the all-tunnel default"
+    );
+    assert_eq!(
+        router.decide(None, Some(&"10.1.2.3".parse().unwrap()), 80),
+        Action::Direct,
+        "a literal address matches CIDR rules"
+    );
+
+    let missing = dirs.profile_dir.join("absent.toml");
+    assert!(
+        Router::load(&missing).is_err(),
+        "an explicit --routing path must exist (exit 6 in the CLI)"
+    );
+    let _ = std::fs::remove_dir_all(&dirs.config_dir);
+}

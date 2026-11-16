@@ -2,49 +2,111 @@ name: release
 on:
   push:
     tags: ["v*"]
+  # Dry-run mode (constitution: "do not tag v* until the full matrix has a
+  # dry-run pass"). Same 9-leg matrix as a tag push, but nothing is published:
+  # the per-target archives and the finalized dist set stay as workflow
+  # artifacts, and the publish job is skipped. A green run of this mode is the
+  # evidence that unblocks tagging.
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  # Tier C (tag): every target the matrix proves is built, smoked, packaged
-  # and uploaded per-target by its own runner — no artifact is produced on a
-  # host that did not prove it. DOCUMENTED STUB (T7 story 18), not yet proven
-  # end-to-end (issue #16 triage): the matrix below covers 3/9
-  # xtask/src/targets.toml entries (Windows only) and MUST match the COVERED
-  # list in `xtask/src/release.rs::run` triple-for-triple. The contract side
-  # cannot drift: release.rs reads CONTRACT from targets.toml at compile
-  # time, and publish's `cargo xtask release --allow-partial-matrix
-  # --staged-artifacts` still names the 6 unproven
-  # targets in its log instead of claiming them.
-  # Expanding to all 9 is DEFERRED: removing/demoting targets needs a
-  # constitution amendment, and the linux/android legs need runner capacity
-  # plus a tag dry-run. Do not tag `v*` until the matrix is complete and a
-  # dry-run passes (AGENTS.md Release row).
+  # Tier C (tag or dry-run): every target declared in xtask/src/targets.toml is
+  # built, smoked, packaged and uploaded by its own runner — no artifact is
+  # produced on a host that did not prove it. The triple list below must match
+  # targets.toml triple-for-triple: `xtask release` parses this file's matrix at
+  # compile time (release.rs::matrix_targets) and fails closed on drift in
+  # either direction, and the `runner` column mirrors that file's `runner`
+  # field. Backends stay single-sourced in xtask/src/build.rs — every leg
+  # drives `cargo xtask build|smoke|package`, which picks native-msvc /
+  # cross-rs / cargo-ndk from the triple; the versions installed below are
+  # that file's pins (CROSS_RS_VERSION, CARGO_NDK_VERSION).
   # Tier C green checklist (definition only, no results claimed):
   # - per-target build+smoke logs for all declared triples in
   #   xtask/src/targets.toml;
   # - per-artifact signature / attestation / SBOM checks.
   matrix:
     strategy:
+      # A dry run is evidence only if every leg reports: one failing leg must
+      # not cancel the other eight.
+      fail-fast: false
       matrix:
-        target:
-          - i686-pc-windows-msvc
-          - x86_64-pc-windows-msvc
-          - aarch64-pc-windows-msvc
-    runs-on: ${{ contains(matrix.target, 'aarch64') && 'windows-11-arm' || 'windows-2022' }}
+        include:
+          - target: i686-pc-windows-msvc
+            runner: windows-2022
+          - target: x86_64-pc-windows-msvc
+            runner: windows-2022
+          - target: aarch64-pc-windows-msvc
+            runner: windows-11-arm
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+          - target: i686-unknown-linux-gnu
+            runner: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04
+          - target: armv7-unknown-linux-gnueabihf
+            runner: ubuntu-22.04
+          - target: aarch64-linux-android
+            runner: ubuntu-22.04
+          - target: armv7-linux-androideabi
+            runner: ubuntu-22.04
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo xtask build --target ${{ matrix.target }}
-      - run: cargo xtask smoke --target ${{ matrix.target }}
+      # cross-rs is the linux-gnu backend. Docker is preinstalled on GitHub
+      # ubuntu runners (cross runs its build inside the target image); only the
+      # pinned CLI has to be installed.
+      - name: cache cross-rs
+        if: contains(matrix.target, '-linux-gnu')
+        id: cross-bin
+        uses: actions/cache@v4
+        with:
+          path: "~/.cargo/bin/cross*"
+          key: cross-${{ runner.os }}-${{ runner.arch }}-0.2.5
+      - name: install cross-rs 0.2.5
+        if: contains(matrix.target, '-linux-gnu') && steps.cross-bin.outputs.cache-hit != 'true'
+        run: cargo install cross --version 0.2.5 --locked
+      # cargo-ndk is the android backend: NDK r23+ plus the target std on the
+      # rust-toolchain.toml channel (dtolnay/rust-toolchain's `targets:` would
+      # add it to `stable`, not to the pinned 1.97.1 channel).
+      - name: set up Android SDK
+        if: contains(matrix.target, 'android')
+        uses: android-actions/setup-android@v3
+      - name: cache cargo-ndk
+        if: contains(matrix.target, 'android')
+        id: ndk-bin
+        uses: actions/cache@v4
+        with:
+          path: "~/.cargo/bin/cargo-ndk*"
+          key: cargo-ndk-${{ runner.os }}-${{ runner.arch }}-3.2.0
+      - name: install cargo-ndk 3.2.0
+        if: contains(matrix.target, 'android') && steps.ndk-bin.outputs.cache-hit != 'true'
+        run: cargo install cargo-ndk --version 3.2.0 --locked
+      - name: install Android NDK r27
+        if: contains(matrix.target, 'android')
+        run: |
+          yes | sdkmanager --licenses > /dev/null
+          sdkmanager --install "ndk;27.0.12077973"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.0.12077973" >> "$GITHUB_ENV"
+      - name: add target std
+        if: contains(matrix.target, 'android')
+        run: rustup target add ${{ matrix.target }}
+      - name: build
+        run: cargo xtask build --target ${{ matrix.target }}
+      - name: smoke
+        run: cargo xtask smoke --target ${{ matrix.target }}
       # Package THIS matrix target (container format from targets.toml's
-      # delivery field; SBOM + SHA256SUMS are rewritten at publish from the
+      # delivery field; SBOM + SHA256SUMS are rewritten at finalize from the
       # staged set, so per-leg packaging only needs the archive itself).
-      - run: cargo xtask package --target ${{ matrix.target }}
+      - name: package
+        run: cargo xtask package --target ${{ matrix.target }}
       # The archive is the only publish input from this leg: correct
       # provenance (built + packaged on the runner that proved the target),
-      # not a linux-side native package standing in for Windows.
+      # not a linux-side native package standing in for another platform.
       - uses: actions/upload-artifact@v4
         with:
           name: qcore-${{ matrix.target }}
@@ -52,45 +114,70 @@ jobs:
             target/dist/qcore-*.zip
             target/dist/qcore-*.tar.gz
           if-no-files-found: error
-  publish:
-    # Publish scope: the per-target artifacts uploaded by the matrix legs
-    # (3/9 targets proven today; see header checklist). Stages them, writes
-    # the full-graph SBOM + SHA256SUMS, cosign-signs keylessly — this job
-    # does NOT rebuild or re-package on its own host.
+
+  # Finalize (tag AND dry-run): stage the nine per-target archives, write the
+  # full-graph SBOM + SHA256SUMS, cosign-sign keylessly. A dry run that skipped
+  # this would not prove the publish path, so it runs in both modes; it never
+  # touches a GitHub Release.
+  finalize:
     needs: [matrix]
     runs-on: ubuntu-22.04
+    timeout-minutes: 30
     permissions:
-      contents: write # GitHub release artifacts
+      contents: read
       id-token: write # cosign keyless signing
     steps:
       - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
-      # Cosign FIRST: package/signing steps depend on it; installing it
-      # after packaging meant the signing branch in release.rs never fired.
+      # Cosign FIRST: finalize treats a missing cosign as a hard error and
+      # would fail the job before the signing step existed.
       - uses: sigstore/cosign-installer@v3
-      # Download every matrix leg's archive into one staging dir; the
-      # wildcard keeps this step correct as the matrix grows.
+      # Download every matrix leg's archive into one staging dir; the wildcard
+      # keeps this step correct as the matrix grows.
       - uses: actions/download-artifact@v4
         with:
           path: staged-artifacts
           pattern: qcore-*
           merge-multiple: true
-      # Finalize only: stage downloaded artifacts, full-graph SBOM,
-      # SHA256SUMS, cosign signature. --allow-partial-matrix is required and
-      # honest here: the matrix above proves exactly the 3 Windows legs and
-      # release.rs names the 6 unproven ones in the log.
-      - run: >-
-          cargo xtask release --allow-partial-matrix
+      # Stage + hash + sign. No --allow-partial-matrix: the matrix above now
+      # proves all nine targets, and release.rs reads that coverage from this
+      # file rather than a hand-kept list.
+      - name: finalize staged artifacts
+        run: >-
+          cargo xtask release
           --staged-artifacts staged-artifacts
-      # Upload the finalized dist set to the GitHub release for this tag.
+      # Hand the finalized set (archives + SBOM + SHA256SUMS + .sig) to the
+      # publish job, and keep it inspectable on a dry run.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qcore-finalized
+          path: target/dist/*
+          if-no-files-found: error
+
+  # Publish (tag only): create the Release if the tag push did not, then upload
+  # the finalized dist set. contents: write lives only here, so a dry run never
+  # holds a token that could write to the repository.
+  publish:
+    needs: [finalize]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      contents: write # GitHub release artifacts
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: qcore-finalized
+          path: target/dist
       # A tag push creates the git tag only, not the Release object — create
       # it first (with --verify-tag, generating notes from commits) or the
       # upload below fails with "release not found" on the first tag.
-      # --clobber so a re-run of the publish job replaces instead of
-      # erroring on existing assets. gh is preinstalled on GitHub runners;
-      # GITHUB_TOKEN with contents:write (granted above) authorizes it.
+      # --clobber so a re-run of the publish job replaces instead of erroring
+      # on existing assets. gh is preinstalled on GitHub runners; GITHUB_TOKEN
+      # with contents:write (granted above) authorizes it.
       - name: ensure release exists
         run: >-
           gh release view "$GITHUB_REF_NAME" --json id >/dev/null 2>&1 ||

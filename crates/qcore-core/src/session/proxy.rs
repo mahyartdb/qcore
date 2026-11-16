@@ -22,11 +22,19 @@
 //! rejected peer is closed without a reply (no SOCKS reply is possible
 //! before the greeting) and diagnosed on stderr.
 //!
+//! Routing (`routing.toml`, [`Router`]) is consulted after the handshake
+//! parse and before any egress: `block` refuses (SOCKS 0x02, HTTP 403),
+//! `direct` dials from the host network stack (no tunnel dialer; the leak
+//! trade-off is documented in `contracts/cli.md`), and the default `proxy`
+//! keeps the tunnel path. `direct` TCP still rides the same relay bounds and
+//! the accept-time peer filter.
+//!
 //! The CLI serves SOCKS (`--bind`) and HTTP CONNECT (`--http-proxy`) with
 //! a second listener through the same dial path.
 
-use super::net::{FamilyMode, FamilyPolicy};
+use super::net::{FamilyMode, FamilyPolicy, SocketUdpFlow, TcpByteStream};
 use super::resolver::{ResolverError, TunnelResolver};
+use super::routing::{Action, Router};
 use qcore_transport_api::{unspecified_bind, ByteStream, Dialer, HopErrorKind, UdpFlow};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -172,6 +180,29 @@ pub async fn serve_socks_via_dialer_with_services(
     peers: PeerPolicy,
     resolver: Option<Arc<TunnelResolver>>,
 ) -> std::io::Result<()> {
+    serve_socks_via_dialer_with_routing(
+        listener,
+        dialer,
+        policy,
+        peers,
+        resolver,
+        Arc::new(Router::all_proxy()),
+    )
+    .await
+}
+
+/// [`serve_socks_via_dialer_with_services`] plus a routing table
+/// (`routing.toml`): every CONNECT target and UDP destination is decided
+/// after the handshake parse and before any dial. Semantics live on
+/// [`Router`]; `Router::all_proxy()` is the historic all-tunnel behavior.
+pub async fn serve_socks_via_dialer_with_routing(
+    listener: tokio::net::TcpListener,
+    dialer: Arc<dyn Dialer>,
+    policy: FamilyPolicy,
+    peers: PeerPolicy,
+    resolver: Option<Arc<TunnelResolver>>,
+    router: Arc<Router>,
+) -> std::io::Result<()> {
     let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     let udp_slots = Arc::new(tokio::sync::Semaphore::new(MAX_UDP_ASSOCIATIONS));
     loop {
@@ -197,6 +228,7 @@ pub async fn serve_socks_via_dialer_with_services(
         let dialer = dialer.clone();
         let policy = policy.clone();
         let resolver = resolver.clone();
+        let router = router.clone();
         let udp_slots = udp_slots.clone();
         // Unbounded spawn is a task-exhaustion primitive: shed load by
         // closing the socket when every slot is busy.
@@ -206,9 +238,16 @@ pub async fn serve_socks_via_dialer_with_services(
         };
         tokio::spawn(async move {
             let _permit = permit;
-            handle_connect(socket, &*dialer, &policy, resolver.as_deref(), &udp_slots)
-                .await
-                .ok();
+            handle_connect(
+                socket,
+                &*dialer,
+                &policy,
+                resolver.as_deref(),
+                &router,
+                &udp_slots,
+            )
+            .await
+            .ok();
         });
     }
 }
@@ -233,6 +272,27 @@ pub async fn serve_http_proxy(
     peers: PeerPolicy,
     resolver: Option<Arc<TunnelResolver>>,
 ) -> std::io::Result<()> {
+    serve_http_proxy_with_routing(
+        listener,
+        dialer,
+        policy,
+        peers,
+        resolver,
+        Arc::new(Router::all_proxy()),
+    )
+    .await
+}
+
+/// [`serve_http_proxy`] plus a routing table, sharing the SOCKS listener's
+/// decision path (`block` → `403`, `direct` → host-network dial).
+pub async fn serve_http_proxy_with_routing(
+    listener: tokio::net::TcpListener,
+    dialer: Arc<dyn Dialer>,
+    policy: FamilyPolicy,
+    peers: PeerPolicy,
+    resolver: Option<Arc<TunnelResolver>>,
+    router: Arc<Router>,
+) -> std::io::Result<()> {
     let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     loop {
         let (socket, peer) = match listener.accept().await {
@@ -252,13 +312,14 @@ pub async fn serve_http_proxy(
         let dialer = dialer.clone();
         let policy = policy.clone();
         let resolver = resolver.clone();
+        let router = router.clone();
         let Ok(permit) = slots.clone().try_acquire_owned() else {
             drop(socket);
             continue;
         };
         tokio::spawn(async move {
             let _permit = permit;
-            handle_http_connect(socket, &*dialer, &policy, resolver.as_deref())
+            handle_http_connect(socket, &*dialer, &policy, resolver.as_deref(), &router)
                 .await
                 .ok();
         });
@@ -270,6 +331,7 @@ async fn handle_connect(
     dialer: &dyn Dialer,
     policy: &FamilyPolicy,
     resolver: Option<&TunnelResolver>,
+    router: &Router,
     udp_slots: &Arc<tokio::sync::Semaphore>,
 ) -> std::io::Result<()> {
     let mut socket = socket;
@@ -302,14 +364,16 @@ async fn handle_connect(
         ));
     }
     match req[1] {
-        0x01 => handle_tcp_connect(socket, dialer, policy, resolver, req[3]).await,
+        0x01 => handle_tcp_connect(socket, dialer, policy, resolver, router, req[3]).await,
         0x03 => {
             // The ASSOCIATE request's address is the client's expected
             // send-from endpoint (usually 0.0.0.0:0), not a routing target —
-            // it is consumed for the protocol shape and discarded; the
-            // dual default disables family gating that must not apply here
-            // (real per-datagram destinations are gated in the relay).
-            let _expected_client =
+            // it is consumed for the protocol shape and, when concrete,
+            // checked against the routing table (a blocked association
+            // answers 0x02). Per-datagram destinations are decided in the
+            // relay. The dual default disables family gating that must not
+            // apply here.
+            let expected_client =
                 match read_addr(&mut socket, req[3], &FamilyPolicy::default()).await {
                     Ok(addr) => addr,
                     Err(e) => {
@@ -317,6 +381,20 @@ async fn handle_connect(
                         return Err(e);
                     }
                 };
+            if let SocksTarget::Ip(addr) = expected_client {
+                // An unspecified address/port means "no expectation": it is
+                // not a destination, so rules must not refuse on it.
+                if !addr.ip().is_unspecified()
+                    && addr.port() != 0
+                    && router.decide(None, Some(&addr.ip()), addr.port()) == Action::Block
+                {
+                    write_reply(&mut socket, 0x02).await.ok();
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!("UDP association address {addr} blocked by routing rule"),
+                    ));
+                }
+            }
             let peer = socket.peer_addr()?;
             // A separate, smaller budget: associations hold their control
             // slot plus a relay socket plus per-destination flows.
@@ -327,7 +405,7 @@ async fn handle_connect(
                     "too many concurrent UDP associations",
                 ));
             };
-            handle_udp_associate(socket, dialer, policy, resolver, peer, permit).await
+            handle_udp_associate(socket, dialer, policy, resolver, router, peer, permit).await
         }
         _ => {
             write_reply(&mut socket, 0x07).await?;
@@ -344,6 +422,7 @@ async fn handle_tcp_connect(
     dialer: &dyn Dialer,
     policy: &FamilyPolicy,
     resolver: Option<&TunnelResolver>,
+    router: &Router,
     atyp: u8,
 ) -> std::io::Result<()> {
     let target = match read_addr(&mut socket, atyp, policy).await {
@@ -353,6 +432,96 @@ async fn handle_tcp_connect(
             return Err(e);
         }
     };
+    // Routing decides BEFORE any dial: a block rule must never leak a
+    // connection, and a direct rule must not touch the tunnel dialer.
+    // Domain and port-only rules are applied on the name first; only CIDR
+    // rules need an address, which comes from the tunnel resolver (never the
+    // OS resolver — a domain name must not leak). A hostname-capable exit's
+    // remote resolution is bypassed for such targets because the rule needs
+    // the address on this side.
+    let mut direct: Option<SocksTarget> = None;
+    let mut resolved: Option<SocketAddr> = None;
+    match &target {
+        SocksTarget::Ip(addr) => match router.decide(None, Some(&addr.ip()), addr.port()) {
+            Action::Block => {
+                write_reply(&mut socket, 0x02).await.ok();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("{addr} blocked by routing rule"),
+                ));
+            }
+            Action::Direct => direct = Some(target.clone()),
+            Action::Proxy => {}
+        },
+        SocksTarget::Domain(host, port) => match router.decide(Some(host), None, *port) {
+            Action::Block => {
+                write_reply(&mut socket, 0x02).await.ok();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("domain `{host}` blocked by routing rule"),
+                ));
+            }
+            Action::Direct => direct = Some(target.clone()),
+            Action::Proxy if router.cidr_needs_resolution(*port) => {
+                let Some(resolver) = resolver else {
+                    write_reply(&mut socket, 0x08).await.ok();
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "domain CONNECT target needs tunnel resolution to apply CIDR routing rules",
+                    ));
+                };
+                let ip = match resolver.resolve(host, policy).await {
+                    Ok(ip) => ip,
+                    Err(e) => {
+                        let rep = reply_for_resolver(&e);
+                        write_reply(&mut socket, rep).await.ok();
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("domain target `{host}` did not resolve: {e}"),
+                        ));
+                    }
+                };
+                let addr = SocketAddr::new(ip, *port);
+                match router.decide(Some(host), Some(&ip), *port) {
+                    Action::Block => {
+                        write_reply(&mut socket, 0x02).await.ok();
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            format!("domain `{host}` ({addr}) blocked by routing rule"),
+                        ));
+                    }
+                    Action::Direct => direct = Some(SocksTarget::Ip(addr)),
+                    Action::Proxy => resolved = Some(addr),
+                }
+            }
+            Action::Proxy => {}
+        },
+    }
+    if let Some(target) = direct {
+        // Direct egress: the host's own network stack, no tunnel dialer. A
+        // domain resolves locally (that is direct's documented trade-off).
+        // PeerPolicy and the relay bounds still apply (peer at accept, relay
+        // below).
+        let upstream = match direct_connect(target).await {
+            Ok(s) => s,
+            Err(e) => {
+                write_reply(&mut socket, 0x05).await.ok();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    format!("direct dial failed: {e}"),
+                ));
+            }
+        };
+        write_reply(&mut socket, 0x00).await?;
+        return relay_with_idle_bounds(
+            socket,
+            Box::new(TcpByteStream::new(upstream)),
+            RELAY_IDLE_TIMEOUT,
+            RELAY_TOTAL_BACKSTOP,
+            RELAY_WATCHDOG_POLL,
+        )
+        .await;
+    }
     // A domain target is resolved through the tunnel resolver — never the
     // OS resolver (the domain name must not leak around the tunnel). No
     // resolver wired (the exit hop has no UDP egress, or none was built) or
@@ -365,45 +534,49 @@ async fn handle_tcp_connect(
     let target = match target {
         SocksTarget::Ip(addr) => addr,
         SocksTarget::Domain(host, port) => {
-            match dialer.dial_host(&host, port, DIAL_HOST_TIMEOUT).await {
-                Ok(upstream) => {
-                    write_reply(&mut socket, 0x00).await?;
-                    return relay_with_idle_bounds(
-                        socket,
-                        upstream,
-                        RELAY_IDLE_TIMEOUT,
-                        RELAY_TOTAL_BACKSTOP,
-                        RELAY_WATCHDOG_POLL,
-                    )
-                    .await;
+            if let Some(addr) = resolved {
+                addr
+            } else {
+                match dialer.dial_host(&host, port, DIAL_HOST_TIMEOUT).await {
+                    Ok(upstream) => {
+                        write_reply(&mut socket, 0x00).await?;
+                        return relay_with_idle_bounds(
+                            socket,
+                            upstream,
+                            RELAY_IDLE_TIMEOUT,
+                            RELAY_TOTAL_BACKSTOP,
+                            RELAY_WATCHDOG_POLL,
+                        )
+                        .await;
+                    }
+                    // Capability signal (default method) or target-shape
+                    // refusal: fall through to tunnel-DNS resolution below.
+                    Err(e) if e.kind == HopErrorKind::Validation => {}
+                    Err(e) => {
+                        write_reply(&mut socket, 0x05).await.ok();
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::ConnectionRefused,
+                            e.message,
+                        ));
+                    }
                 }
-                // Capability signal (default method) or target-shape
-                // refusal: fall through to tunnel-DNS resolution below.
-                Err(e) if e.kind == HopErrorKind::Validation => {}
-                Err(e) => {
-                    write_reply(&mut socket, 0x05).await.ok();
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::ConnectionRefused,
-                        e.message,
-                    ));
-                }
-            }
-            let Some(resolver) = resolver else {
-                write_reply(&mut socket, 0x08).await.ok();
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "domain CONNECT targets refused (no tunnel resolver wired; use a literal IP)",
-                ));
-            };
-            match resolver.resolve(&host, policy).await {
-                Ok(ip) => SocketAddr::new(ip, port),
-                Err(e) => {
-                    let rep = reply_for_resolver(&e);
-                    write_reply(&mut socket, rep).await.ok();
+                let Some(resolver) = resolver else {
+                    write_reply(&mut socket, 0x08).await.ok();
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
-                        format!("domain target `{host}` did not resolve: {e}"),
+                        "domain CONNECT targets refused (no tunnel resolver wired; use a literal IP)",
                     ));
+                };
+                match resolver.resolve(&host, policy).await {
+                    Ok(ip) => SocketAddr::new(ip, port),
+                    Err(e) => {
+                        let rep = reply_for_resolver(&e);
+                        write_reply(&mut socket, rep).await.ok();
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("domain target `{host}` did not resolve: {e}"),
+                        ));
+                    }
                 }
             }
         }
@@ -433,6 +606,18 @@ async fn handle_tcp_connect(
     .await
 }
 
+/// Host-network TCP dial: the `direct` routing action's egress. A domain
+/// resolves through the OS resolver — direct means "outside the tunnel", so
+/// local resolution is the correct (and documented) behavior.
+async fn direct_connect(target: SocksTarget) -> std::io::Result<tokio::net::TcpStream> {
+    match target {
+        SocksTarget::Ip(addr) => tokio::net::TcpStream::connect(addr).await,
+        SocksTarget::Domain(host, port) => {
+            tokio::net::TcpStream::connect((host.as_str(), port)).await
+        }
+    }
+}
+
 /// RFC 1928 UDP ASSOCIATE: reply with a local relay endpoint, then ferry
 /// datagrams between the client and the exit hop's [`UdpFlow`] egress.
 ///
@@ -449,6 +634,12 @@ async fn handle_tcp_connect(
 /// same policy as CONNECT); UDP has no per-datagram error channel, so
 /// undeliverable datagrams are dropped silently.
 ///
+/// Routing applies per datagram: a `block` destination is dropped (UDP has
+/// no per-datagram error channel), a `direct` destination relays through a
+/// plain host UDP socket (no tunnel flow), `proxy` keeps the tunnel flow. A
+/// concrete ASSOCIATE request address (not the usual 0.0.0.0:0) that a rule
+/// blocks refuses the association with 0x02.
+///
 /// The association ends when the control connection closes (RFC 1928 §6) or
 /// after [`UDP_ASSOCIATION_IDLE`] without datagram movement.
 async fn handle_udp_associate(
@@ -456,6 +647,7 @@ async fn handle_udp_associate(
     dialer: &dyn Dialer,
     policy: &FamilyPolicy,
     resolver: Option<&TunnelResolver>,
+    router: &Router,
     peer: SocketAddr,
     _permit: OwnedSemaphorePermit,
 ) -> std::io::Result<()> {
@@ -491,7 +683,7 @@ async fn handle_udp_associate(
     write_reply_with_bind(&mut socket, 0x00, relay_addr).await?;
 
     let (reply_tx, mut reply_rx) = mpsc::channel::<(SocketAddr, Vec<u8>)>(UDP_RELAY_QUEUE);
-    let mut flows: HashMap<SocketAddr, Arc<dyn UdpFlow>> = HashMap::new();
+    let mut flows: HashMap<(SocketAddr, bool), Arc<dyn UdpFlow>> = HashMap::new();
     // Client pin (S2.6): the TCP control connection's peer IP is the
     // associating client's identity — datagrams are accepted only from that
     // IP (any port: NAT reprices ports mid-association). First-datagram-wins
@@ -544,23 +736,44 @@ async fn handle_udp_associate(
                         continue;
                     }
                     Some(UdpDatagram::To { dst, payload_at }) => {
-                        let Some(dst_addr) =
-                            resolve_udp_dst(dst, policy, resolver).await
-                        else {
-                            continue;
+                        // Routing decides per destination, before any flow
+                        // exists. A blocked datagram is dropped silently:
+                        // UDP has no per-datagram error channel (the
+                        // association-level refusal is answered at ASSOCIATE
+                        // time). A direct destination gets a plain host UDP
+                        // socket, never a tunnel flow.
+                        let route = route_udp_dst(router, &dst, policy, resolver).await;
+                        let (dst_addr, direct) = match route {
+                            UdpRoute::Drop => continue,
+                            UdpRoute::Tunnel(addr) => (addr, false),
+                            UdpRoute::Direct(addr) => (addr, true),
                         };
-                        if !flows.contains_key(&dst_addr) {
+                        // Keyed by (address, route): two names may resolve to
+                        // the same address under different rules, and a
+                        // direct target must never ride (or be reached
+                        // through) a tunnel flow built for the other route.
+                        let key = (dst_addr, direct);
+                        if !flows.contains_key(&key) {
                             if flows.len() >= UDP_MAX_FLOWS {
                                 continue; // at the flow cap: drop, never evict
                             }
-                            let Ok(flow) = dialer.dial_udp(dst_addr).await else {
-                                continue;
+                            let flow: Arc<dyn UdpFlow> = if direct {
+                                match tokio::net::UdpSocket::bind(unspecified_bind(&dst_addr))
+                                    .await
+                                {
+                                    Ok(socket) => Arc::new(SocketUdpFlow::new(socket)),
+                                    Err(_) => continue,
+                                }
+                            } else {
+                                let Ok(flow) = dialer.dial_udp(dst_addr).await else {
+                                    continue;
+                                };
+                                Arc::from(flow)
                             };
-                            let flow: Arc<dyn UdpFlow> = Arc::from(flow);
-                            flows.insert(dst_addr, flow.clone());
+                            flows.insert(key, flow.clone());
                             spawn_udp_forwarder(flow, dst_addr, reply_tx.clone());
                         }
-                        let flow = flows.get(&dst_addr).expect("inserted or checked above");
+                        let flow = flows.get(&key).expect("inserted or checked above");
                         let _ = flow.send_to(&buf[payload_at..n], dst_addr).await;
                     }
                 }
@@ -648,6 +861,65 @@ async fn resolve_udp_dst(
     }
 }
 
+/// One UDP datagram's routing outcome.
+enum UdpRoute {
+    /// Tunnel egress through a dialed [`UdpFlow`].
+    Tunnel(SocketAddr),
+    /// Host-network egress to this address (a plain UDP socket, no tunnel
+    /// flow).
+    Direct(SocketAddr),
+    /// Refused or unresolvable: drop the datagram.
+    Drop,
+}
+
+/// Decide and resolve one UDP destination. Domains are decided on the name
+/// first; when CIDR rules need an address (or the tunnel path needs one for
+/// dialing), the name resolves through the tunnel resolver — the proxy's
+/// no-OS-leak policy. A `direct` domain resolves through the OS resolver:
+/// direct means host-network egress, and the flow key must be an address.
+async fn route_udp_dst(
+    router: &Router,
+    dst: &SocksTarget,
+    policy: &FamilyPolicy,
+    resolver: Option<&TunnelResolver>,
+) -> UdpRoute {
+    let (host, port, literal) = match dst {
+        SocksTarget::Ip(addr) => (None, addr.port(), Some(addr.ip())),
+        SocksTarget::Domain(host, port) => (Some(host.as_str()), *port, None),
+    };
+    match router.decide(host, literal.as_ref(), port) {
+        Action::Block => UdpRoute::Drop,
+        Action::Direct => match dst {
+            SocksTarget::Ip(addr) => UdpRoute::Direct(*addr),
+            SocksTarget::Domain(host, port) => {
+                match tokio::net::lookup_host((host.as_str(), *port)).await {
+                    Ok(mut addrs) => addrs.next().map_or(UdpRoute::Drop, UdpRoute::Direct),
+                    Err(_) => UdpRoute::Drop,
+                }
+            }
+        },
+        Action::Proxy => {
+            if host.is_some() && router.cidr_needs_resolution(port) {
+                // The address decides the CIDR rule: resolve through the
+                // tunnel; no resolver = fail closed (drop).
+                let Some(addr) = resolve_udp_dst(dst.clone(), policy, resolver).await else {
+                    return UdpRoute::Drop;
+                };
+                match router.decide(host, Some(&addr.ip()), port) {
+                    Action::Block => UdpRoute::Drop,
+                    Action::Direct => UdpRoute::Direct(addr),
+                    Action::Proxy => UdpRoute::Tunnel(addr),
+                }
+            } else {
+                match resolve_udp_dst(dst.clone(), policy, resolver).await {
+                    Some(addr) => UdpRoute::Tunnel(addr),
+                    None => UdpRoute::Drop,
+                }
+            }
+        }
+    }
+}
+
 /// One client datagram's parsed shape.
 enum UdpDatagram {
     /// Client → destination; the payload starts at `payload_at`.
@@ -717,6 +989,7 @@ async fn handle_http_connect(
     dialer: &dyn Dialer,
     policy: &FamilyPolicy,
     resolver: Option<&TunnelResolver>,
+    router: &Router,
 ) -> std::io::Result<()> {
     let head = match tokio::time::timeout(
         HANDSHAKE_TIMEOUT,
@@ -784,6 +1057,115 @@ async fn handle_http_connect(
             format!("malformed CONNECT authority `{target}`"),
         ));
     };
+    // Routing decides before any egress, with the SOCKS table's semantics:
+    // block answers 403, direct dials from the host network stack, proxy
+    // continues on the tunnel path. Domains decide on the name first; CIDR
+    // rules need the tunnel-resolved address (never the OS resolver).
+    let mut direct: Option<SocksTarget> = None;
+    let mut resolved: Option<SocketAddr> = None;
+    match &authority {
+        SocksTarget::Ip(addr) => {
+            if family_refused(addr, policy) {
+                write_http_reply(&mut socket, 403, "Forbidden", "")
+                    .await
+                    .ok();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("{addr} refused by family policy (mode={:?})", policy.mode),
+                ));
+            }
+            match router.decide(None, Some(&addr.ip()), addr.port()) {
+                Action::Block => {
+                    write_http_reply(&mut socket, 403, "Forbidden", "")
+                        .await
+                        .ok();
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!("{addr} blocked by routing rule"),
+                    ));
+                }
+                Action::Direct => direct = Some(authority.clone()),
+                Action::Proxy => {}
+            }
+        }
+        SocksTarget::Domain(host, port) => match router.decide(Some(host), None, *port) {
+            Action::Block => {
+                write_http_reply(&mut socket, 403, "Forbidden", "")
+                    .await
+                    .ok();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("domain `{host}` blocked by routing rule"),
+                ));
+            }
+            Action::Direct => direct = Some(authority.clone()),
+            Action::Proxy if router.cidr_needs_resolution(*port) => {
+                let Some(resolver) = resolver else {
+                    write_http_reply(&mut socket, 501, "Not Implemented", "")
+                        .await
+                        .ok();
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "domain CONNECT target needs tunnel resolution to apply CIDR routing rules",
+                    ));
+                };
+                let ip = match resolver.resolve(host, policy).await {
+                    Ok(ip) => ip,
+                    Err(e) => {
+                        write_http_reply(&mut socket, 502, "Bad Gateway", "")
+                            .await
+                            .ok();
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            format!("domain target `{host}` did not resolve: {e}"),
+                        ));
+                    }
+                };
+                let addr = SocketAddr::new(ip, *port);
+                match router.decide(Some(host), Some(&ip), *port) {
+                    Action::Block => {
+                        write_http_reply(&mut socket, 403, "Forbidden", "")
+                            .await
+                            .ok();
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            format!("domain `{host}` ({addr}) blocked by routing rule"),
+                        ));
+                    }
+                    Action::Direct => direct = Some(SocksTarget::Ip(addr)),
+                    Action::Proxy => resolved = Some(addr),
+                }
+            }
+            Action::Proxy => {}
+        },
+    }
+    if let Some(target) = direct {
+        // Direct egress: the host network stack, no tunnel dialer. Still
+        // within the same relay bounds (and the accept-time peer filter).
+        let upstream = match direct_connect(target).await {
+            Ok(s) => s,
+            Err(e) => {
+                write_http_reply(&mut socket, 502, "Bad Gateway", "")
+                    .await
+                    .ok();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    format!("direct dial failed: {e}"),
+                ));
+            }
+        };
+        socket
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .await?;
+        return relay_with_idle_bounds(
+            socket,
+            Box::new(TcpByteStream::new(upstream)),
+            RELAY_IDLE_TIMEOUT,
+            RELAY_TOTAL_BACKSTOP,
+            RELAY_WATCHDOG_POLL,
+        )
+        .await;
+    }
     let target_addr = match authority {
         SocksTarget::Ip(addr) => {
             if family_refused(&addr, policy) {
@@ -798,55 +1180,59 @@ async fn handle_http_connect(
             addr
         }
         SocksTarget::Domain(host, port) => {
-            // Same fail-closed DNS policy as SOCKS: the domain name must not
-            // leak around the tunnel via the OS resolver. A hostname-capable
-            // exit (dial_host, e.g. tor) dials the name directly; the
-            // Validation Err is the capability signal and falls through to
-            // the tunnel resolver.
-            match dialer.dial_host(&host, port, DIAL_HOST_TIMEOUT).await {
-                Ok(upstream) => {
-                    socket
-                        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-                        .await?;
-                    return relay_with_idle_bounds(
-                        socket,
-                        upstream,
-                        RELAY_IDLE_TIMEOUT,
-                        RELAY_TOTAL_BACKSTOP,
-                        RELAY_WATCHDOG_POLL,
-                    )
-                    .await;
+            if let Some(addr) = resolved {
+                addr
+            } else {
+                // Same fail-closed DNS policy as SOCKS: the domain name must
+                // not leak around the tunnel via the OS resolver. A
+                // hostname-capable exit (dial_host, e.g. tor) dials the name
+                // directly; the Validation Err is the capability signal and
+                // falls through to the tunnel resolver.
+                match dialer.dial_host(&host, port, DIAL_HOST_TIMEOUT).await {
+                    Ok(upstream) => {
+                        socket
+                            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                            .await?;
+                        return relay_with_idle_bounds(
+                            socket,
+                            upstream,
+                            RELAY_IDLE_TIMEOUT,
+                            RELAY_TOTAL_BACKSTOP,
+                            RELAY_WATCHDOG_POLL,
+                        )
+                        .await;
+                    }
+                    Err(e) if e.kind == HopErrorKind::Validation => {}
+                    Err(e) => {
+                        write_http_reply(&mut socket, 502, "Bad Gateway", "")
+                            .await
+                            .ok();
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::ConnectionRefused,
+                            e.message,
+                        ));
+                    }
                 }
-                Err(e) if e.kind == HopErrorKind::Validation => {}
-                Err(e) => {
-                    write_http_reply(&mut socket, 502, "Bad Gateway", "")
+                let Some(resolver) = resolver else {
+                    write_http_reply(&mut socket, 501, "Not Implemented", "")
                         .await
                         .ok();
                     return Err(std::io::Error::new(
-                        std::io::ErrorKind::ConnectionRefused,
-                        e.message,
+                        std::io::ErrorKind::InvalidData,
+                        "domain CONNECT targets refused (no tunnel resolver wired; use a literal IP)",
                     ));
-                }
-            }
-            let Some(resolver) = resolver else {
-                write_http_reply(&mut socket, 501, "Not Implemented", "")
-                    .await
-                    .ok();
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "domain CONNECT targets refused (no tunnel resolver wired; use a literal IP)",
-                ));
-            };
-            match resolver.resolve(&host, policy).await {
-                Ok(ip) => SocketAddr::new(ip, port),
-                Err(e) => {
-                    write_http_reply(&mut socket, 502, "Bad Gateway", "")
-                        .await
-                        .ok();
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        format!("domain target `{host}` did not resolve: {e}"),
-                    ));
+                };
+                match resolver.resolve(&host, policy).await {
+                    Ok(ip) => SocketAddr::new(ip, port),
+                    Err(e) => {
+                        write_http_reply(&mut socket, 502, "Bad Gateway", "")
+                            .await
+                            .ok();
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            format!("domain target `{host}` did not resolve: {e}"),
+                        ));
+                    }
                 }
             }
         }
@@ -1003,6 +1389,7 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 /// A parsed SOCKS/HTTP CONNECT target: literal IP or a domain name to
 /// resolve.
+#[derive(Clone)]
 enum SocksTarget {
     Ip(SocketAddr),
     Domain(String, u16),
@@ -2310,7 +2697,7 @@ mod tests {
         .await;
         let (mut rh, mut wh) = tokio::io::split(raw);
         // The writer outlives the 400 ms backstop: an EOF before it stops
-        // proves the total bound fired, not an idle drop.
+        // proves the total bound fired, not an idle drop (idle is 60 s).
         let writer = tokio::spawn(async move {
             let mut written = 0usize;
             while written < 200 {
@@ -2322,22 +2709,28 @@ mod tests {
             }
             written
         });
-        let eof = tokio::time::timeout(std::time::Duration::from_secs(3), async move {
+        let eof = tokio::time::timeout(std::time::Duration::from_secs(10), async move {
             let mut byte = [0u8; 1];
             loop {
-                // EOF or a reset both prove the relay dropped: aborting the
-                // copy closes the sockets immediately, and on Windows a
-                // socket dropped with pending data surfaces as ConnectionReset.
-                // The window is generous (3 s vs a 400 ms backstop) because
-                // under parallel test load the relay's poll loop can be
-                // scheduled late; the written<200 check below keeps the
-                // proof honest even in that window (a clean writer-side
-                // close would also produce EOF — but only after all 200
-                // writes, which the assertion rejects).
+                // EOF or an abort/reset both prove the relay dropped: aborting
+                // the copy closes the sockets immediately, and on Windows a
+                // socket dropped with pending data surfaces as
+                // ConnectionReset (WSAECONNRESET) or ConnectionAborted
+                // (WSAECONNABORTED) depending on timing — the latter was the
+                // actual flake (a 10 s window cannot help a wrong error-kind
+                // match).
                 match rh.read(&mut byte).await {
                     Ok(0) => return,
                     Ok(_) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => return,
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionAborted
+                        ) =>
+                    {
+                        return
+                    }
                     Err(e) => panic!("unexpected read error: {e}"),
                 }
             }
@@ -2494,7 +2887,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn http_listener_shares_the_socks_peer_filter() {
-        // Loopback peers serve under both policies — the filter is the same
+        // Loopback peers serve under both policies - the filter is the same
         // `peer_allowed` decision the SOCKS listener applies.
         for policy in [PeerPolicy::LoopbackOnly, PeerPolicy::Any] {
             let echo_addr = echo_on(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)).await;
@@ -2511,5 +2904,320 @@ mod tests {
                 "loopback peer serves under {policy:?}: {reply}"
             );
         }
+    }
+
+    // --- routing rules (`routing.toml`) ------------------------------------
+
+    /// Tunnel dialer that counts every egress attempt and then dials for
+    /// real (so resolver/echo tests work) — the counter proves a block or
+    /// direct decision never reached the tunnel.
+    #[derive(Default)]
+    struct CountingDialer {
+        tcp: AtomicU64,
+        udp: AtomicU64,
+    }
+
+    #[async_trait::async_trait]
+    impl Dialer for CountingDialer {
+        async fn dial_tcp(&self, dst: SocketAddr) -> Result<Box<dyn ByteStream>, HopError> {
+            self.tcp.fetch_add(1, Ordering::SeqCst);
+            let s = tokio::net::TcpStream::connect(dst)
+                .await
+                .map_err(HopError::from)?;
+            Ok(Box::new(DirectStream { inner: s }))
+        }
+
+        async fn dial_udp(&self, dst: SocketAddr) -> Result<Box<dyn UdpFlow>, HopError> {
+            self.udp.fetch_add(1, Ordering::SeqCst);
+            let bind = qcore_transport_api::unspecified_bind(&dst);
+            let socket = tokio::net::UdpSocket::bind(bind)
+                .await
+                .map_err(HopError::from)?;
+            socket.connect(dst).await.map_err(HopError::from)?;
+            Ok(Box::new(ProxyUdpFlow { inner: socket }))
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                accepts_tcp_carrier: true,
+                accepts_udp_carrier: true,
+                dials_tcp: true,
+                dials_udp: true,
+            }
+        }
+    }
+
+    fn router_from(toml: &str) -> Arc<Router> {
+        Arc::new(Router::new(
+            crate::config::routing::parse_routing_toml(toml).expect("test routing table parses"),
+        ))
+    }
+
+    async fn spawn_socks_with_routing(
+        dialer: Arc<dyn Dialer>,
+        resolver: Option<Arc<TunnelResolver>>,
+        router: Arc<Router>,
+    ) -> SocketAddr {
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = proxy.local_addr().unwrap();
+        tokio::spawn(serve_socks_via_dialer_with_routing(
+            proxy,
+            dialer,
+            FamilyPolicy::default(),
+            PeerPolicy::default(),
+            resolver,
+            router,
+        ));
+        addr
+    }
+
+    async fn spawn_http_with_routing(dialer: Arc<dyn Dialer>, router: Arc<Router>) -> SocketAddr {
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = proxy.local_addr().unwrap();
+        tokio::spawn(serve_http_proxy_with_routing(
+            proxy,
+            dialer,
+            FamilyPolicy::default(),
+            PeerPolicy::default(),
+            None,
+            router,
+        ));
+        addr
+    }
+
+    async fn socks_request_ip(c: &mut tokio::net::TcpStream, addr: SocketAddr) -> [u8; 10] {
+        socks_greet(c).await;
+        let mut req = vec![0x05u8, 0x01, 0x00];
+        match addr {
+            SocketAddr::V4(v4) => {
+                req.push(0x01);
+                req.extend_from_slice(&v4.ip().octets());
+            }
+            SocketAddr::V6(v6) => {
+                req.push(0x04);
+                req.extend_from_slice(&v6.ip().octets());
+            }
+        }
+        req.extend_from_slice(&addr.port().to_be_bytes());
+        c.write_all(&req).await.unwrap();
+        let mut hdr = [0u8; 10];
+        c.read_exact(&mut hdr).await.unwrap();
+        hdr
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn routing_block_refuses_ip_connect_with_02_before_any_dial() {
+        let dialer = Arc::new(CountingDialer::default());
+        let router = router_from(
+            r#"
+            [[rules]]
+            match = { cidr = "127.0.0.0/8", port = 443 }
+            action = "block"
+            "#,
+        );
+        let proxy_addr = spawn_socks_with_routing(dialer.clone(), None, router).await;
+
+        let mut c = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        let hdr = socks_request_ip(&mut c, "127.0.0.9:443".parse().unwrap()).await;
+        assert_eq!(hdr[1], 0x02, "block answers 0x02 (not allowed by ruleset)");
+        assert_eq!(
+            dialer.tcp.load(Ordering::SeqCst),
+            0,
+            "a block rule must not reach the tunnel dialer"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn routing_block_refuses_domain_connect_before_resolution() {
+        let dialer = Arc::new(CountingDialer::default());
+        let router = router_from(
+            r#"
+            [[rules]]
+            match = { domain = "blocked.test" }
+            action = "block"
+            "#,
+        );
+        let proxy_addr = spawn_socks_with_routing(dialer.clone(), None, router).await;
+
+        let mut c = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        let hdr = socks_request_domain(&mut c, "www.blocked.test", 443).await;
+        assert_eq!(hdr[1], 0x02, "a domain rule decides without resolving");
+        assert_eq!(dialer.tcp.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            dialer.udp.load(Ordering::SeqCst),
+            0,
+            "a domain block needs no DNS query"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn routing_direct_dials_the_host_stack_not_the_tunnel() {
+        let echo = echo_on(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)).await;
+        let dialer = Arc::new(CountingDialer::default());
+        let router = router_from(&format!(
+            r#"
+            [[rules]]
+            match = {{ cidr = "127.0.0.1/32", port = {} }}
+            action = "direct"
+            "#,
+            echo.port()
+        ));
+        let proxy_addr = spawn_socks_with_routing(dialer.clone(), None, router).await;
+
+        let mut c = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        let hdr = socks_request_ip(&mut c, echo).await;
+        assert_eq!(hdr[1], 0x00, "direct CONNECT succeeds");
+        c.write_all(b"direct").await.unwrap();
+        let mut back = [0u8; 6];
+        c.read_exact(&mut back).await.unwrap();
+        assert_eq!(&back, b"direct", "the direct path relays the echo");
+        assert_eq!(
+            dialer.tcp.load(Ordering::SeqCst),
+            0,
+            "direct egress must not touch the tunnel dialer"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn routing_cidr_on_a_domain_resolves_through_the_tunnel_then_decides() {
+        let dns = fake_dns(
+            "internal.test",
+            IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 2)),
+        )
+        .await;
+        let dialer = Arc::new(CountingDialer::default());
+        let resolver = Arc::new(TunnelResolver::with_server(dialer.clone(), dns));
+        let router = router_from(
+            r#"
+            [[rules]]
+            match = { cidr = "127.0.0.0/8" }
+            action = "block"
+            "#,
+        );
+        let proxy_addr = spawn_socks_with_routing(dialer.clone(), Some(resolver), router).await;
+
+        let mut c = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        let hdr = socks_request_domain(&mut c, "internal.test", 443).await;
+        assert_eq!(
+            hdr[1], 0x02,
+            "the tunnel-resolved address matched the CIDR block rule"
+        );
+        assert_eq!(
+            dialer.udp.load(Ordering::SeqCst),
+            1,
+            "exactly one tunnel DNS query resolved the name"
+        );
+        assert_eq!(
+            dialer.tcp.load(Ordering::SeqCst),
+            0,
+            "the blocked target was never dialed"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn routing_cidr_on_a_domain_without_resolver_fails_closed() {
+        let dialer = Arc::new(CountingDialer::default());
+        let router = router_from(
+            r#"
+            [[rules]]
+            match = { cidr = "10.0.0.0/8" }
+            action = "block"
+            "#,
+        );
+        let proxy_addr = spawn_socks_with_routing(dialer.clone(), None, router).await;
+
+        let mut c = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        let hdr = socks_request_domain(&mut c, "intranet.test", 443).await;
+        assert_eq!(
+            hdr[1], 0x08,
+            "no tunnel resolver: CIDR-on-domain refuses instead of guessing"
+        );
+        assert_eq!(dialer.tcp.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn routing_block_refuses_http_connect_with_403() {
+        let dialer = Arc::new(CountingDialer::default());
+        let router = router_from(
+            r#"
+            [[rules]]
+            match = { domain = "blocked.test" }
+            action = "block"
+            "#,
+        );
+        let proxy_addr = spawn_http_with_routing(dialer.clone(), router).await;
+
+        let mut c = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        c.write_all(b"CONNECT blocked.test:443 HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        let reply = http_read_reply(&mut c).await;
+        assert!(
+            reply.starts_with("HTTP/1.1 403"),
+            "a block rule answers 403: {reply}"
+        );
+        assert_eq!(dialer.tcp.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn routing_direct_udp_uses_a_plain_socket_not_a_tunnel_flow() {
+        let echo = udp_echo_on(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)).await;
+        let dialer = Arc::new(CountingDialer::default());
+        let router = router_from(&format!(
+            r#"
+            [[rules]]
+            match = {{ cidr = "127.0.0.1/32", port = {} }}
+            action = "direct"
+            "#,
+            echo.port()
+        ));
+        let proxy_addr = spawn_socks_with_routing(dialer.clone(), None, router).await;
+
+        let mut c = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        let relay = socks_associate(&mut c).await;
+
+        let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        udp.send_to(&udp_datagram(&echo, b"direct-udp"), relay)
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; 2048];
+        let (n, _from) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), udp.recv_from(&mut buf))
+                .await
+                .expect("direct echo reply within deadline")
+                .expect("recv");
+        let (src, got) = parse_udp_reply(&buf[..n]).expect("encapsulated reply");
+        assert_eq!(got, b"direct-udp");
+        assert_eq!(src, echo);
+        assert_eq!(
+            dialer.udp.load(Ordering::SeqCst),
+            0,
+            "a direct UDP destination must not open a tunnel flow"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn routing_block_refuses_udp_association_with_02() {
+        let dialer = Arc::new(CountingDialer::default());
+        let router = router_from(
+            r#"
+            [[rules]]
+            match = { cidr = "127.0.0.0/8" }
+            action = "block"
+            "#,
+        );
+        let proxy_addr = spawn_socks_with_routing(dialer.clone(), None, router).await;
+
+        let mut c = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        socks_greet(&mut c).await;
+        // A concrete expected send-from address inside the blocked range:
+        // the association is refused with 0x02.
+        c.write_all(&[0x05, 0x03, 0x00, 0x01, 127, 0, 0, 5, 0x00, 0x09])
+            .await
+            .unwrap();
+        let mut reply = [0u8; 10];
+        c.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[1], 0x02, "blocked association address refuses 0x02");
+        assert_eq!(dialer.udp.load(Ordering::SeqCst), 0);
     }
 }

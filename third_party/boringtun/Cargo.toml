@@ -1,0 +1,83 @@
+[package]
+edition = "2018"
+name = "boringtun"
+version = "0.7.1"
+authors = [
+    "Noah Kennedy <nkennedy@cloudflare.com>",
+    "Andy Grover <agrover@cloudflare.com>",
+    "Jeff Hiner <jhiner@cloudflare.com>",
+]
+build = false
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "an implementation of the WireGuard® protocol designed for portability and speed"
+documentation = "https://docs.rs/boringtun/0.7.1/boringtun/"
+readme = "README.md"
+license = "BSD-3-Clause"
+repository = "https://github.com/cloudflare/boringtun"
+
+[features]
+default = []
+mock-instant = ["mock_instant"]
+
+[lib]
+name = "boringtun"
+crate-type = ["rlib"]
+path = "src/lib.rs"
+
+[dependencies.aead]
+version = "0.5.0-pre.2"
+
+[dependencies.blake2]
+version = "0.10"
+
+[dependencies.chacha20]
+version = "0.9"
+
+[dependencies.chacha20poly1305]
+version = "0.10.0-pre.1"
+
+[dependencies.hmac]
+version = "0.12"
+
+[dependencies.mock_instant]
+version = "0.3"
+optional = true
+
+[dependencies.parking_lot]
+version = "0.12"
+
+[dependencies.portable-atomic]
+version = "1.13.1"
+features = ["fallback"]
+
+[dependencies.rand_core]
+version = "0.6.4"
+features = ["getrandom"]
+
+[dependencies.ring]
+version = "0.17"
+
+[dependencies.tracing]
+version = "0.1.40"
+
+[dependencies.x25519-dalek]
+version = "2.0.1"
+features = [
+    "reusable_secrets",
+    "static_secrets",
+]
+
+[dev-dependencies.etherparse]
+version = "0.13"
+
+[target."cfg(unix)".dependencies.nix]
+version = "0.31"
+features = [
+    "time",
+    "user",
+]
+default-features = false

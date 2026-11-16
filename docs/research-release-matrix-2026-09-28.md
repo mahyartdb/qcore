@@ -79,12 +79,27 @@ Local repo declares 9 triples authoritative but proves 3/9 Windows-only in `rele
 
 ## Gaps
 
+**Update 2026-11-16 (W3)** - `.github/workflows/release.yml` now declares all
+9 `targets.toml` triples in one matrix plus a `workflow_dispatch` dry-run mode
+(publish guarded on `refs/tags/`), and `xtask/src/release.rs` derives coverage
+from that file at compile time instead of the hand-kept `COVERED` list, so a
+one-sided edit fails the release gate. The bullets below are the 2026-09-28
+findings: "6/9 legs unbuilt" and the native-only package step are superseded in
+declaration, not yet in proof. The missing green dry-run log stays open until
+one dispatch run covers all nine legs.
+
 - No green tag dry-run log proving matrix+publish (`.sig`/attestation/SBOM per artifact).
 - 6/9 legs unbuilt (all linux + android) — needs ubuntu cross-rs/cargo-ndk jobs + capacity.
 - Local `release` gate ≠ Tier C (native-only) — same dry-run closes it.
 - No survey data on small-team lane counts; verdicts rest on pricing + guides.
 
 ## Recommended next steps
+
+**Update 2026-11-16 (W3)** - Steps 1-2 are implemented in `release.yml` (9-leg
+matrix, dry-run trigger, per-leg `cargo xtask build|smoke|package`, per-leg
+upload); step 3's "publish per-target packaging step" is now per-leg. Step 1
+itself - a green run with per-target logs - has not been executed: the matrix
+is declared, unproven.
 
 1. Run `v*` dry-run of `release.yml` matrix+publish to test release; capture per-target build+smoke logs + `.sig`/attestation/SBOM.
 2. Add ubuntu-22.04 cross-rs/cargo-ndk jobs for 4 linux-gnu + 2 android legs (or amend `targets.toml` + constitution if de-scoping musl/armv7).

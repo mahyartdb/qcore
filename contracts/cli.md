@@ -109,6 +109,32 @@ intact for a retry.
   taken or unavailable) are PRE-START failures: they map to usage (exit 6)
   like the malformed-address and non-loopback refusals, never to hop
   failure (3) — no hop has started when the listener binds.
+- Routing rules (`connect --routing <path>`, default
+  `<profile-dir>/routing.toml` when present; absent file = every target
+  proxies through the tunnel, the historic behavior). Rules evaluate in file
+  order, first match wins; each rule is `match = { domain | cidr | port }`
+  (present fields ANDed, `domain` and `cidr` mutually exclusive) plus
+  `action = "proxy" | "direct" | "block"`. A `domain` matches the CONNECT
+  target name as a DNS suffix on label boundaries (`example.com` covers
+  `a.example.com`, never `notexample.com`; no TLS/HTTP sniffing — only the
+  CONNECT target is consulted); `port` alone matches any host. Decisions run
+  after the handshake parse and before any dial: `block` refuses with SOCKS
+  `0x02` / HTTP `403` (UDP datagrams are dropped; a concrete ASSOCIATE
+  address answers `0x02`), `direct` dials from the host network stack
+  (`tokio::net::TcpStream`, plain UDP socket for UDP) and never touches the
+  tunnel dialer, and `proxy` keeps the existing tunnel path. **`direct` is a
+  deliberate leak**: the destination sees the host's IP and a domain is
+  resolved locally, so neither the tunnel's egress IP nor its
+  tunnel-routed DNS applies. A CIDR rule needs an address; a domain target
+  is resolved through the tunnel resolver (never the OS resolver) before
+  CIDR rules run, so without a tunnel resolver such a target fails closed
+  (SOCKS `0x08` / HTTP `501`) rather than guessing. Malformed or
+  unknown-key rules are usage errors (exit 6) naming the file and field
+  (fail closed: a typo must not silently turn a block rule into a no-op).
+  When rules are active, `connect` prints one stderr line naming the file
+  and rule count, and `status` (text mode) prints one line when the
+  profile-default file is present; an explicit `--routing` path is visible
+  in connect's line and the detached log, not in `status`.
 - Unknown subcommand/shortcut: exit 6 (`qcore: unknown command or shortcut ...`).
 - Global options are validated before any work: `--max-depth` outside 1..=5
   and `--timeout` < 1s are exit 6.

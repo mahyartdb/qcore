@@ -35,12 +35,17 @@ junk_before = 4
 junk_size = [64, 256]
 fragment = 512
 
+# Header protection stays off in shipped AWG profiles: it needs
+# `awg_header_protection_key`, a per-peer shared secret that must not live
+# in profile data, and neither the chain grammar nor the `.conf` import
+# mapping carries it yet. A hop that asks for it without the key fails
+# closed at build naming the field (pinned by tests-conformance).
 ["awg-balanced"]
 family = "awg"
 compatible_modes = [{ kind = "wireguard", peer = "awg" }]
 
 ["awg-balanced".params]
-header_protection = true
+header_protection = false
 s1 = [16, 32]
 s2 = [16, 32]
 s3 = [16, 32]
@@ -60,7 +65,7 @@ family = "awg"
 compatible_modes = [{ kind = "wireguard", peer = "awg" }]
 
 ["awg-aggressive".params]
-header_protection = true
+header_protection = false
 s1 = [32, 64]
 s2 = [32, 64]
 s3 = [32, 64]

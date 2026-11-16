@@ -7,8 +7,19 @@ use qcore_core::api::{Engine, EngineConfig};
 use qcore_core::chain::ExpandedHop;
 use qcore_core::config::import::{store_import, ConfigImport, ImportVerdict};
 use qcore_core::config::profile_dir::ProfileDirs;
+use tests_conformance::awg_peer::AwgResponder;
 use tests_conformance::testutil::unique_dir;
+use transport_wireguard::awg::AwgParams;
 use transport_wireguard::test_support::{generate_keypair, WgResponder};
+
+/// AWG transforms pinned by the import `.conf`. Import material fills before
+/// profile params (chain > import > profile), so every AWG test drives the
+/// same wire shape regardless of the profile's S/H ranges.
+const AWG_S: u32 = 24;
+const AWG_H1: u32 = 111;
+const AWG_H2: u32 = 222;
+const AWG_H3: u32 = 333;
+const AWG_H4: u32 = 444;
 
 fn b64(data: &[u8]) -> String {
     qcore_core::config::import::b64_encode(data)
@@ -51,12 +62,34 @@ fn import_conf(dir: &std::path::Path, file: &str, body: &str) -> String {
 fn conf_text(priv_b64: &str, pub_b64: &str, endpoint: &str, awg: bool) -> String {
     let mut s = format!("[Interface]\nPrivateKey = {priv_b64}\nAddress = 10.9.0.2/32\n");
     if awg {
-        s.push_str("Jc = 6\nJmin = 64\nJmax = 256\nS1 = 24\nH1 = 111\nH2 = 222\n");
+        s.push_str(&format!(
+            "Jc = 6\nJmin = 64\nJmax = 256\n\
+             S1 = {AWG_S}\nS2 = {AWG_S}\nS3 = {AWG_S}\nS4 = {AWG_S}\n\
+             H1 = {AWG_H1}\nH2 = {AWG_H2}\nH3 = {AWG_H3}\nH4 = {AWG_H4}\n"
+        ));
     }
     s.push_str(&format!(
         "\n[Peer]\nPublicKey = {pub_b64}\nAllowedIPs = 0.0.0.0/0\nEndpoint = {endpoint}\n"
     ));
     s
+}
+
+/// AWG params the responder must carry to complete a handshake with the hop
+/// above. `random_trailers` follows the selected profile: a trailed handshake
+/// datagram only parses on a peer that expects trailers, and vice versa.
+fn awg_peer_params(random_trailers: bool) -> AwgParams {
+    AwgParams {
+        s1: AWG_S,
+        s2: AWG_S,
+        s3: AWG_S,
+        s4: AWG_S,
+        h1: AWG_H1,
+        h2: AWG_H2,
+        h3: AWG_H3,
+        h4: AWG_H4,
+        random_trailers,
+        ..Default::default()
+    }
 }
 
 fn hop(kind: &str, opts: &str, id: &str) -> ExpandedHop {
@@ -128,9 +161,16 @@ async fn awg_profile_on_awg_peer_applies_and_reports() {
     let dir = work("awg");
     let (c_sk, c_pk) = generate_keypair();
     let (s_sk, s_pk) = generate_keypair();
-    let responder = WgResponder::spawn("127.0.0.1".parse().unwrap(), s_sk, c_pk)
-        .await
-        .unwrap();
+    // A stock WireGuard responder cannot parse S1-prefixed, H1-typed
+    // handshakes: completion here is the proof the transforms applied.
+    let responder = AwgResponder::spawn(
+        "127.0.0.1".parse().unwrap(),
+        s_sk,
+        c_pk,
+        awg_peer_params(true),
+    )
+    .await
+    .unwrap();
     let r = import_conf(
         &dir,
         "awg.conf",
@@ -144,7 +184,7 @@ async fn awg_profile_on_awg_peer_applies_and_reports() {
             "awg-0",
         )])
         .await
-        .expect("AWG with profile establishes (junk + plain handshake)");
+        .expect("AWG with profile establishes against an AWG peer");
     assert_eq!(
         handle.hop_reports()[0].obfuscation.as_deref(),
         Some("awg-balanced")
@@ -170,6 +210,49 @@ async fn awg_profile_on_warp_edge_is_rejected() {
     assert!(
         err.cause.contains("awg-balanced"),
         "names profile: {}",
+        err.cause
+    );
+}
+
+#[tokio::test]
+async fn awg_header_protection_without_key_fails_closed() {
+    let dir = work("awg-hp-no-key");
+    let prof = dir.join("prof");
+    std::fs::create_dir_all(&prof).unwrap();
+    // Profile params ride to the factory opaquely, so a profile can request
+    // header protection — but it cannot supply the per-peer shared key, and
+    // neither the chain grammar nor the `.conf` import mapping carries
+    // `awg_header_protection_key` today. The build must refuse by name
+    // instead of silently claiming the transform.
+    std::fs::write(
+        prof.join("obfuscation.toml"),
+        "[\"awg-hp-no-key\"]\n\
+         family = \"awg\"\n\
+         compatible_modes = [{ kind = \"wireguard\", peer = \"awg\" }]\n\
+         [\"awg-hp-no-key\".params]\n\
+         header_protection = true\n",
+    )
+    .unwrap();
+    let (c_sk, _c_pk) = generate_keypair();
+    let (_s_sk, s_pk) = generate_keypair();
+    let r = import_conf(
+        &dir,
+        "awg.conf",
+        &conf_text(&b64(&c_sk), &b64(&s_pk), "127.0.0.1:51820", true),
+    );
+    let engine = engine_in(&dir);
+    let err = engine
+        .start(vec![hop(
+            "wireguard",
+            &format!("peer=awg import={r} obfuscation=awg-hp-no-key"),
+            "awg-hp-0",
+        )])
+        .await
+        .expect_err("header protection without the key refuses at hop build");
+    assert_eq!(err.layer, qcore_transport_api::FailureLayer::Config);
+    assert!(
+        err.cause.contains("awg_header_protection_key"),
+        "names the missing key: {}",
         err.cause
     );
 }
@@ -241,9 +324,14 @@ async fn awg_aggressive_on_awg_peer_applies_and_reports() {
     let dir = work("awg-aggr");
     let (c_sk, c_pk) = generate_keypair();
     let (s_sk, s_pk) = generate_keypair();
-    let responder = WgResponder::spawn("127.0.0.1".parse().unwrap(), s_sk, c_pk)
-        .await
-        .unwrap();
+    let responder = AwgResponder::spawn(
+        "127.0.0.1".parse().unwrap(),
+        s_sk,
+        c_pk,
+        awg_peer_params(true),
+    )
+    .await
+    .unwrap();
     let r = import_conf(
         &dir,
         "awg.conf",
@@ -270,9 +358,17 @@ async fn awg_off_on_awg_peer_applies_and_reports() {
     let dir = work("awg-off");
     let (c_sk, c_pk) = generate_keypair();
     let (s_sk, s_pk) = generate_keypair();
-    let responder = WgResponder::spawn("127.0.0.1".parse().unwrap(), s_sk, c_pk)
-        .await
-        .unwrap();
+    // `awg-off` disables trailers and content padding, but import material
+    // fills first, so the conf's S/H transforms (and Jc) still apply: the
+    // responder must still speak AWG, with exact-size handshake datagrams.
+    let responder = AwgResponder::spawn(
+        "127.0.0.1".parse().unwrap(),
+        s_sk,
+        c_pk,
+        awg_peer_params(false),
+    )
+    .await
+    .unwrap();
     let r = import_conf(
         &dir,
         "awg.conf",

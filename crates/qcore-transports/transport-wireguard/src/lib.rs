@@ -157,7 +157,8 @@ pub struct WgParams {
     pub preshared_key: Option<[u8; 32]>,
     /// Persistent keepalive seconds. Default off (FR-013d).
     pub keepalive: Option<u16>,
-    /// AmneziaWG params when `peer=awg` (decorator lands in US5 T071).
+    /// AmneziaWG params when `peer=awg` (applied by the vendored boringtun
+    /// transform module; `QCORE_PATCHES.md`).
     pub awg: Option<awg::AwgParams>,
     /// Noize params when an obfuscation profile is active (US5 T070).
     pub noize: Option<qcore_transport_api::obfuscate::NoizeParams>,
@@ -294,7 +295,7 @@ impl WireguardHop {
     ) -> Result<Arc<dyn RunningHop>, HopError> {
         let local_private = boringtun::x25519::StaticSecret::from(params.private_key);
         let peer_public = boringtun::x25519::PublicKey::from(params.peer_public_key);
-        let tunnel = Tunn::new(
+        let mut tunnel = Tunn::new(
             local_private,
             peer_public,
             params.preshared_key,
@@ -302,6 +303,17 @@ impl WireguardHop {
             0,
             None,
         );
+        // AmneziaWG transforms live inside the vendored boringtun handshake
+        // plane; the transport only hands over validated params.
+        if let Some(a) = &params.awg {
+            tunnel.set_awg_params(Some(a.to_wire())).map_err(|e| {
+                HopError::new(
+                    HopErrorKind::Config,
+                    Some(hop_id.clone()),
+                    format!("AmneziaWG parameters rejected: {e:?}"),
+                )
+            })?;
+        }
         // Nested uplink (T058): an encapsulated carrier drives boringtun over
         // a carrier flow; a direct carrier keeps the OS UDP socket. Against a
         // framing-unaware far end the nested handshake fails closed below.
@@ -340,7 +352,7 @@ impl WireguardHop {
                 .await;
             }
             if let Some(a) = &params.awg {
-                for packet in awg::junk_train(a) {
+                for packet in awg::handshake_preamble(a) {
                     udp.send_to(&packet, params.peer_endpoint).await.ok();
                 }
             }
@@ -655,7 +667,7 @@ async fn pump_loop(
             recvd = inner.udp.recv_from(&mut buf) => {
                 match recvd {
                     Ok((n, src)) => {
-                        handle_inbound(&inner, &events, &hop_id, src, &buf[..n], &mut plain);
+                        handle_inbound(&inner, &events, &hop_id, src, &mut buf[..n], &mut plain);
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {
                         // Windows: an ICMP port-unreachable lands on the
@@ -687,7 +699,8 @@ fn handle_inbound(
     events: &tokio::sync::broadcast::Sender<HopEvent>,
     hop_id: &str,
     src: SocketAddr,
-    packet: &[u8],
+    // Mutable: AmneziaWG undoes header protection in place before parsing.
+    packet: &mut [u8],
     plain: &mut [u8],
 ) {
     let mut tunnel = inner.tunnel.lock().unwrap();
@@ -964,15 +977,15 @@ mod tests {
         let mut a = Tunn::new(sk_a, pk_b, None, None, 0, None);
         let mut b = Tunn::new(sk_b, pk_a, None, None, 0, None);
         let mut buf = vec![0u8; 65535];
-        let init = match a.encapsulate(&[], &mut buf) {
+        let mut init = match a.encapsulate(&[], &mut buf) {
             TunnResult::WriteToNetwork(p) => p.to_vec(),
             _ => panic!("handshake init"),
         };
-        let resp = match b.decapsulate(None, &init, &mut buf) {
+        let mut resp = match b.decapsulate(None, &mut init, &mut buf) {
             TunnResult::WriteToNetwork(p) => p.to_vec(),
             _ => panic!("handshake response"),
         };
-        if let TunnResult::Err(e) = a.decapsulate(None, &resp, &mut buf) {
+        if let TunnResult::Err(e) = a.decapsulate(None, &mut resp, &mut buf) {
             panic!("initiator completes: {e:?}")
         }
         assert!(
@@ -1177,7 +1190,16 @@ mod tests {
             "no retransmit before REKEY_TIMEOUT"
         );
         // Past REKEY_TIMEOUT (5 s) + jitter headroom, the tick retransmits.
-        tokio::time::sleep(Duration::from_millis(5400)).await;
+        // boringtun's optional `mock-instant` feature — unified ON when the
+        // workspace gate builds with `--all-features` — replaces its clock
+        // with a mock that only advances explicitly, so a real sleep alone
+        // never crosses the REKEY_TIMEOUT boundary in that build. A depdent
+        // crate cannot cfg on boringtun's features, so do both unconditionally:
+        // advance the mock clock (no-op for boringtun's real clock) and sleep
+        // real time (the real-clock path needs 5 s + ≤333 ms jitter + load
+        // headroom; the mock path finishes on the first tick after advance).
+        mock_instant::MockClock::advance(Duration::from_millis(6200));
+        tokio::time::sleep(Duration::from_millis(6200)).await;
         let retried = pump_tick(&inner, &mut tick_dst)
             .expect("tick ok after REKEY_TIMEOUT")
             .expect("handshake retransmitted");
@@ -1202,12 +1224,12 @@ mod tests {
         // Half 1 — counting through the real handle_inbound path.
         let before = pump_tick_errors();
         let (inner, _rx) = test_inner(64);
-        let garbage = [0xFFu8; 64];
+        let mut garbage = [0xFFu8; 64];
         let mut plain = vec![0u8; 65535];
         {
             let mut t = inner.tunnel.lock().unwrap();
             assert!(matches!(
-                t.decapsulate(Some("127.0.0.1".parse().unwrap()), &garbage, &mut plain),
+                t.decapsulate(Some("127.0.0.1".parse().unwrap()), &mut garbage, &mut plain),
                 TunnResult::Err(_)
             ));
         }
@@ -1217,7 +1239,7 @@ mod tests {
             &events,
             "wg-pump-test",
             "127.0.0.1:1".parse().unwrap(),
-            &garbage,
+            &mut garbage,
             &mut plain,
         );
         assert!(
@@ -1287,15 +1309,15 @@ mod tests {
                 let mut a = Tunn::new(sk_a, pk_b, None, None, 0, None);
                 let mut b = Tunn::new(sk_b, pk_a, None, None, 0, None);
                 let mut buf = vec![0u8; 65535];
-                let init = match a.encapsulate(&[], &mut buf) {
+                let mut init = match a.encapsulate(&[], &mut buf) {
                     TunnResult::WriteToNetwork(p) => p.to_vec(),
                     _ => panic!("handshake init"),
                 };
-                let resp = match b.decapsulate(None, &init, &mut buf) {
+                let mut resp = match b.decapsulate(None, &mut init, &mut buf) {
                     TunnResult::WriteToNetwork(p) => p.to_vec(),
                     _ => panic!("handshake response"),
                 };
-                let _ = a.decapsulate(None, &resp, &mut buf);
+                let _ = a.decapsulate(None, &mut resp, &mut buf);
                 a
             }),
             udp: Arc::new(WedgedSock),

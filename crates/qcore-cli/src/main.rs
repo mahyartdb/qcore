@@ -159,6 +159,10 @@ fn reject_already_running(json: bool, blocker: &str) -> i32 {
     exit::USAGE
 }
 
+// The `Connect` variant is a clap arg container: built once at startup and
+// never moved around, so the size heuristic's stack-movement premise does
+// not apply. Boxing flags to shrink it would only obscure the CLI surface.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Commands {
     /// Validate a chain and bring up a session (alias: up).
@@ -227,6 +231,12 @@ enum Commands {
         /// in-place hop rebuilds.
         #[arg(long)]
         keepalive: Option<String>,
+        /// Routing rules file (default: `<profile-dir>/routing.toml` when
+        /// present). Rules match the CONNECT/UDP destination — domain
+        /// suffix, CIDR, port — first match wins, action proxy|direct|block.
+        /// `direct` bypasses the tunnel; `block` refuses before any egress.
+        #[arg(long)]
+        routing: Option<String>,
     },
     /// Tear down the current session (alias: down).
     #[command(alias = "down")]
@@ -494,6 +504,7 @@ async fn async_main(cli: Cli) -> i32 {
             obfuscation,
             dns,
             keepalive,
+            routing,
         } => {
             // Discovery is default-on; `--no-scan` is the only switch (the
             // old `--scan` flag was declared `default_value_t = true` with
@@ -517,6 +528,7 @@ async fn async_main(cli: Cli) -> i32 {
                 obfuscation,
                 dns,
                 keepalive,
+                routing,
                 globals_max_depth: globals.max_depth,
                 globals_timeout: globals.timeout_secs,
                 globals_quiet: globals.quiet,
@@ -568,6 +580,9 @@ struct ConnectOpts {
     /// Keepalive argv form (`secs` | `off`); parsed in `run_connect`
     /// (exit 6 on failure). `None` = engine default (25 s, on).
     keepalive: Option<String>,
+    /// Routing rules path (argv form; loaded in `run_connect` before the
+    /// detach re-spawn). `None` = `<profile-dir>/routing.toml` when present.
+    routing: Option<String>,
     /// Validated globals (T083).
     globals_max_depth: Option<u32>,
     globals_timeout: u64,
@@ -647,6 +662,9 @@ async fn run_shortcut(
                 obfuscation: None,
                 dns: None,
                 keepalive: None,
+                // Shortcut tokens take no flags: the profile-dir default
+                // applies, exactly like `connect` without `--routing`.
+                routing: None,
                 globals_max_depth: Some(max_depth),
                 globals_timeout: globals.timeout_secs,
                 globals_quiet: globals.quiet,
@@ -812,9 +830,52 @@ async fn run_connect(o: ConnectOpts) -> i32 {
         interval_secs: keepalive_secs.unwrap_or(qcore_core::session::net::ADVISORY_KEEPALIVE_SECS),
     };
 
+    // Routing rules (`routing.toml`): an explicit --routing wins (a missing
+    // or unparseable file is a usage error, exit 6, naming the file and the
+    // failing field); otherwise the profile-dir default applies when
+    // present, and absent means the historic all-proxy path. Loaded before
+    // the detach re-spawn so a bad file never spawns a child.
+    let (router, routing_from) = match &o.routing {
+        Some(raw) => {
+            let path = std::path::Path::new(raw);
+            match qcore_core::session::routing::Router::load(path) {
+                Ok(r) => (r, Some(path.to_path_buf())),
+                Err(e) => {
+                    exit::diag_exit(exit::USAGE, &format!("invalid routing rules: {e}"));
+                    return exit::USAGE;
+                }
+            }
+        }
+        None => {
+            let path = dirs
+                .profile_dir
+                .join(qcore_core::config::routing::ROUTING_FILE);
+            match qcore_core::session::routing::Router::load_optional(&dirs) {
+                Ok(r) if r.is_empty() => (r, None),
+                Ok(r) => (r, Some(path)),
+                Err(e) => {
+                    exit::diag_exit(exit::USAGE, &format!("invalid routing rules: {e}"));
+                    return exit::USAGE;
+                }
+            }
+        }
+    };
+    let router = std::sync::Arc::new(router);
+
     // Detached parent: re-spawn self as the session process, wait for UP.
     if o.detach && !o.child {
         return spawn_detached(o).await;
+    }
+
+    // Active routing is announced once: a `direct` or `block` rule means
+    // some traffic does NOT ride the tunnel, and the operator must see that
+    // from the session output (stderr; the report schema is stable).
+    if let Some(path) = &routing_from {
+        eprintln!(
+            "qcore: routing active: {} rule(s) from {} (non-matching targets proxy through the tunnel)",
+            router.len(),
+            path.display()
+        );
     }
 
     // Session ownership lock (H2.5): taken by the process that actually
@@ -1174,7 +1235,7 @@ async fn run_connect(o: ConnectOpts) -> i32 {
         // (its stored `Arc<dyn Dialer>` would otherwise pin the dead
         // pre-rebuild exit for ATYP=domain targets).
         tokio::spawn(
-            qcore_core::session::proxy::serve_socks_via_dialer_with_services(
+            qcore_core::session::proxy::serve_socks_via_dialer_with_routing(
                 binder,
                 handle.live_dialer(),
                 // The session policy (not dual-default): `--family ipv4` refuses
@@ -1192,6 +1253,7 @@ async fn run_connect(o: ConnectOpts) -> i32 {
                             ip,
                         ))
                     }),
+                router.clone(),
             ),
         );
     }
@@ -1207,7 +1269,7 @@ async fn run_connect(o: ConnectOpts) -> i32 {
         // Same services + peer policy as the SOCKS listener (the resolver
         // rides the same live dialer and UDP-egress gate; see the SOCKS
         // block above for the rebuild semantics).
-        tokio::spawn(qcore_core::session::proxy::serve_http_proxy(
+        tokio::spawn(qcore_core::session::proxy::serve_http_proxy_with_routing(
             http_binder,
             handle.live_dialer(),
             session.family_policy.clone(),
@@ -1220,6 +1282,7 @@ async fn run_connect(o: ConnectOpts) -> i32 {
                         ip,
                     ))
                 }),
+            router.clone(),
         ));
     }
 
@@ -1452,6 +1515,9 @@ async fn spawn_detached(o: ConnectOpts) -> i32 {
     }
     if let Some(ref ka) = o.keepalive {
         cmd.arg("--keepalive").arg(ka);
+    }
+    if let Some(ref routing) = o.routing {
+        cmd.arg("--routing").arg(routing);
     }
     // Detached child writes the report itself; forward so --detach keeps
     // the same --report-out contract as foreground connect.
@@ -1783,6 +1849,22 @@ fn run_status(json: bool, dirs: &ProfileDirs) -> i32 {
         }
         SessionStatus::Live { report } => {
             report::emit_report(&report, json);
+            if !json {
+                // One line when routing rules are configured at the profile
+                // default. The report schema is frozen, and an explicit
+                // `--routing` path is not persisted; connect's own stderr
+                // line (and the detached log) names the actually loaded
+                // file.
+                let path = dirs
+                    .profile_dir
+                    .join(qcore_core::config::routing::ROUTING_FILE);
+                if path.is_file() {
+                    eprintln!(
+                        "qcore: routing rules configured at {} (connect --routing overrides)",
+                        path.display()
+                    );
+                }
+            }
             exit::SUCCESS
         }
     }
@@ -2009,6 +2091,7 @@ mod tests {
                 obfuscation: None,
                 dns: None,
                 keepalive: None,
+                routing: None,
             },
             false,
         );

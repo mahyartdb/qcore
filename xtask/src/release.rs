@@ -24,9 +24,10 @@ use std::path::{Path, PathBuf};
 /// cannot drift (T7 story 18).
 const TARGETS_TOML: &str = include_str!("targets.toml");
 
-/// One `[[target]]` entry: the triple plus its delivery spec.
+/// One `[[target]]` entry: the triple, its runner label and delivery spec.
 struct TargetEntry {
     triple: String,
+    runner: String,
     delivery: Vec<String>,
 }
 
@@ -41,8 +42,13 @@ fn contract_target_entries() -> Vec<TargetEntry> {
             }
             current = Some(TargetEntry {
                 triple: v.trim().trim_matches('"').to_string(),
+                runner: String::new(),
                 delivery: Vec::new(),
             });
+        } else if let Some(v) = l.strip_prefix("runner = ") {
+            if let Some(c) = current.as_mut() {
+                c.runner = v.trim().trim_matches('"').to_string();
+            }
         } else if let Some(v) = l.strip_prefix("delivery = ") {
             if let Some(c) = current.as_mut() {
                 let inner = v.trim().trim_start_matches('[').trim_end_matches(']');
@@ -65,6 +71,42 @@ fn contract_targets() -> Vec<String> {
         .into_iter()
         .map(|t| t.triple)
         .collect()
+}
+
+/// The proof side of the contract: the tag matrix in
+/// `.github/workflows/release.yml`, embedded at compile time. Parsing it here
+/// instead of keeping a second hand-maintained list means a leg added or
+/// dropped in ONE of the two files fails the release gate in that same commit
+/// (issue #16 triage: the old COVERED const was a documented stub that had to
+/// be remembered).
+const RELEASE_WORKFLOW: &str = include_str!("../../.github/workflows/release.yml");
+
+/// Triples the release matrix proves, in workflow order: the `- target:` rows
+/// under `matrix.include`.
+fn matrix_targets() -> Vec<String> {
+    matrix_rows()
+        .into_iter()
+        .map(|(triple, _)| triple)
+        .collect()
+}
+
+/// `(triple, runner)` pairs from the release matrix, in workflow order. The
+/// runner half is checked against `targets.toml` too: the 3/9 matrix this
+/// replaced chose its runner with `contains(target, 'aarch64')`, which sends
+/// aarch64 linux and android legs to the Windows ARM runner.
+fn matrix_rows() -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for l in RELEASE_WORKFLOW.lines() {
+        let l = l.trim();
+        if let Some(v) = l.strip_prefix("- target: ") {
+            out.push((v.trim().trim_matches('"').to_string(), String::new()));
+        } else if let Some(v) = l.strip_prefix("runner: ") {
+            if let Some(last) = out.last_mut() {
+                last.1 = v.trim().trim_matches('"').to_string();
+            }
+        }
+    }
+    out
 }
 
 /// Delivery container per the `targets.toml` `delivery` field: windows legs
@@ -538,54 +580,56 @@ pub fn package(args: Vec<String>) -> super::anyhow::Result<()> {
 pub fn run(args: Vec<String>) -> super::anyhow::Result<()> {
     let fail = |m: String| super::anyhow::Error::msg(m);
 
-    // Release-matrix honesty (targets.toml is the 9-target contract): the CI
-    // tag matrix builds only the 3 Windows legs, so no release invocation —
-    // local OR publish-finalize — may proceed without acknowledging the
-    // partial matrix explicitly. Printing "package complete" without naming
-    // the 6 unproven targets was a silent contract breach. Full expansion
-    // needs runner capacity + a constitution amendment (see AGENTS.md
-    // release row); do not tag `v*` until then.
-    //
-    // DOCUMENTED STUB (T7 story 18): COVERED is the Windows-only subset the
-    // tag matrix in `.github/workflows/release.yml` proves today. It must
-    // match that file's `matrix.target` list triple-for-triple; CONTRACT is
-    // read from `targets.toml` at compile time, so manifest drift fails the
-    // count here instead of shipping silently. The workflow's publish job
-    // passes --allow-partial-matrix for exactly this reason: the matrix DID
-    // prove the three Windows legs, and the finalize mode below carries the
-    // per-target artifacts; the 6 unproven targets are still named, never
-    // silently claimed.
-    const COVERED: &[&str] = &[
-        "i686-pc-windows-msvc",
-        "x86_64-pc-windows-msvc",
-        "aarch64-pc-windows-msvc",
-    ];
+    // Release-matrix honesty: no release invocation — local OR
+    // publish-finalize — may claim more proof than the workflow's matrix
+    // actually runs. Coverage is parsed from `.github/workflows/release.yml`
+    // (the proof side) and compared against `targets.toml` (the contract
+    // side), both at compile time, so an edit to either file alone fails
+    // closed here instead of shipping a claim no runner backs. A deliberately
+    // partial matrix still needs the explicit --allow-partial-matrix
+    // acknowledgment, which names the unproven targets in the log.
     let contract = contract_targets();
-    let uncovered: Vec<_> = contract
-        .iter()
-        .filter(|t| !COVERED.contains(&t.as_str()))
-        .collect();
-    if !args.iter().any(|a| a == "--allow-partial-matrix") {
+    let covered = matrix_targets();
+    let undeclared: Vec<_> = covered.iter().filter(|t| !contract.contains(t)).collect();
+    if !undeclared.is_empty() {
         return Err(fail(format!(
-            "release blocked: tag matrix covers {}/{} targets ({}); unproven: {}. Re-run with --allow-partial-matrix to acknowledge, or expand the matrix (constitution amendment required).",
-            COVERED.len(),
-            contract.len(),
-            COVERED.join(", "),
-            uncovered
+            "release blocked: release.yml builds targets absent from targets.toml: {}. targets.toml is the contract; removing/demoting a target needs a constitution amendment.",
+            undeclared
                 .iter()
                 .map(|t| t.to_string())
                 .collect::<Vec<_>>()
                 .join(", ")
         )));
     }
-    println!(
-        "release: partial-matrix acknowledged; unproven targets: {}",
-        uncovered
-            .iter()
-            .map(|t| t.to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
+    let uncovered: Vec<_> = contract.iter().filter(|t| !covered.contains(t)).collect();
+    if uncovered.is_empty() {
+        println!(
+            "release: full matrix covered: {}/{} targets (release.yml <-> targets.toml)",
+            covered.len(),
+            contract.len()
+        );
+    } else if !args.iter().any(|a| a == "--allow-partial-matrix") {
+        return Err(fail(format!(
+            "release blocked: tag matrix covers {}/{} targets ({}); unproven: {}. Re-run with --allow-partial-matrix to acknowledge, or add the missing legs to .github/workflows/release.yml.",
+            covered.len(),
+            contract.len(),
+            covered.join(", "),
+            uncovered
+                .iter()
+                .map(|t| t.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    } else {
+        println!(
+            "release: partial-matrix acknowledged; unproven targets: {}",
+            uncovered
+                .iter()
+                .map(|t| t.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
 
     // CI finalize mode (`--staged-artifacts <dir>`): the workflow's matrix
     // legs each built + smoked + packaged + uploaded their own target
@@ -1010,6 +1054,26 @@ mod tests {
         assert_eq!(contract.len(), 9, "manifest triple count: {contract:?}");
         assert!(contract.contains(&"x86_64-pc-windows-msvc".to_string()));
         assert!(contract.contains(&"aarch64-linux-android".to_string()));
+    }
+
+    #[test]
+    fn workflow_matrix_matches_contract() {
+        // Coverage is parsed from release.yml, not a second hand-kept list: a
+        // leg added or dropped in one file alone must fail here instead of at
+        // tag time. Runner placement is asserted with the triple, so a
+        // `contains(..., 'aarch64')`-style runner guess cannot send a linux or
+        // android leg to the Windows ARM runner again.
+        let mut workflow = super::matrix_rows();
+        let mut contract: Vec<_> = super::contract_target_entries()
+            .into_iter()
+            .map(|t| (t.triple, t.runner))
+            .collect();
+        workflow.sort();
+        contract.sort();
+        assert_eq!(
+            workflow, contract,
+            "release.yml (target, runner) vs targets.toml"
+        );
     }
 
     #[test]

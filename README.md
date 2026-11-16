@@ -113,7 +113,9 @@ qcore's own licensing, which the two LICENSE files here make explicit.
 ## Status
 
 Release discipline is deliberately strict: `xtask/src/targets.toml` is the
-9-target contract, the tag matrix currently proves 3/9 (Windows-only), and
-tagging `v*` is prohibited until the full matrix has a dry-run pass (see
-AGENTS.md). Local `cargo xtask release` fails closed without
-`--allow-partial-matrix`.
+9-target contract, and `release.yml` builds, smokes and packages all nine on
+a `v*` tag push or on a `workflow_dispatch` dry run (which publishes
+nothing). Tagging is still prohibited until one green dry run of that full
+matrix (see AGENTS.md). Local `cargo xtask release` fails closed when
+`release.yml` and `targets.toml` disagree, and `--allow-partial-matrix` only
+acknowledges a deliberately partial matrix.

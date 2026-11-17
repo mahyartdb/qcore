@@ -232,9 +232,11 @@ enum Commands {
         #[arg(long)]
         keepalive: Option<String>,
         /// Routing rules file (default: `<profile-dir>/routing.toml` when
-        /// present). Rules match the CONNECT/UDP destination — domain
-        /// suffix, CIDR, port — first match wins, action proxy|direct|block.
-        /// `direct` bypasses the tunnel; `block` refuses before any egress.
+        /// present). Rules match the CONNECT/UDP destination - domain
+        /// suffix, CIDR, port - first match wins, action proxy|direct|block.
+        /// Exception: a CIDR `block` is unorderable, it wins over any
+        /// earlier rule when the resolved address matches. `direct` bypasses
+        /// the tunnel; `block` refuses before any egress.
         #[arg(long)]
         routing: Option<String>,
     },

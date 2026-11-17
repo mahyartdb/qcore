@@ -168,22 +168,20 @@ jobs:
         run: cargo run -q -p xtask -- notices --check
       - name: C ABI diff
         run: cargo xtask abi-diff
-      # Tag-publish integrity (N1, round-7 verification): the gates job runs
-      # on tags and dispatches where ci.yml does not, so the full supply
-      # dimension must be here too — a tag cut from a non-master commit must
-      # not publish code that skipped cargo-deny, semver or the secret scans.
+      # Tags and dispatches do not trigger ci.yml, so the full supply
+      # dimension runs here: deny, semver, and both secret scanners over the
+      # full tree/history.
       - name: supply chain (cargo-deny)
         run: cargo deny --config denylist.toml check
-      # Tags and dispatches do not trigger ci.yml, so the full supply
-      # dimension runs here: deny, semver (against the tag's merge-base
-      # backstop), and both secret scanners over the full tree/history.
-      # Same disk wipe as ci.yml before semver: the fmt/clippy/nextest/
-      # conformance target/ plus the dual baseline/current rustdoc builds
-      # exceed the ~14 GB runner limit.
-      - name: semver-checks (git baseline)
+      # Same free-disk wipe as ci.yml's `free disk before semver baseline
+      # builds` step: the fmt/clippy/nextest/conformance target/ plus the
+      # dual baseline/current rustdoc builds exceed the ~14 GB runner limit.
+      - name: free disk before semver baseline builds
         run: |
           cargo clean
           rm -rf ~/.cargo/registry/cache
+      - name: semver-checks (git baseline)
+        run: |
           BASE="${{ github.event.pull_request.base.sha }}"
           [ -z "$BASE" ] && BASE="$(git merge-base HEAD HEAD~1 2>/dev/null || echo HEAD~1)"
           cargo semver-checks --baseline-rev "$BASE" --exclude tests-conformance --exclude tests-chains

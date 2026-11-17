@@ -1,4 +1,5 @@
-//! Routing rules for proxy targets (first match wins).
+//! Routing rules for proxy targets (first match, except unorderable CIDR
+//! blocks).
 //!
 //! Semantics, also documented in `contracts/cli.md` §4 and
 //! `profiles/README.md`:

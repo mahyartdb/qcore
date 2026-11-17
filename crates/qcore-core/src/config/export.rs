@@ -47,6 +47,15 @@ fn export_with(imp: &ConfigImport, secret: &dyn Fn(&str) -> String) -> String {
         "PrivateKey = {}\n",
         secret("interface.private_key")
     ));
+    if imp.secrets.contains_key("interface.header_protection_key") {
+        // Export the full-fidelity record: `parse(export_plain(a))` must
+        // reproduce `a` including AWG header protection (round-trip
+        // contract). The redacted sink masks this through the same closure.
+        s.push_str(&format!(
+            "HeaderProtectionKey = {}\n",
+            secret("interface.header_protection_key")
+        ));
+    }
     let mut keys: Vec<&String> = imp.interface.keys().collect();
     keys.sort();
     for k in keys {
@@ -171,6 +180,40 @@ mod tests {
         let b = ConfigImport::parse_str(&text, std::path::Path::new("x.conf")).unwrap();
         assert_eq!(b.interface, a.interface);
         assert_eq!(b.peers, a.peers);
+    }
+
+    #[test]
+    fn hp_key_round_trips_and_redacts() {
+        // A conf carrying AWG header protection must survive export →
+        // re-import byte-for-byte (round-trip contract), and the redacted
+        // export must mask the key like every other secret.
+        let mut a = sample();
+        let key_b64 = "AgMIBAcGCAkKCwwNDg8QERITFBUWFxgZGhscHR4fGhs="; // 32 bytes
+        a.secrets.insert(
+            "interface.header_protection_key".to_string(),
+            crate::config::secret::SecretString::new(key_b64),
+        );
+        let text = export_plain(&a).expect("secrets present");
+        assert!(
+            text.contains("HeaderProtectionKey = "),
+            "plain export emits the key"
+        );
+        let b = ConfigImport::parse_str(&text, std::path::Path::new("hp.conf")).unwrap();
+        assert_eq!(
+            b.secrets.len(),
+            a.secrets.len(),
+            "hp key survives the round trip"
+        );
+        for (k, v) in &a.secrets {
+            let got = b.secrets.get(k).expect("re-imported secret present");
+            assert_eq!(got.expose(), v.expose(), "secret {k} round-trips");
+        }
+        let redacted = export_redacted(&a);
+        assert!(
+            redacted.contains("HeaderProtectionKey = <redacted>"),
+            "redacted export masks the key"
+        );
+        assert!(!redacted.contains(key_b64));
     }
 
     #[test]

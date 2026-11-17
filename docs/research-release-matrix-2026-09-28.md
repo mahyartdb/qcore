@@ -19,7 +19,7 @@ Local repo declares 9 triples authoritative but proves 3/9 Windows-only in `rele
 ### 2. Build vs smoke vs package are not the same proof
 
 **Fact** — `build.rs:18-28` selects backend by triple (`native-msvc`/`cargo-ndk`/`cargo-zigbuild`/`cross-rs`); `:30-52` shells one build command with pinned versions `:13-15`. Sources: [L1].
-**Fact** — `smoke.rs:69-118` native runs full offline matrix (version/preflight/ls/import-exit-5/empty-scan-exit-4); `:158-183` cross-target only validates triple + shells build + prints build-OK; android `:179-181` defers to emulator on CI. Sources: [L1].
+**Fact** — `smoke.rs:69-118` native runs full offline matrix (version/preflight/ls/import-exit-5/empty-scan-exit-4); `:158-183` cross-target only validates triple + shells build + prints build-OK; android `:179-181` defers to emulator on CI. Sources: [L1]. **Superseded (2026-11-17, round 7):** the android smoke now claims only build + cdylib export scan — on-device execution is not covered by CI (see `smoke.rs:12-14` and the round-7 reconciliation below); the "emulator on CI" reading is historical.
 **Fact** — `release.yml:30-31` per-matrix-leg steps are `xtask build` + `xtask smoke`; `:32-45` publish on `ubuntu-22.04` runs bare `xtask package` then `xtask release` (re-gates + re-packages). Sources: [L1].
 **Inference** — Cross-target smoke is build-plus-symbol scaffolding, not per-target execution; publish packages native artifact, not matrix outputs. Evidence: file:lines above; leap is interpretation of missing per-target package/upload step — judge accordingly.
 **Inference** — Conflicts with `tasks.md:211` T086 claim of stub-peer connect over ipv4/ipv6/dual for all 9 incl. emulator. Evidence cited, leap is conflict reading.

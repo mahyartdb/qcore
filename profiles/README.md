@@ -65,6 +65,12 @@ Honest limits:
   PrivateKey = <client private key, base64>
   Address = 10.9.0.2/32
   HeaderProtectionKey = <shared 32-byte key, base64>
+  # Junk-train params too: AWG fields absent from the conf default to 0 and
+  # import material fills BEFORE profile params, so a conf without them
+  # would silence the junk train of an `-O awg-balanced` profile.
+  Jc = 6
+  Jmin = 64
+  Jmax = 256
   S1 = 24
   S2 = 24
   S3 = 24

@@ -72,7 +72,8 @@ pub struct ConfigImport {
     /// Recognized `[Peer]` non-secret fields per peer section.
     pub peers: Vec<BTreeMap<String, String>>,
     pub awg: Option<AwgParams>,
-    /// In-memory secrets: `interface.private_key`, `peer<N>.preshared_key`.
+    /// In-memory secrets: `interface.private_key`,
+    /// `interface.header_protection_key`, `peer<N>.preshared_key`.
     pub secrets: BTreeMap<String, SecretString>,
     pub unknown_fields: Vec<String>,
     pub verdict: ImportVerdict,

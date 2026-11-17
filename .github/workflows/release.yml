@@ -151,7 +151,7 @@ jobs:
           key: v2-pruned
       - uses: taiki-e/install-action@v2
         with:
-          tool: nextest@0.9.145
+          tool: nextest@0.9.145,cargo-deny@0.20.2,cargo-semver-checks@0.50.0
       - name: fmt
         run: cargo fmt --check
       - name: clippy
@@ -166,6 +166,29 @@ jobs:
         run: cargo run -q -p xtask -- notices --check
       - name: C ABI diff
         run: cargo xtask abi-diff
+      # Tag-publish integrity (N1, round-7 verification): the gates job runs
+      # on tags and dispatches where ci.yml does not, so the full supply
+      # dimension must be here too — a tag cut from a non-master commit must
+      # not publish code that skipped cargo-deny, semver or the secret scans.
+      - name: supply chain (cargo-deny)
+        run: cargo deny --config denylist.toml check
+      - name: semver-checks (git baseline)
+        run: |
+          BASE="${{ github.event.pull_request.base.sha }}"
+          [ -z "$BASE" ] && BASE="$(git merge-base HEAD HEAD~1 2>/dev/null || echo HEAD~1)"
+          cargo semver-checks --baseline-rev "$BASE" --exclude tests-conformance --exclude tests-chains
+      - name: prune semver scratch trees
+        run: rm -rf target/semver-checks
+      - name: gitleaks (pinned CLI)
+        run: |
+          curl -sSL -o /tmp/gitleaks.tar.gz https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
+          tar xzf /tmp/gitleaks.tar.gz -C /tmp && sudo install -m755 /tmp/gitleaks /usr/local/bin/
+          gitleaks detect --source . -v --exit-code=2
+      - name: secret scan (trufflehog git history)
+        run: |
+          curl -sSL -o /tmp/trufflehog.tar.gz https://github.com/trufflesecurity/trufflehog/releases/download/v3.88.4/trufflehog_3.88.4_linux_amd64.tar.gz
+          tar xzf /tmp/trufflehog.tar.gz -C /tmp && sudo install -m755 /tmp/trufflehog /usr/local/bin/
+          trufflehog git "file://$(pwd)" --fail --no-update --only-verified
 
   # Finalize (tag AND dry-run): stage the nine per-target archives, write the
   # full-graph SBOM + SHA256SUMS, cosign-sign keylessly. A dry run that skipped

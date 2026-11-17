@@ -190,7 +190,11 @@ fn install_version(workflow: &str, tool: &str) -> Result<String, String> {
 
 /// Release.yml's installed backend versions must equal the pins in `build.rs`
 /// (the backend selector). A drift here silently changes what cross/cargo-ndk
-/// does for the same triple while the build command stays the same.
+/// does for the same triple while the build command stays the same. The
+/// actions/cache key carries the same version (QA#5): when the pin bumps but
+/// the cache key stays, the cache restores the OLD binary and skips the
+/// install — the leg builds with a backend the pin says it is not using — so
+/// both literals are diffed, not just the install line.
 fn workflow_backend_pins_match() -> Result<(), String> {
     backend_pins_match(RELEASE_WORKFLOW)
 }
@@ -206,8 +210,37 @@ fn backend_pins_match(workflow: &str) -> Result<(), String> {
                 "release.yml installs {tool} {actual}, but build.rs pins {expected}; update both or neither"
             ));
         }
+        let cache = cache_key_version(workflow, tool)?;
+        if cache != expected {
+            return Err(format!(
+                "release.yml caches {tool} {cache}, but build.rs pins {expected}; the cache would restore the old backend after a bump — update the cache key too"
+            ));
+        }
     }
     Ok(())
+}
+
+/// The `key:` literal of the actions/cache step for `tool` (the version is
+/// the last `-`-separated segment).
+fn cache_key_version(workflow: &str, tool: &str) -> Result<String, String> {
+    let needle = format!("key: {tool}-");
+    let mut found = Vec::new();
+    for raw in workflow.lines() {
+        let line = raw.trim();
+        if let Some(rest) = line.strip_prefix(&needle) {
+            let version = rest
+                .rsplit('-')
+                .next()
+                .ok_or_else(|| format!("release.yml: cache key `{line}` names no version"))?;
+            found.push(version.trim_end_matches('-').to_string());
+        }
+    }
+    match found.len() {
+        1 => Ok(found.remove(0)),
+        n => Err(format!(
+            "release.yml: expected exactly one `key: {tool}-<...>-<version>` cache key, found {n}: {found:?}"
+        )),
+    }
 }
 
 /// Delivery container per the `targets.toml` `delivery` field: windows legs

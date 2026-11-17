@@ -118,7 +118,10 @@ intact for a retry.
   verdict and the table is applied once with both name and address; when no
   CIDR rule can match the port, name and port-only rules decide without
   resolution. First match wins among rules evaluated with the same
-  information. Each rule is `match = { domain | cidr | port }`
+  information, with ONE exception: a CIDR `block` rule is unorderable — when
+  the resolved address matches a port-matching CIDR block, `block` wins over
+  any earlier rule, so file order can never ship a denied address to the
+  host stack. Each rule is `match = { domain | cidr | port }`
   (present fields ANDed, `domain` and `cidr` mutually exclusive) plus
   `action = "proxy" | "direct" | "block"`. A `domain` matches the CONNECT
   target name as a DNS suffix on label boundaries (`example.com` covers

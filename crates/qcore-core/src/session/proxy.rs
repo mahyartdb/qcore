@@ -2997,6 +2997,14 @@ mod tests {
     }
 
     async fn spawn_http_with_routing(dialer: Arc<dyn Dialer>, router: Arc<Router>) -> SocketAddr {
+        spawn_http_with_services(dialer, None, router).await
+    }
+
+    async fn spawn_http_with_services(
+        dialer: Arc<dyn Dialer>,
+        resolver: Option<Arc<crate::session::resolver::TunnelResolver>>,
+        router: Arc<Router>,
+    ) -> SocketAddr {
         let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = proxy.local_addr().unwrap();
         tokio::spawn(serve_http_proxy_with_routing(
@@ -3004,7 +3012,7 @@ mod tests {
             dialer,
             FamilyPolicy::default(),
             PeerPolicy::default(),
-            None,
+            resolver,
             router,
         ));
         addr
@@ -3272,6 +3280,85 @@ mod tests {
             "a block rule answers 403: {reply}"
         );
         assert_eq!(dialer.tcp.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn routing_http_cidr_on_a_domain_resolves_then_blocks() {
+        // QA#2 follow-up: the HTTP CONNECT path must behave like SOCKS on a
+        // CIDR-relevant port — resolve through the tunnel before any verdict.
+        // A name-first decision would 403 on the name alone here, fine, but
+        // the mirror case (direct rule first, block second) would ship the
+        // blocked address to the host stack.
+        let dns = fake_dns(
+            "corp.internal",
+            IpAddr::V4(std::net::Ipv4Addr::new(10, 1, 2, 3)),
+        )
+        .await;
+        let dialer = Arc::new(CountingDialer::default());
+        let resolver = Arc::new(TunnelResolver::with_server(dialer.clone(), dns));
+        let router = router_from(
+            r#"
+            [[rules]]
+            match = { domain = "corp.internal" }
+            action = "direct"
+
+            [[rules]]
+            match = { cidr = "10.0.0.0/8", port = 445 }
+            action = "block"
+            "#,
+        );
+        let proxy_addr = spawn_http_with_services(dialer.clone(), Some(resolver), router).await;
+
+        let mut c = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        c.write_all(b"CONNECT corp.internal:445 HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        let reply = http_read_reply(&mut c).await;
+        assert!(
+            reply.starts_with("HTTP/1.1 403"),
+            "the unorderable CIDR block wins over the earlier direct rule: {reply}"
+        );
+        assert_eq!(
+            dialer.udp.load(Ordering::SeqCst),
+            1,
+            "exactly one tunnel DNS query resolved the name before the verdict"
+        );
+        assert_eq!(
+            dialer.tcp.load(Ordering::SeqCst),
+            0,
+            "blocked before any dial"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn routing_http_cidr_without_a_resolver_fails_closed_501() {
+        // QA#2 follow-up: the HTTP CONNECT fail-closed arm — a CIDR-relevant
+        // port on a domain target with no tunnel resolver must answer 501,
+        // never fall back to the OS resolver.
+        let dialer = Arc::new(CountingDialer::default());
+        let router = router_from(
+            r#"
+            [[rules]]
+            match = { cidr = "10.0.0.0/8", port = 445 }
+            action = "block"
+            "#,
+        );
+        let proxy_addr = spawn_http_with_services(dialer.clone(), None, router).await;
+
+        let mut c = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        c.write_all(b"CONNECT corp.internal:445 HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        let reply = http_read_reply(&mut c).await;
+        assert!(
+            reply.starts_with("HTTP/1.1 501"),
+            "no tunnel resolver: CIDR-on-domain refuses instead of guessing: {reply}"
+        );
+        assert_eq!(
+            dialer.tcp.load(Ordering::SeqCst),
+            0,
+            "no dial of any kind on the fail-closed path"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

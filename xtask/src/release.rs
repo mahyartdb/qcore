@@ -1331,9 +1331,10 @@ mod serde_json_lite {
 #[cfg(test)]
 mod tests {
     use super::{
-        archive_fmt_for, backend_pins_match, contract_targets, expected_machine, install_version,
-        machine_of, matrix_rows_in, sha256_hex, stage_and_archive, workflow_backend_pins_match,
-        ArchiveFmt, Machine, ELF_EM_AARCH64, ELF_EM_ARM, ELF_EM_X86_64, PE_AMD64, PE_I386,
+        archive_fmt_for, backend_pins_match, cache_key_version, contract_targets, expected_machine,
+        install_version, machine_of, matrix_rows_in, sha256_hex, stage_and_archive,
+        workflow_backend_pins_match, ArchiveFmt, Machine, ELF_EM_AARCH64, ELF_EM_ARM,
+        ELF_EM_X86_64, PE_AMD64, PE_I386,
     };
 
     fn tmp_base(tag: &str) -> std::path::PathBuf {
@@ -1436,6 +1437,28 @@ jobs:
         .expect_err("version drift must fail");
         assert!(
             err.contains("cross 9.9.9") && err.contains("0.2.5"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn cache_key_version_parses_and_drift_fails_closed() {
+        // The actions/cache key carries the same version as the install
+        // line; a bump of one without the other restores the OLD backend
+        // binary and skips the install (QA#5). The version is the last
+        // dash-separated segment.
+        let ok = "key: cross-${{ runner.os }}-${{ runner.arch }}-0.2.5\n";
+        assert_eq!(cache_key_version(ok, "cross").unwrap(), "0.2.5");
+        assert!(cache_key_version("", "cross").is_err());
+        let drift = ok.replace("0.2.5", "0.2.4");
+        let err = backend_pins_match(&format!(
+            "{drift}run: cargo install cross --version 0.2.5 --locked\n\
+             run: cargo install cargo-ndk --version 3.2.0 --locked\n\
+             key: cargo-ndk-3.2.0\n"
+        ))
+        .expect_err("cache-key drift must fail even with a matching install line");
+        assert!(
+            err.contains("caches cross 0.2.4") && err.contains("0.2.5"),
             "{err}"
         );
     }

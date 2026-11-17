@@ -1,9 +1,13 @@
 //! Routing rules as data (`routing.toml`, per profile dir).
 //!
 //! A rule is `action` plus a `match` table; every present `match` field must
-//! agree (AND). Rules evaluate in file order and the first match decides.
-//! Nothing matching means "proxy through the tunnel", the historic behavior,
-//! so an absent or empty file changes nothing.
+//! agree (AND). Rules evaluate in file order and the first match decides —
+//! with ONE exception: a CIDR `block` rule is unorderable, it wins over any
+//! earlier rule when the resolved address matches (see
+//! `session::routing::Router::decide`; file order must never ship a denied
+//! address to the host stack). Nothing matching means "proxy through the
+//! tunnel", the historic behavior, so an absent or empty file changes
+//! nothing.
 //!
 //! Parsing fails closed naming the rule index and the offending field, the
 //! same discipline as `obfuscation.toml`: a typo must not silently turn a

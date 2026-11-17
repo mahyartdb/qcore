@@ -117,26 +117,34 @@ ASSOCIATE) target goes. `connect --routing <path>` loads a different file;
 an absent or empty file means every target proxies through the tunnel, the
 historic behavior.
 
-Rules are an ordered array; the first match wins among rules evaluated with
-the same information. Evaluation is order-independent across match kinds:
-when some CIDR rule could match the target port, a domain target resolves
+Rules are an ordered array; first match wins among rules evaluated with the
+same information. Evaluation is order-independent across match kinds: when
+some CIDR rule could match the target port, a domain target resolves
 through the tunnel *before* any verdict, so an earlier domain rule cannot
-bypass a later CIDR block. Each rule has a `match` table (at least one field;
-present fields must all agree) and an `action`:
+bypass a later CIDR block. One exception on top of first match: a CIDR
+`block` rule is **unorderable** — when the resolved address matches a
+port-matching CIDR block, `block` wins over any earlier rule, so file order
+can never ship a denied address to the host stack (the example below relies
+on exactly that: `intranet.example` resolving inside RFC1918 is blocked at
+445 even though the `direct` rule precedes the block). Each rule has a
+`match` table (at least one field; present fields must all agree) and an
+`action`:
 
 ```toml
 # Host-network egress for an intranet suffix; everything else stays in the
-# tunnel unless a later rule says otherwise.
+# tunnel unless a later rule says otherwise. NOTE: a target resolving into
+# 10.0.0.0/8 at port 445 is still BLOCKED by the later rule below — CIDR
+# blocks are unorderable.
 [[rules]]
 match = { domain = "intranet.example" }
 action = "direct"
 
-# SMB inside RFC1918 is refused before any egress.
+# SMB inside RFC1918 is refused before any egress, regardless of file order.
 [[rules]]
 match = { cidr = "10.0.0.0/8", port = 445 }
 action = "block"
 
-# Port-only rules match any host.
+# Port-only rules match any host that no CIDR block has refused.
 [[rules]]
 match = { port = 25 }
 action = "block"

@@ -133,9 +133,11 @@ jobs:
   # per-target artifacts; this job proves the source they were built from:
   # a v* tag must never publish from a commit that flunks the CI essentials.
   # Same commands as ci.yml's gate minus `smoke` (each matrix leg runs the
-  # target smoke itself) and minus the secret/semver jobs (those already run
-  # on every push and PR). Cache key matches ci.yml's gate so a tag push
-  # restores the PR run's artifacts instead of rebuilding.
+  # target smoke itself) — and INCLUDING cargo-deny, semver-checks,
+  # gitleaks and trufflehog: ci.yml triggers only on PRs and pushes to
+  # master, so a tag cut from another commit would otherwise publish code
+  # that never saw the supply dimension. Cache key matches ci.yml's gate so
+  # a tag push restores the PR run's artifacts instead of rebuilding.
   gates:
     runs-on: ubuntu-22.04
     timeout-minutes: 120
@@ -172,8 +174,16 @@ jobs:
       # not publish code that skipped cargo-deny, semver or the secret scans.
       - name: supply chain (cargo-deny)
         run: cargo deny --config denylist.toml check
+      # Tags and dispatches do not trigger ci.yml, so the full supply
+      # dimension runs here: deny, semver (against the tag's merge-base
+      # backstop), and both secret scanners over the full tree/history.
+      # Same disk wipe as ci.yml before semver: the fmt/clippy/nextest/
+      # conformance target/ plus the dual baseline/current rustdoc builds
+      # exceed the ~14 GB runner limit.
       - name: semver-checks (git baseline)
         run: |
+          cargo clean
+          rm -rf ~/.cargo/registry/cache
           BASE="${{ github.event.pull_request.base.sha }}"
           [ -z "$BASE" ] && BASE="$(git merge-base HEAD HEAD~1 2>/dev/null || echo HEAD~1)"
           cargo semver-checks --baseline-rev "$BASE" --exclude tests-conformance --exclude tests-chains

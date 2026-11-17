@@ -11,9 +11,9 @@ specs
 contracts
 *.md
 !README.md
+!THIRD-PARTY-NOTICES.md
 !Cargo.toml
 Cargo.lock.orig
-denlylist.toml
 denylist.toml
 rustfmt.toml
 clippy.toml

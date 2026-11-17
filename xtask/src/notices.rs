@@ -166,6 +166,20 @@ waived all copyright and related rights.\n"
             _ => {}
         }
     }
+    // Provenance for the one vendored dependency: cargo metadata lists it as
+    // an ordinary package, but it is a modified copy, and BSD-3-Clause §2/§4
+    // require the modification and its provenance to travel with the notices.
+    // Emitted only when boringtun is actually in the graph.
+    if let Some(boringtun) = crates.iter().find(|c| c.name == "boringtun") {
+        out.push_str(&format!(
+            "\n## Vendored packages\n\n\
+- `boringtun {}` is a **modified copy** of upstream crates.io `boringtun {}` \
+(Cloudflare, BSD-3-Clause). Every deviation, and the upstream provenance pin \
+(crate sha256 + git commit), is recorded in `third_party/boringtun/QCORE_PATCHES.md`. \
+The BSD-3-Clause text ships with every binary archive as `LICENSE.md`.\n",
+            boringtun.version, boringtun.version
+        ));
+    }
     Ok(out)
 }
 
@@ -461,6 +475,27 @@ mod tests {
         // URL fallback: homepage preferred, repository second, dash when absent.
         assert!(doc.contains("| https://example.com/oe |"), "{doc}");
         assert!(doc.contains("| - |"), "empty URL degrades to dash: {doc}");
+    }
+
+    #[test]
+    fn vendored_boringtun_gets_a_modified_copy_note() {
+        // The archive ships the BSD-3-Clause text and this notice: the note
+        // must name the modification and point at the patch record, else the
+        // binary distribution is a licence violation (BSD-3-Clause §2).
+        let meta = serde_json_lite::parse(
+            r#"{"packages":[
+                {"name":"boringtun","version":"0.7.1","license":"BSD-3-Clause","repository":"https://github.com/cloudflare/boringtun"}
+            ]}"#,
+        )
+        .expect("parses");
+        let doc = build_document(&meta).expect("document");
+        assert!(doc.contains("## Vendored packages"), "{doc}");
+        assert!(doc.contains("modified copy"), "{doc}");
+        assert!(
+            doc.contains("third_party/boringtun/QCORE_PATCHES.md"),
+            "{doc}"
+        );
+        assert!(doc.contains("LICENSE.md"), "{doc}");
     }
 
     #[test]

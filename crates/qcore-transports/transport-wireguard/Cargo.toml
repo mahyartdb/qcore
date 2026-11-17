@@ -15,5 +15,6 @@ tokio = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true }
 # Only for advancing boringtun's mock clock in tests when the workspace
-# --all-features build unifies `mock-instant` on.
+# --all-features build unifies `mock-instant` on. MockClock state is
+# thread-local: tests using it pin `flavor = "current_thread"`.
 mock_instant = "0.3"

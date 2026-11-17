@@ -339,12 +339,34 @@ enum Commands {
 fn main() {
     #[cfg(windows)]
     use_utf8_console();
+    // A closed stdout (e.g. `qcore ls | head`) must end the process like any
+    // Unix filter, not panic on the first print. println's panic on EPIPE
+    // surfaces as `failed printing to stdout: Broken pipe` — restore the
+    // default SIGPIPE disposition before anything writes.
+    #[cfg(unix)]
+    unsafe {
+        if libc_sigpipe_default() != 0 {
+            // Best effort only: without the signal reset the CLI still works,
+            // just with the broken-pipe panic path on early-closed pipes.
+        }
+    };
     // Force linkage of every enabled transport so inventory registration
     // reaches the engine registry (static archives only link used objects).
     let _ = qcore_transports::linked_kinds();
     let cli = Cli::parse();
     let code = run(cli);
     std::process::exit(code);
+}
+
+/// Reset SIGPIPE to SIG_DFL (the Rust runtime starts with it ignored).
+/// Declared locally to avoid a libc dependency: `signal` is in every libc.
+#[cfg(unix)]
+unsafe fn libc_sigpipe_default() -> i32 {
+    // ::signal(int, void (*)(int)) — SIGPIPE = 13, SIG_DFL = 0.
+    unsafe extern "C" {
+        fn signal(signum: i32, handler: usize) -> usize;
+    }
+    signal(13, 0) as i32
 }
 
 /// Windows consoles default to the OEM code page, so UTF-8 results (JSON

@@ -9,6 +9,15 @@
 //! Against a qcore peer (or the loopback test responder) the framing carries
 //! inner destinations; host IP routing via a TUN device is platform
 //! integration outside the core. Health reflects handshake state.
+//!
+//! `--all-features` caveat: the workspace gate unifies boringtun's optional
+//! `mock-instant` feature into this crate's dependency graph, which replaces
+//! boringtun's clock with a mock that only advances explicitly. Timing tests
+//! advance that mock *and* sleep real time so both feature sets pass; a plain
+//! `cargo test -p qcore-transport-wireguard` (default features) exercises only
+//! the real-clock path, so a change can pass one and fail the other.
+//! `MockClock` state is thread-local, so timing tests are pinned to
+//! `flavor = "current_thread"`: the advance and the wait must share a thread.
 
 pub mod awg;
 pub mod modes;
@@ -1148,7 +1157,7 @@ mod tests {
     /// retransmitted initiation arrives at the uplink within 6 s of the
     /// first send. Pre-fix this failed: no packet ever left after the
     /// initial initiation.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn pump_tick_retransmits_unanswered_handshake() {
         use crate::test_support::generate_keypair;
         let (c_sk, _c_pk) = generate_keypair();
@@ -1193,11 +1202,14 @@ mod tests {
         // boringtun's optional `mock-instant` feature — unified ON when the
         // workspace gate builds with `--all-features` — replaces its clock
         // with a mock that only advances explicitly, so a real sleep alone
-        // never crosses the REKEY_TIMEOUT boundary in that build. A depdent
-        // crate cannot cfg on boringtun's features, so do both unconditionally:
-        // advance the mock clock (no-op for boringtun's real clock) and sleep
-        // real time (the real-clock path needs 5 s + ≤333 ms jitter + load
-        // headroom; the mock path finishes on the first tick after advance).
+        // never crosses the REKEY_TIMEOUT boundary in that build. The mock
+        // clock is thread-local, hence `flavor = "current_thread"` above: the
+        // advance below and the tick must run on the thread that owns it. A
+        // dependent crate cannot cfg on boringtun's features, so do both
+        // unconditionally: advance the mock clock (no-op for boringtun's real
+        // clock) and sleep real time (the real-clock path needs 5 s + ≤333 ms
+        // jitter + load headroom; the mock path finishes on the first tick
+        // after advance).
         mock_instant::MockClock::advance(Duration::from_millis(6200));
         tokio::time::sleep(Duration::from_millis(6200)).await;
         let retried = pump_tick(&inner, &mut tick_dst)
@@ -1209,7 +1221,8 @@ mod tests {
     /// Finding 1b: `TunnResult::Err` is counted (observable via
     /// [`pump_tick_errors`]) and a terminal `ConnectionExpired` from the
     /// tick fails the pump loudly. Boringtun's real expiry lives at
-    /// REJECT_AFTER_TIME*3 = 540 s (no mock clock in this build), so the
+    /// REJECT_AFTER_TIME*3 = 540 s (no mock clock in the default-feature
+    /// build), so the
     /// test pins the two observable halves of the contract:
     ///
     /// 1. Counting — an inbound decapsulate error increments the shared

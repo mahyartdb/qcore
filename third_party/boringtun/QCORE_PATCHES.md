@@ -7,6 +7,13 @@ Version (`0.7.1`) and `license` field are unchanged, so the root
 qcore-transport-wireguard -i boringtun` resolves to
 `third_party/boringtun`.
 
+Upstream provenance pins (recheck with `sha256sum` on the downloaded `.crate`
+and `git rev-parse` in a checkout of the 0.7.1 tag):
+
+- crates.io `boringtun-0.7.1.crate` sha256:
+  `15dd6a8a89cbe8997f37ca0cf035e6ea4d64cd2ecea4aed83ffb9f99f7126939`
+- upstream git commit: `051c9d47dc9c5cb36e461b7d36dcd673820dc98b`
+
 This file records every deviation from upstream. The vendored copy is a
 carrier for AmneziaWG wire transforms; nothing else is changed unless listed
 here.
@@ -14,16 +21,28 @@ here.
 ## Removed upstream surface
 
 - `src/device/` (TUN device, Linux/macOS backends, privileged drop,
-  integration tests) and its `socket2`, `thiserror`, `ip_network`,
-  `ip_network_table`, `libc`/`nix` device dependencies.
+  integration tests) and the dependencies only it used: `socket2`,
+  `thiserror`, `ip_network`, `ip_network_table`, `libc` and `hex`.
+  `nix` is **retained** — `src/sleepyinstant/unix.rs` calls
+  `nix::time::clock_gettime` on every unix target, so the earlier list that
+  named `nix` as a removed device dependency was wrong and is corrected here.
+- The `untrusted` dependency (upstream's device/serialization helper) went
+  with the modules that used it. `hex` and `untrusted` are therefore absent
+  from the vendored `Cargo.toml`.
 - `src/ffi/`, `src/jni.rs`, `src/wireguard_ffi.h` and the
   `ffi-bindings`/`jni-bindings` features. qcore embeds the Rust API only.
 - `src/serialization.rs` and the `base64` dependency: only the removed
   device/ffi code parsed key strings through it.
 - The `boringtun-cli` binary, `benches/`, examples and integration tests, plus
   the `Benches`/`lib` crate types. Only the `rlib` is built.
-- The remaining `Cargo.toml` keeps upstream's edition (2018), deps and
-  version. `chacha20 = "0.9"` was **added** for header protection.
+- Upstream dev-dependencies `tracing-subscriber` and `criterion`
+  (benchmark/logging only); `etherparse` is the sole remaining dev-dependency.
+- Upstream `README.md`: it advertised the `boringtun-cli` binary, FFI/JNI
+  bindings and privileged TUN setup that this copy does not build. Replaced
+  with a short vendored-copy note pointing at upstream and at this file.
+- The remaining `Cargo.toml` keeps upstream's edition (2018) and version; the
+  dependency set is the pruned list above, not upstream's full list.
+  `chacha20 = "0.9"` was **added** for header protection.
 
 ## Lint policy
 

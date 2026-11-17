@@ -37,9 +37,12 @@ fragment = 512
 
 # Header protection stays off in shipped AWG profiles: it needs
 # `awg_header_protection_key`, a per-peer shared secret that must not live
-# in profile data, and neither the chain grammar nor the `.conf` import
-# mapping carries it yet. A hop that asks for it without the key fails
-# closed at build naming the field (pinned by tests-conformance).
+# in profile data. The key path is the `.conf` import: a `HeaderProtectionKey`
+# in `[Interface]` is stored as a secret and materialized as
+# `awg_header_protection_key` + `awg_header_protection=true`, which wins over
+# a profile's `false` (import material fills first). A hop that asks for the
+# transform without a key fails closed at build naming the field (pinned by
+# tests-conformance).
 ["awg-balanced"]
 family = "awg"
 compatible_modes = [{ kind = "wireguard", peer = "awg" }]

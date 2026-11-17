@@ -20,6 +20,10 @@ COPY examples examples
 COPY xtask xtask
 COPY tests tests
 COPY profiles profiles
+# Workspace member + [patch.crates-io] replacement target: the root manifest
+# resolves `third_party/boringtun` unconditionally, so the builder dies at
+# manifest load without it.
+COPY third_party third_party
 
 # Release build of the CLI (links every builtin transport, tor included —
 # see crates/qcore-cli/Cargo.toml). xtask is not built here: the image
@@ -32,6 +36,13 @@ FROM debian:trixie-slim
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+
+# Licence + provenance files ship with the image, not only with the release
+# archives: the binary embeds a modified Cloudflare boringtun (BSD-3-Clause),
+# so Apache-2.0 §4(a) (NOTICE/provenance) and BSD-3-Clause §2 (licence text in
+# binary distributions) both apply to the container as a distribution form.
+COPY LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.md /usr/share/doc/qcore/
+COPY third_party/boringtun/LICENSE.md /usr/share/doc/qcore/LICENSE-boringtun.md
 COPY --from=builder /build/target/release/qcore /usr/local/bin/qcore
 
 # Never root: the proxy binds ports >1024 (default 1080), so no

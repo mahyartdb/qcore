@@ -606,3 +606,7 @@ These packages include modified Unicode data and are governed by the Unicode Ter
 
 CC0 1.0 (public domain dedication): notify 8.2.0.
 To the extent possible under law, the authors of these packages have waived all copyright and related rights.
+
+## Vendored packages
+
+- `boringtun 0.7.1` is a **modified copy** of upstream crates.io `boringtun 0.7.1` (Cloudflare, BSD-3-Clause). Every deviation, and the upstream provenance pin (crate sha256 + git commit), is recorded in `third_party/boringtun/QCORE_PATCHES.md`. The BSD-3-Clause text ships with every binary archive as `LICENSE.md`.

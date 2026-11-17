@@ -220,10 +220,10 @@ async fn awg_header_protection_without_key_fails_closed() {
     let prof = dir.join("prof");
     std::fs::create_dir_all(&prof).unwrap();
     // Profile params ride to the factory opaquely, so a profile can request
-    // header protection — but it cannot supply the per-peer shared key, and
-    // neither the chain grammar nor the `.conf` import mapping carries
-    // `awg_header_protection_key` today. The build must refuse by name
-    // instead of silently claiming the transform.
+    // header protection — but it cannot supply the per-peer shared key
+    // (profile data is not secret), and this conf declares no
+    // `HeaderProtectionKey`. The build must refuse by name instead of
+    // silently claiming the transform.
     std::fs::write(
         prof.join("obfuscation.toml"),
         "[\"awg-hp-no-key\"]\n\
@@ -255,6 +255,98 @@ async fn awg_header_protection_without_key_fails_closed() {
         "names the missing key: {}",
         err.cause
     );
+}
+
+#[test]
+fn imported_hp_key_with_wrong_length_is_rejected_naming_the_field() {
+    // The CLI maps a rejected parse to exit 5; the parse layer must name the
+    // field and the key-size rule, not merely treat the line as unknown.
+    let dir = work("awg-hp-badlen");
+    let (c_sk, _c_pk) = generate_keypair();
+    let (_s_sk, s_pk) = generate_keypair();
+    let short = [0x11u8; 16];
+    let body = conf_text(&b64(&c_sk), &b64(&s_pk), "127.0.0.1:51820", true).replacen(
+        "[Interface]\n",
+        &format!("[Interface]\nHeaderProtectionKey = {}\n", b64(&short)),
+        1,
+    );
+    let path = dir.join("short-hp.conf");
+    std::fs::write(&path, body).unwrap();
+    let imp = ConfigImport::parse(&path).expect("parse returns a verdict");
+    assert_eq!(imp.verdict, ImportVerdict::Rejected);
+    assert!(
+        imp.reasons
+            .iter()
+            .any(|r| r.contains("HeaderProtectionKey") && r.contains("expected 32")),
+        "rejects by key length naming the field (exit 5 at the CLI): {:?}",
+        imp.reasons
+    );
+}
+
+#[test]
+fn hp_key_without_the_flag_fails_closed_naming_the_pair() {
+    // The factory pair rule behind the import mapping: a materialized key is
+    // always paired with `awg_header_protection=true`, so an orphan key can
+    // only arrive through a hand-built factory config — and must be refused
+    // naming both fields rather than silently disabling the transform.
+    let mut cfg = qcore_transport_api::HopConfig::new("wireguard");
+    cfg.fields
+        .insert("awg_header_protection".into(), "false".into());
+    cfg.fields
+        .insert("awg_header_protection_key".into(), "ab".repeat(32));
+    let err = transport_wireguard::awg::parse_fields(&cfg).expect_err("orphan key refuses");
+    assert!(
+        err.contains("awg_header_protection_key") && err.contains("awg_header_protection"),
+        "names the pair: {err}"
+    );
+}
+
+#[tokio::test]
+async fn awg_profile_with_imported_hp_key_handshakes() {
+    // End-to-end V2.2: the `.conf` carries `HeaderProtectionKey`, the import
+    // store keeps it as a secret, materialize() pairs it with
+    // `awg_header_protection=true`, and the hop completes a header-protected
+    // handshake against a peer keyed with the same value. The profile ships
+    // `header_protection = false`; import material wins.
+    let dir = work("awg-hp-import");
+    let (c_sk, c_pk) = generate_keypair();
+    let (s_sk, s_pk) = generate_keypair();
+    let hp_key = [0x42u8; 32];
+    let responder = AwgResponder::spawn("127.0.0.1".parse().unwrap(), s_sk, c_pk, {
+        let mut p = awg_peer_params(true);
+        p.header_protection = true;
+        p.header_protection_key = Some(hp_key);
+        p
+    })
+    .await
+    .unwrap();
+    let body = conf_text(&b64(&c_sk), &b64(&s_pk), &responder.addr.to_string(), true).replacen(
+        "[Interface]\n",
+        &format!("[Interface]\nHeaderProtectionKey = {}\n", b64(&hp_key)),
+        1,
+    );
+    let r = import_conf(&dir, "awg-hp.conf", &body);
+    let _ = qcore_transports::linked_kinds();
+    let engine = Engine::new(EngineConfig {
+        dirs: dirs_of(&dir),
+        // A bounded handshake budget: an unplumbed key must fail the build,
+        // not sit until the 30 s session default.
+        timeout_secs: 5,
+        ..Default::default()
+    });
+    let handle = engine
+        .start(vec![hop(
+            "wireguard",
+            &format!("peer=awg import={r} obfuscation=awg-balanced"),
+            "awg-hp-0",
+        )])
+        .await
+        .expect("imported HeaderProtectionKey completes an hp handshake");
+    assert_eq!(
+        handle.hop_reports()[0].obfuscation.as_deref(),
+        Some("awg-balanced")
+    );
+    handle.stop_all().await.expect("clean stop");
 }
 
 #[test]

@@ -434,11 +434,13 @@ async fn handle_tcp_connect(
     };
     // Routing decides BEFORE any dial: a block rule must never leak a
     // connection, and a direct rule must not touch the tunnel dialer.
-    // Domain and port-only rules are applied on the name first; only CIDR
-    // rules need an address, which comes from the tunnel resolver (never the
-    // OS resolver — a domain name must not leak). A hostname-capable exit's
-    // remote resolution is bypassed for such targets because the rule needs
-    // the address on this side.
+    // Evaluation is order-independent: when a CIDR rule could match this
+    // port, the address is resolved FIRST (through the tunnel resolver,
+    // never the OS resolver — a domain name must not leak) and the table is
+    // applied once with both name and address. A name-first decision would
+    // let a domain rule sitting before a CIDR block win on incomplete
+    // information (QA#2). A hostname-capable exit's remote resolution is
+    // bypassed for such targets because the rule needs the address here.
     let mut direct: Option<SocksTarget> = None;
     let mut resolved: Option<SocketAddr> = None;
     match &target {
@@ -453,16 +455,8 @@ async fn handle_tcp_connect(
             Action::Direct => direct = Some(target.clone()),
             Action::Proxy => {}
         },
-        SocksTarget::Domain(host, port) => match router.decide(Some(host), None, *port) {
-            Action::Block => {
-                write_reply(&mut socket, 0x02).await.ok();
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    format!("domain `{host}` blocked by routing rule"),
-                ));
-            }
-            Action::Direct => direct = Some(target.clone()),
-            Action::Proxy if router.cidr_needs_resolution(*port) => {
+        SocksTarget::Domain(host, port) => {
+            if router.cidr_relevant(*port) {
                 let Some(resolver) = resolver else {
                     write_reply(&mut socket, 0x08).await.ok();
                     return Err(std::io::Error::new(
@@ -493,9 +487,22 @@ async fn handle_tcp_connect(
                     Action::Direct => direct = Some(SocksTarget::Ip(addr)),
                     Action::Proxy => resolved = Some(addr),
                 }
+            } else {
+                // No CIDR rule could match this port: name-only rules decide
+                // without a DNS query.
+                match router.decide(Some(host), None, *port) {
+                    Action::Block => {
+                        write_reply(&mut socket, 0x02).await.ok();
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            format!("domain `{host}` blocked by routing rule"),
+                        ));
+                    }
+                    Action::Direct => direct = Some(target.clone()),
+                    Action::Proxy => {}
+                }
             }
-            Action::Proxy => {}
-        },
+        }
     }
     if let Some(target) = direct {
         // Direct egress: the host's own network stack, no tunnel dialer. A
@@ -872,11 +879,13 @@ enum UdpRoute {
     Drop,
 }
 
-/// Decide and resolve one UDP destination. Domains are decided on the name
-/// first; when CIDR rules need an address (or the tunnel path needs one for
-/// dialing), the name resolves through the tunnel resolver — the proxy's
-/// no-OS-leak policy. A `direct` domain resolves through the OS resolver:
-/// direct means host-network egress, and the flow key must be an address.
+/// Decide and resolve one UDP destination. Evaluation is order-independent
+/// with the CONNECT paths (QA#2): when a CIDR rule could match the port, the
+/// name resolves BEFORE any verdict, through the tunnel resolver only — no
+/// OS fallback (a resolver-less association drops the datagram instead of
+/// leaking the name to the host resolver). A `direct` domain with no relevant
+/// CIDR rule resolves through the OS resolver: direct means host-network
+/// egress, and the flow key must be an address.
 async fn route_udp_dst(
     router: &Router,
     dst: &SocksTarget,
@@ -887,35 +896,38 @@ async fn route_udp_dst(
         SocksTarget::Ip(addr) => (None, addr.port(), Some(addr.ip())),
         SocksTarget::Domain(host, port) => (Some(host.as_str()), *port, None),
     };
-    match router.decide(host, literal.as_ref(), port) {
+    let resolved = if host.is_some() && router.cidr_relevant(port) {
+        match resolve_udp_dst(dst.clone(), policy, resolver).await {
+            Some(addr) => Some(addr),
+            None => return UdpRoute::Drop,
+        }
+    } else {
+        None
+    };
+    let addr = resolved.map(|a| a.ip()).or(literal);
+    match router.decide(host, addr.as_ref(), port) {
         Action::Block => UdpRoute::Drop,
         Action::Direct => match dst {
             SocksTarget::Ip(addr) => UdpRoute::Direct(*addr),
-            SocksTarget::Domain(host, port) => {
-                match tokio::net::lookup_host((host.as_str(), *port)).await {
+            SocksTarget::Domain(host, port) => match resolved {
+                // The tunnel-resolved address decided the rule: use exactly
+                // that, never a second local resolution.
+                Some(addr) => UdpRoute::Direct(addr),
+                None => match tokio::net::lookup_host((host.as_str(), *port)).await {
                     Ok(mut addrs) => addrs.next().map_or(UdpRoute::Drop, UdpRoute::Direct),
                     Err(_) => UdpRoute::Drop,
-                }
-            }
+                },
+            },
         },
         Action::Proxy => {
-            if host.is_some() && router.cidr_needs_resolution(port) {
-                // The address decides the CIDR rule: resolve through the
-                // tunnel; no resolver = fail closed (drop).
-                let Some(addr) = resolve_udp_dst(dst.clone(), policy, resolver).await else {
-                    return UdpRoute::Drop;
-                };
-                match router.decide(host, Some(&addr.ip()), port) {
-                    Action::Block => UdpRoute::Drop,
-                    Action::Direct => UdpRoute::Direct(addr),
-                    Action::Proxy => UdpRoute::Tunnel(addr),
-                }
-            } else {
-                match resolve_udp_dst(dst.clone(), policy, resolver).await {
-                    Some(addr) => UdpRoute::Tunnel(addr),
-                    None => UdpRoute::Drop,
-                }
-            }
+            let addr = match resolved {
+                Some(addr) => addr,
+                None => match resolve_udp_dst(dst.clone(), policy, resolver).await {
+                    Some(addr) => addr,
+                    None => return UdpRoute::Drop,
+                },
+            };
+            UdpRoute::Tunnel(addr)
         }
     }
 }
@@ -1059,8 +1071,9 @@ async fn handle_http_connect(
     };
     // Routing decides before any egress, with the SOCKS table's semantics:
     // block answers 403, direct dials from the host network stack, proxy
-    // continues on the tunnel path. Domains decide on the name first; CIDR
-    // rules need the tunnel-resolved address (never the OS resolver).
+    // continues on the tunnel path. Order-independent like SOCKS: when a
+    // CIDR rule could match the port, the domain resolves through the tunnel
+    // (never the OS) BEFORE any verdict.
     let mut direct: Option<SocksTarget> = None;
     let mut resolved: Option<SocketAddr> = None;
     match &authority {
@@ -1088,18 +1101,8 @@ async fn handle_http_connect(
                 Action::Proxy => {}
             }
         }
-        SocksTarget::Domain(host, port) => match router.decide(Some(host), None, *port) {
-            Action::Block => {
-                write_http_reply(&mut socket, 403, "Forbidden", "")
-                    .await
-                    .ok();
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    format!("domain `{host}` blocked by routing rule"),
-                ));
-            }
-            Action::Direct => direct = Some(authority.clone()),
-            Action::Proxy if router.cidr_needs_resolution(*port) => {
+        SocksTarget::Domain(host, port) => {
+            if router.cidr_relevant(*port) {
                 let Some(resolver) = resolver else {
                     write_http_reply(&mut socket, 501, "Not Implemented", "")
                         .await
@@ -1135,9 +1138,22 @@ async fn handle_http_connect(
                     Action::Direct => direct = Some(SocksTarget::Ip(addr)),
                     Action::Proxy => resolved = Some(addr),
                 }
+            } else {
+                match router.decide(Some(host), None, *port) {
+                    Action::Block => {
+                        write_http_reply(&mut socket, 403, "Forbidden", "")
+                            .await
+                            .ok();
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            format!("domain `{host}` blocked by routing rule"),
+                        ));
+                    }
+                    Action::Direct => direct = Some(authority.clone()),
+                    Action::Proxy => {}
+                }
             }
-            Action::Proxy => {}
-        },
+        }
     }
     if let Some(target) = direct {
         // Direct egress: the host network stack, no tunnel dialer. Still
@@ -2360,6 +2376,15 @@ mod tests {
         out
     }
 
+    /// Encode one SOCKS UDP datagram with an ATYP=domain destination.
+    fn udp_datagram_domain(host: &str, port: u16, payload: &[u8]) -> Vec<u8> {
+        let mut out = vec![0u8, 0x00, 0x00, 0x03, host.len() as u8];
+        out.extend_from_slice(host.as_bytes());
+        out.extend_from_slice(&port.to_be_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
     /// Decode one encapsulated reply into (source, payload).
     fn parse_udp_reply(buf: &[u8]) -> Option<(SocketAddr, &[u8])> {
         if buf.len() < 10 || buf[0] != 0x00 || buf[1] != 0x00 || buf[2] != 0x00 {
@@ -3136,6 +3161,96 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn routing_cidr_before_a_domain_rule_blocks_the_domain_target() {
+        // QA#2: the CIDR block is FIRST, the domain-direct rule second. A
+        // name-first decision short-circuits on `direct` before the resolved
+        // address is known, and corp.internal:445 leaves through the host
+        // stack. The address must decide first.
+        let dns = fake_dns(
+            "corp.internal",
+            IpAddr::V4(std::net::Ipv4Addr::new(10, 1, 2, 3)),
+        )
+        .await;
+        let dialer = Arc::new(CountingDialer::default());
+        let resolver = Arc::new(TunnelResolver::with_server(dialer.clone(), dns));
+        let router = router_from(
+            r#"
+            [[rules]]
+            match = { cidr = "10.0.0.0/8", port = 445 }
+            action = "block"
+
+            [[rules]]
+            match = { domain = "corp.internal" }
+            action = "direct"
+            "#,
+        );
+        let proxy_addr = spawn_socks_with_routing(dialer.clone(), Some(resolver), router).await;
+
+        let mut c = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        let hdr = socks_request_domain(&mut c, "corp.internal", 445).await;
+        assert_eq!(
+            hdr[1], 0x02,
+            "the CIDR block sees the tunnel-resolved address before the later domain rule decides"
+        );
+        assert_eq!(
+            dialer.udp.load(Ordering::SeqCst),
+            1,
+            "exactly one tunnel DNS query resolved the name"
+        );
+        assert_eq!(
+            dialer.tcp.load(Ordering::SeqCst),
+            0,
+            "blocked before any dial"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn routing_cidr_before_a_domain_rule_lets_an_unmatched_address_go_direct() {
+        // Same rule order, an address outside the block: resolution still
+        // happens before the verdict (the request carries only the name), and
+        // rule 2 wins. The echo sits on 127.0.0.1, which the fake DNS —
+        // never the OS resolver — answers for the name.
+        let echo = echo_on(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)).await;
+        let dns = fake_dns("corp.internal", IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)).await;
+        let dialer = Arc::new(CountingDialer::default());
+        let resolver = Arc::new(TunnelResolver::with_server(dialer.clone(), dns));
+        let router = router_from(&format!(
+            r#"
+            [[rules]]
+            match = {{ cidr = "10.0.0.0/8", port = {} }}
+            action = "block"
+
+            [[rules]]
+            match = {{ domain = "corp.internal" }}
+            action = "direct"
+            "#,
+            echo.port()
+        ));
+        let proxy_addr = spawn_socks_with_routing(dialer.clone(), Some(resolver), router).await;
+
+        let mut c = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        let hdr = socks_request_domain(&mut c, "corp.internal", echo.port()).await;
+        assert_eq!(
+            hdr[1], 0x00,
+            "outside the blocked CIDR, the domain rule wins after resolution"
+        );
+        c.write_all(b"resolved").await.unwrap();
+        let mut back = [0u8; 8];
+        c.read_exact(&mut back).await.unwrap();
+        assert_eq!(&back, b"resolved", "direct relays to the resolved addr");
+        assert_eq!(
+            dialer.udp.load(Ordering::SeqCst),
+            1,
+            "the verdict ran after one tunnel DNS query"
+        );
+        assert_eq!(
+            dialer.tcp.load(Ordering::SeqCst),
+            0,
+            "direct egress must not touch the tunnel dialer"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn routing_block_refuses_http_connect_with_403() {
         let dialer = Arc::new(CountingDialer::default());
         let router = router_from(
@@ -3193,6 +3308,106 @@ mod tests {
             dialer.udp.load(Ordering::SeqCst),
             0,
             "a direct UDP destination must not open a tunnel flow"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn routing_udp_domain_with_relevant_cidr_and_no_resolver_drops() {
+        // QA#2 UDP leak: rules are [cidr block, domain direct] and no tunnel
+        // resolver is wired. Pre-fix, the name-first decision picked
+        // `direct` and "localhost" resolved through the OS resolver, so the
+        // datagram reached the local echo. Post-fix the relevant CIDR rule
+        // forces tunnel resolution first; without a resolver the datagram is
+        // dropped — never the OS resolver, never a host-stack egress.
+        let echo = udp_echo_on(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)).await;
+        let dialer = Arc::new(CountingDialer::default());
+        let router = router_from(&format!(
+            r#"
+            [[rules]]
+            match = {{ cidr = "10.0.0.0/8", port = {} }}
+            action = "block"
+
+            [[rules]]
+            match = {{ domain = "localhost" }}
+            action = "direct"
+            "#,
+            echo.port()
+        ));
+        let proxy_addr = spawn_socks_with_routing(dialer.clone(), None, router).await;
+
+        let mut c = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        let relay = socks_associate(&mut c).await;
+        let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        udp.send_to(
+            &udp_datagram_domain("localhost", echo.port(), b"leak?"),
+            relay,
+        )
+        .await
+        .unwrap();
+        let mut buf = vec![0u8; 2048];
+        let got = tokio::time::timeout(
+            std::time::Duration::from_millis(400),
+            udp.recv_from(&mut buf),
+        )
+        .await;
+        assert!(
+            got.is_err(),
+            "no tunnel resolver + relevant CIDR rule: fail-closed drop, never OS resolution"
+        );
+        assert_eq!(
+            dialer.udp.load(Ordering::SeqCst),
+            0,
+            "no tunnel flow and no DNS query were opened"
+        );
+        assert_eq!(dialer.tcp.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn routing_udp_domain_uses_the_tunnel_resolved_addr_before_deciding() {
+        // Same mixed rule order, resolver wired, address outside the block:
+        // the name resolves through the tunnel BEFORE the verdict and the
+        // `direct` rule egresses to exactly that address. The name is not
+        // OS-resolvable, so a pre-fix name-first decision would drop.
+        let echo = udp_echo_on(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)).await;
+        let dns = fake_dns("corp.internal", IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)).await;
+        let dialer = Arc::new(CountingDialer::default());
+        let resolver = Arc::new(TunnelResolver::with_server(dialer.clone(), dns));
+        let router = router_from(&format!(
+            r#"
+            [[rules]]
+            match = {{ cidr = "10.0.0.0/8", port = {} }}
+            action = "block"
+
+            [[rules]]
+            match = {{ domain = "corp.internal" }}
+            action = "direct"
+            "#,
+            echo.port()
+        ));
+        let proxy_addr = spawn_socks_with_routing(dialer.clone(), Some(resolver), router).await;
+
+        let mut c = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        let relay = socks_associate(&mut c).await;
+        let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        udp.send_to(
+            &udp_datagram_domain("corp.internal", echo.port(), b"resolved-udp"),
+            relay,
+        )
+        .await
+        .unwrap();
+        let mut buf = vec![0u8; 2048];
+        let (n, _from) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), udp.recv_from(&mut buf))
+                .await
+                .expect("resolved direct echo reply within deadline")
+                .expect("recv");
+        let (src, got) = parse_udp_reply(&buf[..n]).expect("encapsulated reply");
+        assert_eq!(got, b"resolved-udp");
+        assert_eq!(src, echo, "egress used the tunnel-resolved address");
+        assert_eq!(
+            dialer.udp.load(Ordering::SeqCst),
+            1,
+            "one tunnel DNS query; the direct egress used a plain socket"
         );
     }
 

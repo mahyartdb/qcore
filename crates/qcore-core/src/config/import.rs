@@ -3,10 +3,11 @@
 //! Standard INI (`[Interface]` / `[Peer]`). Import preserves every recognized
 //! field, field-for-field — including dual-stack `Address` and `AllowedIPs`
 //! exactly — and rejects unknown fields by name (FR-023). Absent AWG keys
-//! mean standard WireGuard behavior. Secrets (`PrivateKey`, `PresharedKey`)
-//! are parsed at the boundary into [`SecretString`] and never persist in the
-//! stored TOML; [`store_import`] puts them in the [`SecretStore`] (keyring
-//! with 0600 file fallback) under `import/<ref>/<field>` accounts.
+//! mean standard WireGuard behavior. Secrets (`PrivateKey`, `PresharedKey`,
+//! `HeaderProtectionKey`) are parsed at the boundary into [`SecretString`]
+//! and never persist in the stored TOML; [`store_import`] puts them in the
+//! [`SecretStore`] (keyring with 0600 file fallback) under
+//! `import/<ref>/<field>` accounts.
 //!
 //! Validation (all failures are `Rejected` verdicts naming the field):
 //! - `H1..H4` must be pairwise distinct (non-overlapping).
@@ -88,6 +89,7 @@ pub struct ImportMaterial {
 /// Recognized `[Interface]` keys (canonical snake_case). Secrets marked `*`.
 const IFACE_KEYS: &[&str] = &[
     "private_key",
+    "header_protection_key",
     "address",
     "dns",
     "mtu",
@@ -123,6 +125,7 @@ const PEER_KEYS: &[&str] = &[
 fn canonical_key(lower: &str) -> String {
     match lower {
         "privatekey" => "private_key".into(),
+        "headerprotectionkey" => "header_protection_key".into(),
         "publickey" => "public_key".into(),
         "presharedkey" => "preshared_key".into(),
         "allowedips" => "allowed_ips".into(),
@@ -341,6 +344,20 @@ impl ConfigImport {
                                     .insert("interface.private_key".into(), SecretString::new(v));
                             }
                             Err(e) => imp.reject(format!("`PrivateKey`: {e}")),
+                        },
+                        // AmneziaWG header-protection key: a per-peer shared
+                        // secret, so it lives in the secret store and never in
+                        // the stored record or the typed HopSpec (same policy
+                        // as PresharedKey). materialize() pairs it with
+                        // `awg_header_protection=true`.
+                        "header_protection_key" => match b64_decode_32(v) {
+                            Ok(_) => {
+                                imp.secrets.insert(
+                                    "interface.header_protection_key".into(),
+                                    SecretString::new(v),
+                                );
+                            }
+                            Err(e) => imp.reject(format!("`HeaderProtectionKey`: {e}")),
                         },
                         _ => {
                             imp.interface.insert(key, v.to_string());
@@ -1040,6 +1057,12 @@ pub fn load_import(
             secrets.insert(field, s);
         }
     }
+    // HeaderProtectionKey is optional: absent means header protection was
+    // never requested by the imported conf.
+    let hp_field = "interface.header_protection_key";
+    if let Ok(s) = get_import_secret(&store, &legacy, import_ref, hp_field) {
+        secrets.insert(hp_field.to_string(), s);
+    }
     Ok((stored, secrets))
 }
 
@@ -1216,6 +1239,23 @@ pub fn materialize(
                 )
             })?;
             fields.push(("preshared_key".into(), hex_encode(&psk_raw)));
+        }
+        if let Some(hp) = secrets.get("interface.header_protection_key") {
+            let hp_str = Zeroizing::new(String::from_utf8_lossy(hp.expose()).into_owned());
+            let hp_raw = b64_decode_32(hp_str.trim()).map_err(|e| {
+                ChainError::new(
+                    None,
+                    Some(hop.id.clone()),
+                    format!("import `{import_ref}` HeaderProtectionKey: {e}"),
+                    None,
+                )
+            })?;
+            // The imported key is the operator's request for the transform:
+            // emit the pair together so a profile's `header_protection =
+            // false` (filled after import material) cannot leave the key
+            // orphaned, which `awg.rs` refuses as a mismatch.
+            fields.push(("awg_header_protection_key".into(), hex_encode(&hp_raw)));
+            fields.push(("awg_header_protection".into(), "true".into()));
         }
         if let Some(ka) = peer.get("persistent_keepalive") {
             fields.push(("keepalive".into(), ka.clone()));

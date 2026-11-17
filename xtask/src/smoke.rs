@@ -9,9 +9,9 @@
 //! Live per-family connects (stub-peer session up/down over ipv4/ipv6/dual)
 //! are NOT re-driven here: they run in CI as `tests-chains orderings` and
 //! the `single_stack` conformance suite, which assert on the same engine
-//! paths without process orchestration. Android Termux CLI runs under
-//! emulator execution on CI; the cdylib/JNI library is covered by the
-//! exported-symbol check below plus the `abi_consumer` conformance test.
+//! paths without process orchestration. Android legs get a build + cdylib
+//! export scan only; on-device execution is not covered by CI. The JNI
+//! surface is additionally pinned by the `abi_consumer` conformance test.
 //! Release is blocked if any required target fails build or smoke.
 
 use std::process::Command;
@@ -492,9 +492,12 @@ pub fn run(args: Vec<String>) -> super::anyhow::Result<()> {
     }
     check_cdylib_exports(&artifact).map_err(super::anyhow::Error::msg)?;
     if target.contains("android") {
-        println!("smoke {target}: Termux CLI + cdylib/JNI run under emulator execution on CI (ubuntu-22.04 runner)");
+        println!(
+            "smoke {target}: build + cdylib export scan OK; on-device execution not covered by CI"
+        );
+    } else {
+        println!("smoke {target}: build + cdylib export scan OK (artifact built for the target, not executed here)");
     }
-    println!("smoke {target}: build + exports OK (execution on its runner)");
     Ok(())
 }
 

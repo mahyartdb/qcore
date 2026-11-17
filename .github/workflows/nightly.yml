@@ -12,6 +12,10 @@ jobs:
   # nightly leg, not a cross-build matrix; the tag-time release matrix owns
   # per-target coverage (all nine contract targets on a tag push or a
   # workflow_dispatch dry run).
+  # Builds the HOST triple natively: `--target native` invokes plain
+  # `cargo build --release`, so the ubuntu runner compiles its own triple and
+  # nightly needs no cross-rs install. Cross backend coverage (cross-rs on a
+  # foreign host) lives in release.yml, which installs the pinned cross CLI.
   # Real-network egress (WARP/MASQUE/Tor/Psiphon) is supplementary,
   # non-blocking.
   linux-gnu-native:
@@ -19,8 +23,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo xtask build --target x86_64-unknown-linux-gnu
-      - run: cargo xtask smoke --target x86_64-unknown-linux-gnu
+      - run: cargo xtask build --target native
+      - run: cargo xtask smoke --target native
   live-egress:
     runs-on: ubuntu-22.04
     continue-on-error: true

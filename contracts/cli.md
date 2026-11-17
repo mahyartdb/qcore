@@ -111,8 +111,14 @@ intact for a retry.
   failure (3) — no hop has started when the listener binds.
 - Routing rules (`connect --routing <path>`, default
   `<profile-dir>/routing.toml` when present; absent file = every target
-  proxies through the tunnel, the historic behavior). Rules evaluate in file
-  order, first match wins; each rule is `match = { domain | cidr | port }`
+  proxies through the tunnel, the historic behavior). Rules evaluate
+  order-independently: a CIDR rule must not be bypassed by an earlier domain
+  rule, so when any CIDR rule could match the target port, a domain target is
+  resolved through the tunnel resolver (never the OS resolver) BEFORE any
+  verdict and the table is applied once with both name and address; when no
+  CIDR rule can match the port, name and port-only rules decide without
+  resolution. First match wins among rules evaluated with the same
+  information. Each rule is `match = { domain | cidr | port }`
   (present fields ANDed, `domain` and `cidr` mutually exclusive) plus
   `action = "proxy" | "direct" | "block"`. A `domain` matches the CONNECT
   target name as a DNS suffix on label boundaries (`example.com` covers
@@ -125,10 +131,10 @@ intact for a retry.
   tunnel dialer, and `proxy` keeps the existing tunnel path. **`direct` is a
   deliberate leak**: the destination sees the host's IP and a domain is
   resolved locally, so neither the tunnel's egress IP nor its
-  tunnel-routed DNS applies. A CIDR rule needs an address; a domain target
-  is resolved through the tunnel resolver (never the OS resolver) before
-  CIDR rules run, so without a tunnel resolver such a target fails closed
-  (SOCKS `0x08` / HTTP `501`) rather than guessing. Malformed or
+  tunnel-routed DNS applies. Without a tunnel resolver, a domain target at a
+  port some CIDR rule could match fails closed (SOCKS `0x08` / HTTP `501`,
+  UDP datagrams dropped) rather than guessing or falling back to the OS
+  resolver. Malformed or
   unknown-key rules are usage errors (exit 6) naming the file and field
   (fail closed: a typo must not silently turn a block rule into a no-op).
   When rules are active, `connect` prints one stderr line naming the file

@@ -53,7 +53,7 @@ DNS) dial the name directly.
 ## Docker
 
 Multi-stage build (builder pinned to the `rust-toolchain.toml` toolchain,
-runtime on `debian:bookworm-slim`, non-root user):
+runtime on `debian:trixie-slim`, non-root user):
 
 ```sh
 docker build -t qcore .

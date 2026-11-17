@@ -90,23 +90,124 @@ fn matrix_targets() -> Vec<String> {
         .collect()
 }
 
+/// One `matrix.include` list item, key order independent.
+#[derive(Default)]
+struct MatrixRow {
+    target: Option<String>,
+    runner: Option<String>,
+}
+
+fn set_matrix_key(row: &mut MatrixRow, key: &str, value: String) {
+    match key {
+        "target" => row.target = Some(value),
+        "runner" => row.runner = Some(value),
+        _ => {}
+    }
+}
+
+fn key_value(line: &str) -> Option<(&str, String)> {
+    let (key, value) = line.split_once(':')?;
+    Some((key.trim(), value.trim().trim_matches('"').to_string()))
+}
+
 /// `(triple, runner)` pairs from the release matrix, in workflow order. The
 /// runner half is checked against `targets.toml` too: the 3/9 matrix this
 /// replaced chose its runner with `contains(target, 'aarch64')`, which sends
 /// aarch64 linux and android legs to the Windows ARM runner.
+///
+/// Scoped to the `matrix.include:` block by indentation: any other job or
+/// step that later uses a `- target:` key (a drift-check input, a cache key)
+/// must not silently join this list, where it would fake coverage or trip the
+/// contract diff with a non-triple.
 fn matrix_rows() -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = Vec::new();
-    for l in RELEASE_WORKFLOW.lines() {
-        let l = l.trim();
-        if let Some(v) = l.strip_prefix("- target: ") {
-            out.push((v.trim().trim_matches('"').to_string(), String::new()));
-        } else if let Some(v) = l.strip_prefix("runner: ") {
-            if let Some(last) = out.last_mut() {
-                last.1 = v.trim().trim_matches('"').to_string();
+    matrix_rows_in(RELEASE_WORKFLOW)
+}
+
+fn matrix_rows_in(workflow: &str) -> Vec<(String, String)> {
+    let mut rows: Vec<MatrixRow> = Vec::new();
+    let mut include_indent: Option<usize> = None;
+    for raw in workflow.lines() {
+        let indent = raw.len() - raw.trim_start().len();
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some(base) = include_indent else {
+            if line == "include:" {
+                include_indent = Some(indent);
             }
+            continue;
+        };
+        if indent <= base {
+            include_indent = None;
+            continue;
+        }
+        if indent == base + 2 && line.starts_with('-') {
+            rows.push(MatrixRow::default());
+            let item = line.trim_start_matches('-').trim();
+            if let (Some(row), Some((key, value))) = (rows.last_mut(), key_value(item)) {
+                set_matrix_key(row, key, value);
+            }
+        } else if let (Some(row), Some((key, value))) = (rows.last_mut(), key_value(line)) {
+            set_matrix_key(row, key, value);
         }
     }
-    out
+    rows.into_iter()
+        .filter_map(|row| {
+            row.target
+                .map(|target| (target, row.runner.unwrap_or_default()))
+        })
+        .collect()
+}
+
+/// A backend CLI version pinned by a `cargo install <tool> --version` line in
+/// release.yml. Exactly one install line per tool is required: zero means the
+/// leg cannot build, two make the effective version order-dependent.
+fn install_version(workflow: &str, tool: &str) -> Result<String, String> {
+    let needle = format!("cargo install {tool} --version ");
+    let mut found = Vec::new();
+    for raw in workflow.lines() {
+        let line = raw.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        let command = line.strip_prefix("run:").map(str::trim).unwrap_or(line);
+        if let Some(rest) = command.strip_prefix(&needle) {
+            let version = rest
+                .split_whitespace()
+                .next()
+                .ok_or_else(|| format!("release.yml: `{needle}` names no version"))?;
+            found.push(version.to_string());
+        }
+    }
+    match found.len() {
+        1 => Ok(found.remove(0)),
+        n => Err(format!(
+            "release.yml: expected exactly one `{needle}<version>` line, found {n}: {found:?}"
+        )),
+    }
+}
+
+/// Release.yml's installed backend versions must equal the pins in `build.rs`
+/// (the backend selector). A drift here silently changes what cross/cargo-ndk
+/// does for the same triple while the build command stays the same.
+fn workflow_backend_pins_match() -> Result<(), String> {
+    backend_pins_match(RELEASE_WORKFLOW)
+}
+
+fn backend_pins_match(workflow: &str) -> Result<(), String> {
+    for (tool, expected) in [
+        ("cross", super::build::CROSS_RS_VERSION),
+        ("cargo-ndk", super::build::CARGO_NDK_VERSION),
+    ] {
+        let actual = install_version(workflow, tool)?;
+        if actual != expected {
+            return Err(format!(
+                "release.yml installs {tool} {actual}, but build.rs pins {expected}; update both or neither"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Delivery container per the `targets.toml` `delivery` field: windows legs
@@ -412,17 +513,131 @@ fn write_sbom(dist: &Path, ver: &str) -> Result<PathBuf, String> {
     Ok(out_path)
 }
 
+/// Machine ids the staged deliverables must carry: a cross build that quietly
+/// produced the host's binary (wrong artifact dir, a missing `--target`) would
+/// otherwise ship a foreign executable under the target's name. Read from the
+/// first bytes only — PE `Machine` / ELF `e_machine`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Machine {
+    Pe(u16),
+    Elf(u16),
+}
+
+const PE_I386: u16 = 0x014c;
+const PE_AMD64: u16 = 0x8664;
+const PE_ARM64: u16 = 0xAA64;
+const ELF_EM_386: u16 = 0x03;
+const ELF_EM_ARM: u16 = 0x28;
+const ELF_EM_X86_64: u16 = 0x3E;
+const ELF_EM_AARCH64: u16 = 0xB7;
+
+/// Triple → expected machine constant. Android legs are ELF too (bionic, not
+/// a separate container format). A missing triple fails closed: the contract
+/// gained a target whose machine type nobody recorded.
+const TARGET_MACHINES: &[(&str, Machine)] = &[
+    ("i686-pc-windows-msvc", Machine::Pe(PE_I386)),
+    ("x86_64-pc-windows-msvc", Machine::Pe(PE_AMD64)),
+    ("aarch64-pc-windows-msvc", Machine::Pe(PE_ARM64)),
+    ("x86_64-unknown-linux-gnu", Machine::Elf(ELF_EM_X86_64)),
+    ("i686-unknown-linux-gnu", Machine::Elf(ELF_EM_386)),
+    ("aarch64-unknown-linux-gnu", Machine::Elf(ELF_EM_AARCH64)),
+    ("armv7-unknown-linux-gnueabihf", Machine::Elf(ELF_EM_ARM)),
+    ("aarch64-linux-android", Machine::Elf(ELF_EM_AARCH64)),
+    ("armv7-linux-androideabi", Machine::Elf(ELF_EM_ARM)),
+];
+
+fn expected_machine(target: &str) -> Result<Machine, String> {
+    if target == "native" {
+        return Ok(if cfg!(windows) {
+            if cfg!(target_arch = "x86") {
+                Machine::Pe(PE_I386)
+            } else if cfg!(target_arch = "aarch64") {
+                Machine::Pe(PE_ARM64)
+            } else {
+                Machine::Pe(PE_AMD64)
+            }
+        } else if cfg!(target_arch = "x86") {
+            Machine::Elf(ELF_EM_386)
+        } else if cfg!(target_arch = "arm") {
+            Machine::Elf(ELF_EM_ARM)
+        } else if cfg!(target_arch = "aarch64") {
+            Machine::Elf(ELF_EM_AARCH64)
+        } else {
+            Machine::Elf(ELF_EM_X86_64)
+        });
+    }
+    TARGET_MACHINES
+        .iter()
+        .find(|(triple, _)| *triple == target)
+        .map(|(_, machine)| *machine)
+        .ok_or_else(|| format!("target `{target}` has no machine-type entry"))
+}
+
+fn machine_of(path: &Path) -> Result<Machine, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    if bytes.len() >= 0x40 && bytes.starts_with(b"MZ") {
+        let offset =
+            u32::from_le_bytes([bytes[0x3c], bytes[0x3d], bytes[0x3e], bytes[0x3f]]) as usize;
+        let header = bytes
+            .get(offset..offset + 6)
+            .ok_or_else(|| format!("{}: PE offset {offset:#x} outside the file", path.display()))?;
+        if &header[..4] != b"PE\0\0" {
+            return Err(format!("{}: MZ without a PE header", path.display()));
+        }
+        return Ok(Machine::Pe(u16::from_le_bytes([header[4], header[5]])));
+    }
+    if bytes.len() >= 20 && bytes.starts_with(b"\x7fELF") {
+        // e_ident[EI_DATA]: 1 = little endian. Every contracted target is LE.
+        if bytes[5] != 1 {
+            return Err(format!("{}: big-endian ELF", path.display()));
+        }
+        return Ok(Machine::Elf(u16::from_le_bytes([bytes[18], bytes[19]])));
+    }
+    Err(format!(
+        "{}: neither PE nor ELF (first bytes {:02x?})",
+        path.display(),
+        &bytes[..bytes.len().min(4)]
+    ))
+}
+
+fn check_machine(path: &Path, target: &str, label: &str) -> Result<(), String> {
+    let want = expected_machine(target)?;
+    let got = machine_of(path)?;
+    if got != want {
+        return Err(format!(
+            "{label} {} has machine {got:?}, want {want:?} for target `{target}`; \
+             the backend built the wrong target",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Licence + provenance files staged into every archive. Apache-2.0 §4(a) and
+/// BSD-3-Clause §2 both require the texts to travel with the compiled form:
+/// every binary embeds the modified Cloudflare boringtun vendored here.
+const PACKAGE_DOC_FILES: &[&str] = &[
+    "LICENSE-MIT",
+    "LICENSE-APACHE",
+    "THIRD-PARTY-NOTICES.md",
+    "third_party/boringtun/LICENSE.md",
+];
+
 /// Stage the deliverables and build the container archive (the testable
-/// core of `package`): copies `bin` + `cdylib` + the header/ABI stamp into
-/// `stage`, then writes the `fmt` archive beside it. Every expected input
-/// must exist — absent deliverables fail closed.
+/// core of `package`): copies `bin` + `cdylib` + the header/ABI stamp + the
+/// licence/notice files into `stage`, asserts the two binaries' machine type
+/// matches `target`, then writes the `fmt` archive beside it. Every expected
+/// input must exist — absent deliverables fail closed.
+#[allow(clippy::too_many_arguments)]
 fn stage_and_archive(
     dist: &Path,
     stage: &Path,
+    target: &str,
     bin: &Path,
     cdylib: &Path,
     header: &Path,
     abi_version: &Path,
+    docs: &[PathBuf],
     fmt: ArchiveFmt,
 ) -> Result<PathBuf, String> {
     let fail = |m: String| format!("package: {m}");
@@ -447,6 +662,35 @@ fn stage_and_archive(
         let dest = stage.join(file.file_name().expect("artifact path has a file name"));
         std::fs::copy(file, &dest).map_err(|e| fail(format!("stage {}: {e}", file.display())))?;
     }
+    for file in docs {
+        if !file.is_file() {
+            return Err(fail(format!(
+                "licence/notice file missing (expected {}); refusing to package an archive without the required notices",
+                file.display()
+            )));
+        }
+        let dest = stage.join(
+            file.file_name()
+                .ok_or_else(|| fail(format!("licence/notice path unnamed: {}", file.display())))?,
+        );
+        if dest.exists() {
+            return Err(fail(format!(
+                "duplicate staged file name {}; two package inputs share a basename",
+                dest.display()
+            )));
+        }
+        std::fs::copy(file, &dest).map_err(|e| fail(format!("stage {}: {e}", file.display())))?;
+    }
+    check_machine(
+        &stage.join(bin.file_name().expect("bin has a file name")),
+        target,
+        "CLI binary",
+    )?;
+    check_machine(
+        &stage.join(cdylib.file_name().expect("cdylib has a file name")),
+        target,
+        "cdylib",
+    )?;
     let archive_path = dist.join(format!(
         "{}.{}",
         stage
@@ -464,10 +708,12 @@ fn stage_and_archive(
         .into_iter()
         .map(|e| e.path())
         .collect();
-    if staged.len() < 4 {
+    let expected = 4 + docs.len();
+    if staged.len() < expected {
         return Err(fail(format!(
-            "staging incomplete ({} files, want >= 4: CLI binary, cdylib, qcore.h, abi-version.txt)",
-            staged.len()
+            "staging incomplete ({} files, want >= {expected}: CLI binary, cdylib, qcore.h, abi-version.txt + {} licence/notice file(s))",
+            staged.len(),
+            docs.len()
         )));
     }
     Ok(archive_path)
@@ -511,17 +757,23 @@ pub fn package(args: Vec<String>) -> super::anyhow::Result<()> {
         super::build::cdylib_name_for_triple(&target)
     };
     let fmt = archive_fmt_for(&target).map_err(fail)?;
+    let docs: Vec<PathBuf> = PACKAGE_DOC_FILES.iter().map(PathBuf::from).collect();
     let archive_path = stage_and_archive(
         &dist,
         &stage,
+        &target,
         &bin_dir.join(bin_name),
         &bin_dir.join(cdylib_name),
         Path::new("crates/qcore-ffi/qcore.h"),
         Path::new("crates/qcore-ffi/abi-version.txt"),
+        &docs,
         fmt,
     )
     .map_err(fail)?;
-    println!("package: staged {name} (CLI {bin_name}, {cdylib_name}, qcore.h, abi-version.txt)");
+    println!(
+        "package: staged {name} (CLI {bin_name}, {cdylib_name}, qcore.h, abi-version.txt, {})",
+        PACKAGE_DOC_FILES.join(", ")
+    );
     println!("package: {}", archive_path.display());
 
     // SBOM first so it joins the checksum list. Full dependency graph
@@ -588,6 +840,7 @@ pub fn run(args: Vec<String>) -> super::anyhow::Result<()> {
     // closed here instead of shipping a claim no runner backs. A deliberately
     // partial matrix still needs the explicit --allow-partial-matrix
     // acknowledgment, which names the unproven targets in the log.
+    workflow_backend_pins_match().map_err(fail)?;
     let contract = contract_targets();
     let covered = matrix_targets();
     let undeclared: Vec<_> = covered.iter().filter(|t| !contract.contains(t)).collect();
@@ -1044,7 +1297,19 @@ mod serde_json_lite {
 
 #[cfg(test)]
 mod tests {
-    use super::{archive_fmt_for, contract_targets, sha256_hex, stage_and_archive, ArchiveFmt};
+    use super::{
+        archive_fmt_for, backend_pins_match, contract_targets, expected_machine, install_version,
+        machine_of, matrix_rows_in, sha256_hex, stage_and_archive, workflow_backend_pins_match,
+        ArchiveFmt, Machine, ELF_EM_AARCH64, ELF_EM_ARM, ELF_EM_X86_64, PE_AMD64, PE_I386,
+    };
+
+    fn tmp_base(tag: &str) -> std::path::PathBuf {
+        let base =
+            std::env::temp_dir().join(format!("qcore-xtask-release-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        base
+    }
 
     #[test]
     fn contract_targets_match_manifest() {
@@ -1074,6 +1339,112 @@ mod tests {
             workflow, contract,
             "release.yml (target, runner) vs targets.toml"
         );
+    }
+
+    #[test]
+    fn matrix_rows_ignore_targets_outside_include_block() {
+        // Scoped to matrix.include: a later job/step that uses a `- target:`
+        // key must not join the coverage list (it would claim a leg or fail
+        // the contract diff with a non-triple). Key order inside a row must
+        // not matter either.
+        let workflow = "\
+jobs:
+  matrix:
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            runner: windows-2022
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+  gates:
+    steps:
+      - target: not-a-triple
+        runner: ignored-runner
+      - name: nested key alone is not a row
+        with:
+          target: also-ignored
+";
+        assert_eq!(
+            matrix_rows_in(workflow),
+            vec![
+                (
+                    "x86_64-pc-windows-msvc".to_string(),
+                    "windows-2022".to_string()
+                ),
+                (
+                    "x86_64-unknown-linux-gnu".to_string(),
+                    "ubuntu-22.04".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn release_workflow_backend_pins_match_build_constants() {
+        workflow_backend_pins_match().expect("release.yml pins == build.rs pins");
+    }
+
+    #[test]
+    fn install_version_parses_run_lines_and_fails_closed() {
+        let one = "run: cargo install cross --version 0.2.5 --locked\n";
+        assert_eq!(install_version(one, "cross").unwrap(), "0.2.5");
+        // A commented install line is documentation, not a pin.
+        assert!(install_version("# run: cargo install cross --version 9.9.9\n", "cross").is_err());
+        // Zero or two pins both fail: the effective version would be absent
+        // or order-dependent.
+        assert!(install_version("", "cross").is_err());
+        assert!(install_version(&format!("{one}{one}"), "cross").is_err());
+        // Drift against build.rs fails closed naming both versions.
+        let drift = one.replace("0.2.5", "9.9.9");
+        let err = backend_pins_match(&format!(
+            "{drift}run: cargo install cargo-ndk --version 3.2.0 --locked\n"
+        ))
+        .expect_err("version drift must fail");
+        assert!(
+            err.contains("cross 9.9.9") && err.contains("0.2.5"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn expected_machine_covers_every_contract_target() {
+        for triple in contract_targets() {
+            expected_machine(&triple).unwrap_or_else(|e| panic!("{triple}: {e}"));
+        }
+        assert_eq!(
+            expected_machine("x86_64-pc-windows-msvc").unwrap(),
+            Machine::Pe(PE_AMD64)
+        );
+        assert_eq!(
+            expected_machine("i686-pc-windows-msvc").unwrap(),
+            Machine::Pe(PE_I386)
+        );
+        assert_eq!(
+            expected_machine("armv7-linux-androideabi").unwrap(),
+            Machine::Elf(ELF_EM_ARM)
+        );
+        assert_eq!(
+            expected_machine("aarch64-unknown-linux-gnu").unwrap(),
+            Machine::Elf(ELF_EM_AARCH64)
+        );
+        assert!(expected_machine("not-a-triple").is_err());
+    }
+
+    #[test]
+    fn machine_of_reads_pe_and_elf_headers() {
+        let base = tmp_base("machine-of");
+        let pe = base.join("pe.exe");
+        std::fs::write(&pe, staged_binary(Machine::Pe(PE_I386))).unwrap();
+        assert_eq!(machine_of(&pe).unwrap(), Machine::Pe(PE_I386));
+        let elf = base.join("elf.so");
+        std::fs::write(&elf, staged_binary(Machine::Elf(ELF_EM_AARCH64))).unwrap();
+        assert_eq!(machine_of(&elf).unwrap(), Machine::Elf(ELF_EM_AARCH64));
+        let junk = base.join("junk.bin");
+        std::fs::write(&junk, b"plain text, not an executable").unwrap();
+        let err = machine_of(&junk).expect_err("non-binary fails closed");
+        assert!(err.contains("neither PE nor ELF"), "{err}");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -1111,41 +1482,101 @@ mod tests {
         assert!(archive_fmt_for("not-a-target").is_err());
     }
 
-    /// Fake built artifacts in a tmpdir; asserts the staged archive exists
-    /// and contains the CLI binary payload.
-    fn stage_fixture(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
-        let base =
-            std::env::temp_dir().join(format!("qcore-xtask-release-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
+    /// A minimal but genuinely shaped executable header (PE or ELF) followed
+    /// by a recognisable payload. Packaging now reads the machine type from
+    /// these bytes, so fixtures must be real containers, not text.
+    fn staged_binary(machine: Machine) -> Vec<u8> {
+        let mut bytes = match machine {
+            Machine::Pe(id) => {
+                let mut b = vec![0u8; 0x40];
+                b[..2].copy_from_slice(b"MZ");
+                b[0x3c..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+                b.extend_from_slice(b"PE\0\0");
+                b.extend_from_slice(&id.to_le_bytes());
+                b
+            }
+            Machine::Elf(id) => {
+                let mut b = vec![0u8; 20];
+                b[..4].copy_from_slice(b"\x7fELF");
+                b[4] = 2; // EI_CLASS: 64-bit
+                b[5] = 1; // EI_DATA: little endian
+                b[18..20].copy_from_slice(&id.to_le_bytes());
+                b
+            }
+        };
+        bytes.extend_from_slice(b"fake-cli-binary-payload");
+        bytes
+    }
+
+    /// Fake built artifacts in a tmpdir: PE i686 pair (windows legs) + ELF
+    /// x86_64 pair (linux legs) + the four licence/notice inputs.
+    fn stage_fixture(
+        tag: &str,
+    ) -> (
+        std::path::PathBuf,
+        std::path::PathBuf,
+        Vec<std::path::PathBuf>,
+    ) {
+        let base = tmp_base(tag);
         let build = base.join("build");
         std::fs::create_dir_all(&build).unwrap();
-        std::fs::write(build.join("qcore.exe"), b"fake-cli-binary-payload").unwrap();
-        std::fs::write(build.join("qcore"), b"fake-cli-binary-payload").unwrap();
-        std::fs::write(build.join("qcore_ffi.dll"), b"fake-cdylib-payload").unwrap();
-        std::fs::write(build.join("libqcore_ffi.so"), b"fake-cdylib-payload").unwrap();
+        std::fs::write(build.join("qcore.exe"), staged_binary(Machine::Pe(PE_I386))).unwrap();
+        std::fs::write(
+            build.join("qcore_ffi.dll"),
+            staged_binary(Machine::Pe(PE_I386)),
+        )
+        .unwrap();
+        std::fs::write(
+            build.join("qcore"),
+            staged_binary(Machine::Elf(ELF_EM_X86_64)),
+        )
+        .unwrap();
+        std::fs::write(
+            build.join("libqcore_ffi.so"),
+            staged_binary(Machine::Elf(ELF_EM_X86_64)),
+        )
+        .unwrap();
         let header = base.join("qcore.h");
         std::fs::write(&header, b"/* header */ uint32_t qcore_abi_version(void);").unwrap();
         let abi = base.join("abi-version.txt");
         std::fs::write(&abi, "3\n").unwrap();
-        (base, build)
+        let docs_dir = base.join("docs");
+        std::fs::create_dir_all(&docs_dir).unwrap();
+        let docs: Vec<_> = [
+            "LICENSE-MIT",
+            "LICENSE-APACHE",
+            "THIRD-PARTY-NOTICES.md",
+            "LICENSE.md",
+        ]
+        .iter()
+        .map(|name| {
+            let path = docs_dir.join(name);
+            std::fs::write(&path, b"licence text").unwrap();
+            path
+        })
+        .collect();
+        (base, build, docs)
     }
 
     #[test]
     fn stage_and_archive_zip_contains_staged_binary() {
-        let (base, build) = stage_fixture("zip");
+        let (base, build, docs) = stage_fixture("zip");
         let dist = base.join("dist");
-        let stage = dist.join("qcore-0.1.0-native");
+        let target = "i686-pc-windows-msvc";
+        let stage = dist.join(format!("qcore-0.1.0-{target}"));
         let archive = stage_and_archive(
             &dist,
             &stage,
+            target,
             &build.join("qcore.exe"),
             &build.join("qcore_ffi.dll"),
             &base.join("qcore.h"),
             &base.join("abi-version.txt"),
+            &docs,
             ArchiveFmt::Zip,
         )
         .expect("stage + zip");
-        assert_eq!(archive, dist.join("qcore-0.1.0-native.zip"));
+        assert_eq!(archive, dist.join(format!("qcore-0.1.0-{target}.zip")));
         let bytes = std::fs::read(&archive).unwrap();
         // The archive must exist, be a zip, and contain the fake CLI
         // binary payload (store method keeps bytes verbatim).
@@ -1155,23 +1586,31 @@ mod tests {
             bytes.windows(needle.len()).any(|w| w == needle),
             "zip contains the staged CLI binary"
         );
+        assert!(
+            bytes
+                .windows(b"licence text".len())
+                .any(|w| w == b"licence text"),
+            "zip contains the staged licence/notice files"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
     fn stage_and_archive_targz_contains_staged_binary() {
-        let (base, build) = stage_fixture("targz");
+        let (base, build, docs) = stage_fixture("targz");
         let dist = base.join("dist");
         let stage = dist.join("qcore-0.1.0-x86_64-unknown-linux-gnu");
         let archive = stage_and_archive(
             &dist,
             &stage,
+            "x86_64-unknown-linux-gnu",
             // Cross linux leg: the CLI has no .exe suffix, the cdylib is a
             // .so — the target platform decides the staged names.
             &build.join("qcore"),
             &build.join("libqcore_ffi.so"),
             &base.join("qcore.h"),
             &base.join("abi-version.txt"),
+            &docs,
             ArchiveFmt::TarGz,
         )
         .expect("stage + tar.gz");
@@ -1181,7 +1620,9 @@ mod tests {
         );
         let bytes = std::fs::read(&archive).unwrap();
         assert_eq!(&bytes[..2], &[0x1f, 0x8b], "gzip magic");
-        // Decode and confirm all four staged members are present.
+        // Decode and confirm all staged members are present: the four
+        // deliverables plus the four licence/notice files every archive now
+        // carries.
         let gz = flate2::read::GzDecoder::new(&bytes[..]);
         let mut tar = tar::Archive::new(gz);
         let mut names = Vec::new();
@@ -1192,6 +1633,10 @@ mod tests {
         assert_eq!(
             names,
             vec![
+                "LICENSE-APACHE".to_string(),
+                "LICENSE-MIT".to_string(),
+                "LICENSE.md".to_string(),
+                "THIRD-PARTY-NOTICES.md".to_string(),
                 "abi-version.txt".to_string(),
                 "libqcore_ffi.so".to_string(),
                 "qcore".to_string(),
@@ -1204,39 +1649,96 @@ mod tests {
 
     #[test]
     fn stage_and_archive_fails_closed_on_missing_binary() {
-        let (base, build) = stage_fixture("failclosed");
+        let (base, build, docs) = stage_fixture("failclosed");
         let dist = base.join("dist");
-        let stage = dist.join("qcore-0.1.0-native");
+        let stage = dist.join("qcore-0.1.0-i686-pc-windows-msvc");
         let err = stage_and_archive(
             &dist,
             &stage,
+            "i686-pc-windows-msvc",
             &build.join("missing-binary"),
             &build.join("qcore_ffi.dll"),
             &base.join("qcore.h"),
             &base.join("abi-version.txt"),
+            &docs,
             ArchiveFmt::Zip,
         )
         .expect_err("missing CLI binary fails closed");
         assert!(err.contains("CLI binary missing"), "{err}");
         // No archive written on the failure path.
-        assert!(!dist.join("qcore-0.1.0-native.zip").exists());
+        assert!(!dist.join("qcore-0.1.0-i686-pc-windows-msvc.zip").exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn stage_and_archive_rejects_missing_licence_file() {
+        // Every archive carries the licence/notice set; a missing input is a
+        // packaging failure, not a silent omission.
+        let (base, build, mut docs) = stage_fixture("nodocs");
+        let dist = base.join("dist");
+        let stage = dist.join("qcore-0.1.0-i686-pc-windows-msvc");
+        docs.push(base.join("docs/missing-LICENSE"));
+        let err = stage_and_archive(
+            &dist,
+            &stage,
+            "i686-pc-windows-msvc",
+            &build.join("qcore.exe"),
+            &build.join("qcore_ffi.dll"),
+            &base.join("qcore.h"),
+            &base.join("abi-version.txt"),
+            &docs,
+            ArchiveFmt::Zip,
+        )
+        .expect_err("dropping a doc file fails closed");
+        assert!(err.contains("licence/notice file missing"), "{err}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn stage_and_archive_rejects_wrong_machine_type() {
+        // PE i386 payload under an x86_64 triple: a build that ignored
+        // --target (or a stale artifact dir) must fail packaging instead of
+        // shipping a foreign executable under the target's name.
+        let (base, build, docs) = stage_fixture("machine");
+        let dist = base.join("dist");
+        let stage = dist.join("qcore-0.1.0-x86_64-pc-windows-msvc");
+        let err = stage_and_archive(
+            &dist,
+            &stage,
+            "x86_64-pc-windows-msvc",
+            &build.join("qcore.exe"),
+            &build.join("qcore_ffi.dll"),
+            &base.join("qcore.h"),
+            &base.join("abi-version.txt"),
+            &docs,
+            ArchiveFmt::Zip,
+        )
+        .expect_err("wrong machine type fails closed");
+        assert!(
+            err.contains("CLI binary")
+                && err.contains("machine")
+                && err.contains("x86_64-pc-windows-msvc"),
+            "{err}"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
     fn stage_and_archive_rejects_stale_stage_files() {
-        let (base, build) = stage_fixture("stale");
+        let (base, build, docs) = stage_fixture("stale");
         let dist = base.join("dist");
-        let stage = dist.join("qcore-0.1.0-native");
+        let stage = dist.join("qcore-0.1.0-i686-pc-windows-msvc");
         std::fs::create_dir_all(&stage).unwrap();
         std::fs::write(stage.join("stale-junk.txt"), b"old run").unwrap();
         let archive = stage_and_archive(
             &dist,
             &stage,
+            "i686-pc-windows-msvc",
             &build.join("qcore.exe"),
             &build.join("qcore_ffi.dll"),
             &base.join("qcore.h"),
             &base.join("abi-version.txt"),
+            &docs,
             ArchiveFmt::Zip,
         )
         .expect("stage + zip");

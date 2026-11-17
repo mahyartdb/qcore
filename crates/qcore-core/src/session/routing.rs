@@ -10,14 +10,20 @@
 //!   boundaries (`example.com` covers `example.com` and `a.example.com`,
 //!   never `notexample.com`), case-insensitively. The proxy never sniffs
 //!   TLS/HTTP: only the CONNECT target is consulted.
-//! - `cidr` matches a literal target IP. A domain target must be resolved
-//!   before CIDR rules can see an address; that resolution goes through the
-//!   tunnel resolver (never the OS resolver). Domain and port-only rules
-//!   decide before any resolution; without a resolver, a domain target that
-//!   needs CIDR evaluation fails closed. A hostname-capable exit
+//! - `cidr` matches a literal target IP. Evaluation is order-independent:
+//!   when ANY CIDR rule could match the target port ([`Router::cidr_relevant`]),
+//!   a domain target is resolved BEFORE any verdict, through the tunnel
+//!   resolver (never the OS resolver), and the table is then applied once
+//!   with both the name and the address. Without a resolver such a target
+//!   fails closed instead of guessing (or leaking the name locally). When no
+//!   CIDR rule could match the port, domain and port-only rules decide on the
+//!   name alone, with no resolution. A hostname-capable exit
 //!   ([`Dialer::dial_host`](qcore_transport_api::Dialer::dial_host)'s
 //!   remote resolution) is bypassed for such targets because the rule needs
 //!   the address on this side.
+//! - First match still wins among rules that were evaluated with the same
+//!   information (a `domain` rule before a CIDR rule can still win when the
+//!   resolved address does not match the CIDR).
 //! - `direct` dials from the host's own network stack: it BYPASSES the
 //!   tunnel. That is the point of the rule, and the leak trade-off (the
 //!   destination sees the host IP; a hostname is resolved locally) is
@@ -75,11 +81,15 @@ impl Router {
         }
     }
 
-    /// First-match decision. `host` is the CONNECT target name (if any),
-    /// `addr` a literal or tunnel-resolved address (if any), `port` the
-    /// target port. Callers decide the resolution order: domain and port-only
-    /// rules first (`addr = None`), then (if needed) the same call with the
-    /// resolved `addr`.
+    /// First-match decision over the rules whose present `match` fields all
+    /// agree. `host` is the CONNECT target name (if any), `addr` a literal or
+    /// tunnel-resolved address (if any), `port` the target port.
+    ///
+    /// Callers must not decide a domain target with `addr = None` while
+    /// [`Self::cidr_relevant`] reports the port: a CIDR rule placed before a
+    /// domain rule would silently miss the resolved address and the domain
+    /// rule would win on incomplete information (order-dependent routing,
+    /// QA#2). Resolve first, then make ONE call with both.
     pub fn decide(&self, host: Option<&str>, addr: Option<&IpAddr>, port: u16) -> Action {
         self.rules
             .iter()
@@ -87,10 +97,11 @@ impl Router {
             .map_or(RoutingAction::Proxy, |rule| rule.action)
     }
 
-    /// True when a domain target at `port` needs tunnel resolution before the
-    /// table can be applied: some CIDR rule could match this port. Called
-    /// only after a host-only [`Self::decide`] returned `Proxy`.
-    pub fn cidr_needs_resolution(&self, port: u16) -> bool {
+    /// True when some CIDR rule in the table could match `port`
+    /// (unconstrained or the same port). A domain target at such a port must
+    /// be resolved through the tunnel before any verdict, so a CIDR block
+    /// placed before (or after) a domain rule applies to the same address.
+    pub fn cidr_relevant(&self, port: u16) -> bool {
         self.rules
             .iter()
             .any(|rule| rule.cidr.is_some() && rule.port.is_none_or(|p| p == port))
@@ -184,7 +195,7 @@ mod tests {
             Action::Block
         );
         assert_eq!(r.decide(Some("mail.example"), None, 587), Action::Proxy);
-        assert!(!r.cidr_needs_resolution(25));
+        assert!(!r.cidr_relevant(25));
     }
 
     #[test]
@@ -195,7 +206,7 @@ mod tests {
             r.decide(None, Some(&"10.0.0.1".parse().unwrap()), 443),
             Action::Proxy
         );
-        assert!(!r.cidr_needs_resolution(443));
+        assert!(!r.cidr_relevant(443));
     }
 
     #[test]
@@ -208,7 +219,7 @@ mod tests {
             "#,
         );
         assert_eq!(r.decide(Some("intranet.example"), None, 443), Action::Proxy);
-        assert!(r.cidr_needs_resolution(443));
+        assert!(r.cidr_relevant(443));
         assert_eq!(
             r.decide(
                 Some("intranet.example"),
@@ -236,8 +247,28 @@ mod tests {
             action = "block"
             "#,
         );
-        assert!(!r.cidr_needs_resolution(443));
-        assert!(r.cidr_needs_resolution(445));
+        assert!(!r.cidr_relevant(443));
+        assert!(r.cidr_relevant(445));
+    }
+
+    #[test]
+    fn cidr_relevance_scans_rules_behind_a_domain_rule() {
+        // QA#2: the CIDR rule sits AFTER a domain rule, so a name-first
+        // decision would short-circuit on `direct` and never see the
+        // address. The scan must look at the whole table.
+        let r = router(
+            r#"
+            [[rules]]
+            match = { domain = "corp.internal" }
+            action = "direct"
+
+            [[rules]]
+            match = { cidr = "10.0.0.0/8", port = 445 }
+            action = "block"
+            "#,
+        );
+        assert!(r.cidr_relevant(445));
+        assert!(!r.cidr_relevant(443));
     }
 
     fn scratch_dirs(tag: &str) -> (ProfileDirs, std::path::PathBuf) {

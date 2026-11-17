@@ -335,6 +335,10 @@ mod tests {
         let err = parse_fields(&cfg(&[("awg_header_protection_key", &"ab".repeat(32))]))
             .expect_err("key without flag");
         assert!(err.contains("awg_header_protection"), "{err}");
+        // A malformed key fails by field name at the factory boundary.
+        let err = parse_fields(&cfg(&[("awg_header_protection_key", "not-hex")]))
+            .expect_err("malformed key");
+        assert!(err.contains("awg_header_protection_key"), "{err}");
         // amneziawg-go requires S1..S4 >= 12 as the ChaCha20 nonce.
         let err = parse_fields(&cfg(&[
             ("awg_header_protection", "true"),

@@ -53,12 +53,43 @@ Honest limits:
 
 - The shipped AWG profiles keep `header_protection = false`: the transform
   needs `awg_header_protection_key`, a per-peer shared secret that does not
-  belong in profile data, and neither the chain grammar nor the `.conf`
-  import mapping carries it yet. A hop that requests header protection
-  without the key fails closed at hop build naming the field, so enabling it
-  needs a config path for the key first. (A custom profile *could* put
-  `header_protection_key` in `params` — the only path today — but profile
-  data is not a secret store.)
+  belong in profile data. The key arrives through `.conf` import instead: a
+  `HeaderProtectionKey = <base64 32 bytes>` line in `[Interface]` is stored
+  in the secret store (never in the stored record or the chain grammar) and
+  materialized as `awg_header_protection_key` with
+  `awg_header_protection = true`. Import material fills before profile
+  params, so the shipped `false` does not override it:
+
+  ```ini
+  [Interface]
+  PrivateKey = <client private key, base64>
+  Address = 10.9.0.2/32
+  HeaderProtectionKey = <shared 32-byte key, base64>
+  S1 = 24
+  S2 = 24
+  S3 = 24
+  S4 = 24
+  H1 = 111
+  H2 = 222
+  H3 = 333
+  H4 = 444
+
+  [Peer]
+  PublicKey = <server public key, base64>
+  AllowedIPs = 0.0.0.0/0
+  Endpoint = vpn.example:51820
+  ```
+
+  ```
+  qcore import amneziawg.conf          # prints the stored ref
+  qcore connect --hop "wireguard peer=awg import=<ref> obfuscation=awg-balanced"
+  ```
+
+  A wrong-length value rejects the import (exit 5) naming
+  `HeaderProtectionKey`. `s1..s4 >= 12` still applies, and a hop that
+  requests header protection without a key fails closed at hop build naming
+  the field. A custom profile *could* put `header_protection_key` in
+  `params`, but profile data is not a secret store — do not.
 - `i1`..`i5` are literal datagram payloads, not upstream's programmable
   signature-packet grammar.
 
@@ -80,9 +111,12 @@ ASSOCIATE) target goes. `connect --routing <path>` loads a different file;
 an absent or empty file means every target proxies through the tunnel, the
 historic behavior.
 
-Rules are an ordered array and the **first match wins**. Each rule has a
-`match` table (at least one field; present fields must all agree) and an
-`action`:
+Rules are an ordered array; the first match wins among rules evaluated with
+the same information. Evaluation is order-independent across match kinds:
+when some CIDR rule could match the target port, a domain target resolves
+through the tunnel *before* any verdict, so an earlier domain rule cannot
+bypass a later CIDR block. Each rule has a `match` table (at least one field;
+present fields must all agree) and an `action`:
 
 ```toml
 # Host-network egress for an intranet suffix; everything else stays in the
@@ -107,9 +141,10 @@ action = "block"
   `notexample.com`. Only the CONNECT target is consulted — the proxy does
   not sniff TLS/HTTP. Wildcards are rejected; a bare suffix already covers
   subdomains.
-- `cidr` matches a literal target IP and, for a domain target, the address
-  resolved through the tunnel resolver (never the OS resolver). Without a
-  tunnel resolver such a target fails closed instead of guessing.
+- `cidr` matches a literal target IP and, for a domain target at a port some
+  CIDR rule could match, the address resolved through the tunnel resolver
+  (never the OS resolver). Without a tunnel resolver such a target fails
+  closed instead of guessing.
 - `port` alone matches any host.
 - `domain` and `cidr` are mutually exclusive in one rule (`10.0.0.0/8` is
   not a name), and unknown keys anywhere fail closed naming the rule and

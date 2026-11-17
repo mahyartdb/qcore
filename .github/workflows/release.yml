@@ -57,6 +57,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+      # Per-leg cache key: cargo artifacts under target/<triple> are
+      # target-specific, so nine legs sharing one cache would thrash it and
+      # restore foreign triples.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
       # cross-rs is the linux-gnu backend. Docker is preinstalled on GitHub
       # ubuntu runners (cross runs its build inside the target image); only the
       # pinned CLI has to be installed.
@@ -92,8 +98,16 @@ jobs:
           yes | sdkmanager --licenses > /dev/null
           sdkmanager --install "ndk;27.0.12077973"
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.0.12077973" >> "$GITHUB_ENV"
-      - name: add target std
-        if: contains(matrix.target, 'android')
+      # The runner image's default toolchain is not rust-toolchain.toml's
+      # pinned channel, and a fresh pinned toolchain ships only host std.
+      # That bites every leg whose target differs from the host triple
+      # (i686/aarch64 windows included, not just android). Installing from the
+      # repo dir targets the pinned channel because the rust-toolchain.toml
+      # directory override wins over the image's `rustup default`; on the host
+      # triple the command is a no-op. `dtolnay/rust-toolchain`'s `targets:`
+      # input would add std to `stable` instead of the pinned channel — do not
+      # move this back into that action.
+      - name: add target std (pinned toolchain)
         run: rustup target add ${{ matrix.target }}
       - name: build
         run: cargo xtask build --target ${{ matrix.target }}
@@ -115,12 +129,50 @@ jobs:
             target/dist/qcore-*.tar.gz
           if-no-files-found: error
 
+  # CI gate for the tagged tree (tag AND dry-run). The matrix below proves
+  # per-target artifacts; this job proves the source they were built from:
+  # a v* tag must never publish from a commit that flunks the CI essentials.
+  # Same commands as ci.yml's gate minus `smoke` (each matrix leg runs the
+  # target smoke itself) and minus the secret/semver jobs (those already run
+  # on every push and PR). Cache key matches ci.yml's gate so a tag push
+  # restores the PR run's artifacts instead of rebuilding.
+  gates:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # abi-diff's committed-header check shells git
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: v2-pruned
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.145
+      - name: fmt
+        run: cargo fmt --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: unit + contract tests
+        run: cargo nextest run --workspace --all-features --exclude tests-conformance
+      - name: conformance matrix
+        run: cargo nextest run -p tests-conformance
+      - name: denylist policy sync (deny-sync)
+        run: cargo run -q -p xtask -- deny-sync
+      - name: third-party notices
+        run: cargo run -q -p xtask -- notices --check
+      - name: C ABI diff
+        run: cargo xtask abi-diff
+
   # Finalize (tag AND dry-run): stage the nine per-target archives, write the
   # full-graph SBOM + SHA256SUMS, cosign-sign keylessly. A dry run that skipped
   # this would not prove the publish path, so it runs in both modes; it never
   # touches a GitHub Release.
   finalize:
-    needs: [matrix]
+    needs: [matrix, gates]
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     permissions:
@@ -158,7 +210,7 @@ jobs:
   # the finalized dist set. contents: write lives only here, so a dry run never
   # holds a token that could write to the repository.
   publish:
-    needs: [finalize]
+    needs: [finalize, gates]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-22.04
     timeout-minutes: 15

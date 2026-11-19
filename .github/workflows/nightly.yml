@@ -3,6 +3,12 @@ on:
   schedule: [{ cron: "0 3 * * *" }]
   workflow_dispatch:
 
+# One nightly at a time per ref; a manual dispatch cancels a still-running
+# scheduled run for the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -23,14 +29,23 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - run: cargo xtask build --target native
       - run: cargo xtask smoke --target native
   live-egress:
     runs-on: ubuntu-22.04
     continue-on-error: true
+    env:
+      # The ignored-only lane includes tests that panic without this guard
+      # (masque_live_register_and_scan mints a real identity) — the whole
+      # point of this job is real-network egress, so enable it. The job
+      # stays non-blocking; a red here means the provider path moved, not
+      # that the core regressed.
+      QCORE_LIVE: "1"
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest@0.9.145

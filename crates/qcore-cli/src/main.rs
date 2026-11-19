@@ -343,7 +343,14 @@ fn main() {
     use_utf8_console();
     // Reset SIGPIPE to SIG_DFL (the Rust runtime starts with it ignored).
     #[cfg(unix)]
-    let _ = libc_sigpipe_default();
+    {
+        // SAFETY: `signal` with SIG_DFL is a plain syscall; called before
+        // any thread spawns, so POSIX's undefined concurrent-fn behavior
+        // does not apply.
+        unsafe {
+            let _ = libc_sigpipe_default();
+        }
+    }
     // Force linkage of every enabled transport so inventory registration
     // reaches the engine registry (static archives only link used objects).
     let _ = qcore_transports::linked_kinds();

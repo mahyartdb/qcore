@@ -714,15 +714,17 @@ mod tests {
         _s: JString,
         _is_copy: *mut u8,
     ) -> *const c_char {
-        // The test always passes the same pinned content; store a marker
-        // string the test set beforehand.
-        let cell = PINNED
+        // The test always passes the same pinned content; return the pointer
+        // INTO the stored entry (never a clone: a local clone's `as_ptr`
+        // dangles the moment this fn returns — glibc poisons freed chunks,
+        // so the JVM-side read would see garbage/NULs and fail downstream,
+        // while Windows' heap happens to keep the bytes readable).
+        PINNED
             .lock()
             .unwrap()
             .last()
             .expect("test set a pinned string")
-            .clone();
-        cell.as_ptr()
+            .as_ptr()
     }
 
     unsafe extern "system" fn capture_new_string(_env: JniEnv, bytes: *const c_char) -> JString {

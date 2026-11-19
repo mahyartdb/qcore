@@ -682,14 +682,19 @@ async fn run_watchdog(
                 if vanished {
                     lifecycle::unwind(&started).await;
                 }
+                // Clear the degraded flag BEFORE the durable Up record: the
+                // flag belongs to the degraded period, which ended when the
+                // rebuilt hops were swapped in above. Storing it after
+                // up_record opened an observation window where session.json
+                // said Up but handle.degraded was still true (linux CI).
+                handle
+                    .degraded
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
                 handle
                     .reconnects
                     .store(wd.reconnects, std::sync::atomic::Ordering::SeqCst);
                 up_record(&wd.cfg.dirs, wd.reconnects);
                 publish_report(&live, &handle.id, false, wd.reconnects).await;
-                handle
-                    .degraded
-                    .store(false, std::sync::atomic::Ordering::SeqCst);
             }
         }
     }

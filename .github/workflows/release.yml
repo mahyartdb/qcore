@@ -95,7 +95,11 @@ jobs:
       - name: install Android NDK r27
         if: contains(matrix.target, 'android')
         run: |
-          sdkmanager --install "ndk;27.0.12077973" > /dev/null
+          # The image's sdkmanager lives under cmdline-tools/latest/bin and is
+          # not on PATH for raw run steps (android-actions/setup-android used
+          # to add it; we dropped that action for its flaky self-upgrade).
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          "$SDKM" --install "ndk;27.0.12077973" > /dev/null
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.0.12077973" >> "$GITHUB_ENV"
       - name: cache cargo-ndk
         if: contains(matrix.target, 'android')

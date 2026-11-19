@@ -65,29 +65,57 @@ impl qcore_transport_api::HopFactory for MasqueFactory {
         // synchronously, names go through `lookup_host` with a timeout, and
         // every failure is a Config error naming the field — never a chain
         // that cannot run.
-        let endpoint = resolve_endpoint(hop_id.clone(), cfg.get("endpoint")).await?;
+        let endpoints = resolve_endpoint(hop_id.clone(), cfg.get("endpoint")).await?;
         let insecure = cfg.get("insecure_skip_verify") == Some("true");
         let fragment = obfuscate::fragment_size(&cfg)?;
-        match alpn {
-            "h3" => MasqueHop::bring_up_h3(hop_id, endpoint, insecure, carrier).await,
-            "h2" => MasqueHop::bring_up_h2(hop_id, endpoint, carrier, fragment).await,
-            other => Err(HopError::new(
+        // Try each resolved address in order; the first successful bring-up
+        // wins. Dual-stack names (`localhost` → `::1` + `127.0.0.1`) are
+        // platform-ordered, so one address must not be picked upfront — that
+        // silently broke IPv4-only peers on linux (the CI dry-run failure).
+        let mut last: Option<HopError> = None;
+        for endpoint in endpoints {
+            let result = match alpn {
+                "h3" => {
+                    MasqueHop::bring_up_h3(hop_id.clone(), endpoint, insecure, carrier.clone())
+                        .await
+                }
+                "h2" => {
+                    MasqueHop::bring_up_h2(hop_id.clone(), endpoint, carrier.clone(), fragment)
+                        .await
+                }
+                other => {
+                    return Err(HopError::new(
+                        HopErrorKind::Config,
+                        Some(hop_id),
+                        format!("unknown masque alpn `{other}` (h3|h2)"),
+                    ));
+                }
+            };
+            match result {
+                Ok(hop) => return Ok(hop),
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last.unwrap_or_else(|| {
+            HopError::new(
                 HopErrorKind::Config,
                 Some(hop_id),
-                format!("unknown masque alpn `{other}` (h3|h2)"),
-            )),
-        }
+                "endpoint resolved to no addresses".to_string(),
+            )
+        }))
     }
 }
 
 /// Timeout for the DNS resolution of a hostname `endpoint` (fails closed).
 const ENDPOINT_RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Parse `endpoint=<ip:port|host:port>` into a `SocketAddr`, resolving
-/// hostnames like `transport-wireguard::modes::resolve_endpoint`. Standard
-/// configs carry hostnames; failing them at build with a Config error naming
-/// the field is early and precise.
-async fn resolve_endpoint(hop_id: String, raw: Option<&str>) -> Result<SocketAddr, HopError> {
+/// Resolve `endpoint=<ip:port|host:port>` into every address the name has
+/// (a literal is a one-element list). Callers try the addresses in order —
+/// "localhost" resolves to both `::1` and `127.0.0.1` and which one comes
+/// first is platform-ordered, so a single-address pick silently breaks
+/// dual-stack peers (the linux CI failure). Fails closed with a Config
+/// error naming the field, like `transport-wireguard::modes::resolve_endpoint`.
+async fn resolve_endpoint(hop_id: String, raw: Option<&str>) -> Result<Vec<SocketAddr>, HopError> {
     let config_err = |msg: String| HopError::new(HopErrorKind::Config, Some(hop_id.clone()), msg);
     let Some(s) = raw else {
         return Err(config_err(
@@ -95,7 +123,7 @@ async fn resolve_endpoint(hop_id: String, raw: Option<&str>) -> Result<SocketAdd
         ));
     };
     if let Ok(addr) = s.parse::<SocketAddr>() {
-        return Ok(addr);
+        return Ok(vec![addr]);
     }
     // Bracketed v6 that failed to parse above is malformed, not a name.
     if s.starts_with('[') {
@@ -124,13 +152,13 @@ async fn resolve_endpoint(hop_id: String, raw: Option<&str>) -> Result<SocketAdd
     )
     .await
     .map_err(|_| config_err(format!("bad endpoint: resolve `{host}` timed out")))?;
-    let addrs: Vec<SocketAddr> = lookup
+    let resolved: Vec<SocketAddr> = lookup
         .map_err(|e| config_err(format!("bad endpoint: resolve `{host}`: {e}")))?
         .collect();
-    addrs
-        .into_iter()
-        .next()
-        .ok_or_else(|| config_err(format!("bad endpoint: no address for `{host}`")))
+    if resolved.is_empty() {
+        return Err(config_err(format!("bad endpoint: no address for `{host}`")));
+    }
+    Ok(resolved)
 }
 
 enum Conn {

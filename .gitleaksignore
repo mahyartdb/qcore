@@ -10,3 +10,10 @@ f3f376f3c1d8abd467d08d2eee840da76b0fb821:.gitleaks.toml:generic-api-key:6
 # #13 denylist_covers_pem_headers test markers (known-fake PEM headers the
 # redaction denylist must catch); reported by CI gitleaks on a11fe1b.
 a11fe1b145241fd0bb3d85d35fbe8051676c3eec:crates/qcore-core/src/diag/redact.rs:private-key:379
+# Round-8/round-9 test fixtures reported by the FULL-history gitleaks scan
+# in release.yml's gates job (ci.yml scans only the PR diff, so these were
+# never flagged there). Both are deterministic fixtures, not credentials:
+# - hp_key_round_trips_and_redacts' 32-byte base64 test key (export.rs).
+# - the cache-key-version test's literal `key: cargo-ndk-3.2.0` (release.rs).
+9c022e7b2e99a3368f0c9ceda0503a2cf02aaf40:crates/qcore-core/src/config/export.rs:generic-api-key:191
+fa17fc58fd4ab7106b3b8f7f09c430530e8d2b20:xtask/src/release.rs:generic-api-key:1457

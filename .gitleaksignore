@@ -14,6 +14,11 @@ a11fe1b145241fd0bb3d85d35fbe8051676c3eec:crates/qcore-core/src/diag/redact.rs:pr
 # in release.yml's gates job (ci.yml scans only the PR diff, so these were
 # never flagged there). Both are deterministic fixtures, not credentials:
 # - hp_key_round_trips_and_redacts' 32-byte base64 test key (export.rs).
-# - the cache-key-version test's literal `key: cargo-ndk-3.2.0` (release.rs).
+# - the cache-key-version test's cargo-ndk version literal (release.rs).
+# NOTE: do not spell either literal in this file — gitleaks scans the
+# ignore file itself and a quoted sample becomes a fresh finding.
 9c022e7b2e99a3368f0c9ceda0503a2cf02aaf40:crates/qcore-core/src/config/export.rs:generic-api-key:191
 fa17fc58fd4ab7106b3b8f7f09c430530e8d2b20:xtask/src/release.rs:generic-api-key:1457
+# The prior version of this ignore file quoted one literal and gitleaks
+# flagged the quote itself; ignore that historical finding too.
+82bfcf33d61fc0991e8a4433fd5546b03f69f19e:.gitleaksignore:generic-api-key:17

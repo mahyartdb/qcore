@@ -40,7 +40,6 @@ toml = "1.1"
 inventory = "0.3"
 keyring = "3"
 clap = { version = "4", features = ["derive", "env"] }
-boringtun = "0.7"
 bytes = "1"
 http = "1"
 rustls-native-certs = "0.8"
@@ -55,12 +54,14 @@ h2 = "0.4"
 arti-client = { version = "0.46", default-features = false, features = ["tokio", "rustls"] }
 tor-rtcompat = "=0.46.0"
 libsqlite3-sys = { version = "0.37", features = ["bundled"] }
-
 # AmneziaWG wire transforms need handshake-plane access inside boringtun;
 # the in-tree copy is 0.7.1 plus those patches (see
-# third_party/boringtun/QCORE_PATCHES.md).
-[patch.crates-io]
-boringtun = { path = "third_party/boringtun" }
+# third_party/boringtun/QCORE_PATCHES.md). A PATH dependency, not
+# [patch.crates-io]: patches live in the workspace manifest and vanish
+# when a tool builds this crate from outside it (cargo semver-checks'
+# temp crate resolved boringtun from crates.io and the doc build died on
+# the awg module). Path deps resolve relative to the manifest everywhere.
+boringtun = { path = "third_party/boringtun", version = "0.7.1" }
 
 [profile.release]
 lto = true

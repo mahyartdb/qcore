@@ -67,6 +67,54 @@ fn server_config(
     )))
 }
 
+/// Server config whose certificate is only offered when the client's SNI
+/// matches `expected` (or, when `None`, is absent); a mismatch returns no
+/// certificate and the handshake fails. Loopback proof of what the client
+/// actually puts on the wire.
+fn server_config_gated_by_sni(
+    cert_der: Vec<u8>,
+    key_der: Vec<u8>,
+    expected: Option<&str>,
+) -> Result<quinn::ServerConfig, Box<dyn std::error::Error>> {
+    crate::ensure_provider();
+    let cert = rustls::pki_types::CertificateDer::from(cert_der);
+    let key = rustls::pki_types::PrivateKeyDer::try_from(key_der)
+        .map_err(|e| format!("private key: {e}"))?;
+    let signing_key = rustls::crypto::ring::sign::any_supported_type(&key)?;
+    let resolver = Arc::new(SniGate {
+        key: Arc::new(rustls::sign::CertifiedKey::new(vec![cert], signing_key)),
+        expected: expected.map(str::to_string),
+    });
+    let mut crypto = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_cert_resolver(resolver);
+    crypto.alpn_protocols = vec![b"h3".to_vec()];
+    Ok(quinn::ServerConfig::with_crypto(Arc::new(
+        quinn::crypto::rustls::QuicServerConfig::try_from(crypto)?,
+    )))
+}
+
+#[derive(Debug)]
+struct SniGate {
+    key: Arc<rustls::sign::CertifiedKey>,
+    /// `Some`: require this SNI. `None`: require SNI to be absent (an IP
+    /// literal server name is never sent as SNI, RFC 6066).
+    expected: Option<String>,
+}
+
+impl rustls::server::ResolvesServerCert for SniGate {
+    fn resolve(
+        &self,
+        client_hello: rustls::server::ClientHello<'_>,
+    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        let matches = match &self.expected {
+            Some(name) => client_hello.server_name() == Some(name.as_str()),
+            None => client_hello.server_name().is_none(),
+        };
+        matches.then(|| self.key.clone())
+    }
+}
+
 use std::sync::Arc;
 
 /// A QUIC responder: echoes bidirectional streams, echoes DATAGRAM frames.
@@ -81,10 +129,44 @@ impl QuinnResponder {
         cert_der: Vec<u8>,
         key_der: Vec<u8>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let endpoint = quinn::Endpoint::server(
-            server_config(cert_der, key_der)?,
-            SocketAddr::new(bind_ip, 0),
-        )?;
+        Self::spawn_with_config(bind_ip, server_config(cert_der, key_der)?).await
+    }
+
+    /// Like [`QuinnResponder::spawn`], but the certificate is only offered
+    /// when the client's SNI matches `expected_sni`.
+    pub async fn spawn_requiring_sni(
+        bind_ip: IpAddr,
+        cert_der: Vec<u8>,
+        key_der: Vec<u8>,
+        expected_sni: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::spawn_with_config(
+            bind_ip,
+            server_config_gated_by_sni(cert_der, key_der, Some(expected_sni))?,
+        )
+        .await
+    }
+
+    /// Like [`QuinnResponder::spawn`], but the certificate is only offered
+    /// when the client sends no SNI at all — the shape of a connect to an IP
+    /// literal (RFC 6066 forbids SNI for IP names).
+    pub async fn spawn_requiring_no_sni(
+        bind_ip: IpAddr,
+        cert_der: Vec<u8>,
+        key_der: Vec<u8>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::spawn_with_config(
+            bind_ip,
+            server_config_gated_by_sni(cert_der, key_der, None)?,
+        )
+        .await
+    }
+
+    async fn spawn_with_config(
+        bind_ip: IpAddr,
+        config: quinn::ServerConfig,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let endpoint = quinn::Endpoint::server(config, SocketAddr::new(bind_ip, 0))?;
         let addr = endpoint.local_addr()?;
         let task = tokio::spawn(async move {
             while let Some(incoming) = endpoint.accept().await {

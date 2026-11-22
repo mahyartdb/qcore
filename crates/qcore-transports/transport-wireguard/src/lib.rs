@@ -138,20 +138,11 @@ impl qcore_transport_api::HopFactory for WireguardFactory {
         carrier: Arc<dyn Dialer>,
     ) -> Result<Arc<dyn RunningHop>, HopError> {
         let hop_id = cfg.get("hop_id").unwrap_or("wireguard-0").to_string();
-        // Hostnames resolve here (async) so standard `.conf` endpoints work:
-        // the sync `modes::resolve` below then always sees an IP literal.
-        let mut cfg = cfg;
-        if let Some(ep) = cfg.get("endpoint") {
-            if ep.parse::<SocketAddr>().is_err() {
-                let family = cfg.get("family").unwrap_or("dual").to_string();
-                let resolved = modes::resolve_endpoint(ep, &family)
-                    .await
-                    .map_err(|e| HopError::new(HopErrorKind::Config, Some(hop_id.clone()), e))?;
-                cfg.fields
-                    .insert("endpoint".to_string(), resolved.to_string());
-            }
-        }
+        // `modes::resolve` is async because a hostname `endpoint` resolves
+        // here (async) into every address the name has; literals never touch
+        // the resolver. Standard `.conf` files routinely carry hostnames.
         let params = modes::resolve(&cfg)
+            .await
             .map_err(|e| HopError::new(HopErrorKind::Config, Some(hop_id.clone()), e))?;
         WireguardHop::bring_up(hop_id, params, carrier).await
     }
@@ -160,7 +151,11 @@ impl qcore_transport_api::HopFactory for WireguardFactory {
 /// Resolved peer parameters.
 #[derive(Debug, Clone)]
 pub struct WgParams {
-    pub peer_endpoint: SocketAddr,
+    /// Every address the `endpoint` resolved to, in resolver order. Bring-up
+    /// tries them until one handshakes: a dual-stack name resolves to both
+    /// stacks and which one is ordered first is platform-dependent, so a
+    /// single pick silently broke one stack.
+    pub peer_endpoints: Vec<SocketAddr>,
     pub private_key: [u8; 32],
     pub peer_public_key: [u8; 32],
     pub preshared_key: Option<[u8; 32]>,
@@ -296,11 +291,89 @@ async fn send_junk(
     }
 }
 
+/// Total wall-clock budget for the WireGuard handshake across every
+/// resolved endpoint. The engine races `build` with its own connection
+/// timeout (30 s default), so this is the inner fail-closed backstop.
+const HANDSHAKE_BUDGET: Duration = Duration::from_secs(15);
+
+/// Floor for one endpoint attempt's share of [`HANDSHAKE_BUDGET`]: a
+/// dual-stack name must still leave an unreachable address enough time to
+/// be told apart from a slow handshake. Long address lists may exceed the
+/// total by design; the engine's outer timeout remains the hard bound.
+const MIN_ENDPOINT_ATTEMPT: Duration = Duration::from_secs(5);
+
+/// Divide `total` across `endpoints` attempts, floor-bounded by
+/// [`MIN_ENDPOINT_ATTEMPT`] and never above `total` itself (a short caller
+/// budget stays short).
+fn attempt_budget(total: Duration, endpoints: usize) -> Duration {
+    let n = u32::try_from(endpoints.max(1)).unwrap_or(u32::MAX);
+    (total / n).max(MIN_ENDPOINT_ATTEMPT.min(total))
+}
+
 impl WireguardHop {
     async fn bring_up(
         hop_id: String,
         params: WgParams,
         carrier: Arc<dyn Dialer>,
+    ) -> Result<Arc<dyn RunningHop>, HopError> {
+        Self::bring_up_within(hop_id, params, carrier, HANDSHAKE_BUDGET).await
+    }
+
+    /// Try each resolved endpoint until one completes the handshake; the
+    /// first success wins. Failures are aggregated per address — reporting
+    /// only the last attempt hides the first (platform-ordered) address,
+    /// which is usually the one that mattered. Config errors (bad keys, AWG
+    /// params) are identical for every address, so they fail fast instead of
+    /// burning the whole budget.
+    async fn bring_up_within(
+        hop_id: String,
+        params: WgParams,
+        carrier: Arc<dyn Dialer>,
+        total: Duration,
+    ) -> Result<Arc<dyn RunningHop>, HopError> {
+        if params.peer_endpoints.is_empty() {
+            return Err(HopError::new(
+                HopErrorKind::Config,
+                Some(hop_id),
+                "wireguard hop has no peer endpoint (endpoint resolved to no addresses)"
+                    .to_string(),
+            ));
+        }
+        let budget = attempt_budget(total, params.peer_endpoints.len());
+        let mut failures: Vec<String> = Vec::with_capacity(params.peer_endpoints.len());
+        for endpoint in &params.peer_endpoints {
+            // The outer timeout also bounds the carrier dial and socket bind,
+            // so a hung attempt cannot starve the remaining addresses.
+            match tokio::time::timeout(
+                budget,
+                Self::bring_up_one(&hop_id, &params, *endpoint, carrier.clone(), budget),
+            )
+            .await
+            {
+                Ok(Ok(hop)) => return Ok(hop),
+                Ok(Err(e)) if e.kind == HopErrorKind::Config => return Err(e),
+                Ok(Err(e)) => failures.push(format!("{endpoint}: {}", e.message)),
+                Err(_) => {
+                    failures.push(format!("{endpoint}: handshake timed out after {budget:?}"))
+                }
+            }
+        }
+        Err(HopError::new(
+            HopErrorKind::Transport,
+            Some(hop_id),
+            format!(
+                "wireguard handshake failed on every resolved endpoint ({})",
+                failures.join("; ")
+            ),
+        ))
+    }
+
+    async fn bring_up_one(
+        hop_id: &str,
+        params: &WgParams,
+        endpoint: SocketAddr,
+        carrier: Arc<dyn Dialer>,
+        handshake_budget: Duration,
     ) -> Result<Arc<dyn RunningHop>, HopError> {
         let local_private = boringtun::x25519::StaticSecret::from(params.private_key);
         let peer_public = boringtun::x25519::PublicKey::from(params.peer_public_key);
@@ -318,7 +391,7 @@ impl WireguardHop {
             tunnel.set_awg_params(Some(a.to_wire())).map_err(|e| {
                 HopError::new(
                     HopErrorKind::Config,
-                    Some(hop_id.clone()),
+                    Some(hop_id.to_string()),
                     format!("AmneziaWG parameters rejected: {e:?}"),
                 )
             })?;
@@ -328,15 +401,15 @@ impl WireguardHop {
         // framing-unaware far end the nested handshake fails closed below.
         let direct = carrier.nested_mtu().is_none();
         let udp: Arc<dyn PacketSock> = if !direct {
-            let flow = carrier.dial_udp(params.peer_endpoint).await.map_err(|e| {
+            let flow = carrier.dial_udp(endpoint).await.map_err(|e| {
                 HopError::transport(
-                    hop_id.clone(),
+                    hop_id.to_string(),
                     format!("nested uplink via carrier: {}", e.message),
                 )
             })?;
             Arc::new(FlowSock { flow })
         } else {
-            let bind: SocketAddr = unspecified_bind(&params.peer_endpoint);
+            let bind: SocketAddr = unspecified_bind(&endpoint);
             Arc::new(OsSock {
                 socket: Arc::new(
                     tokio::net::UdpSocket::bind(bind)
@@ -353,7 +426,7 @@ impl WireguardHop {
             if let Some(n) = &params.noize {
                 send_junk(
                     &udp,
-                    params.peer_endpoint,
+                    endpoint,
                     n.junk_before as usize,
                     n.junk_min,
                     n.junk_max,
@@ -362,7 +435,7 @@ impl WireguardHop {
             }
             if let Some(a) = &params.awg {
                 for packet in awg::handshake_preamble(a) {
-                    udp.send_to(&packet, params.peer_endpoint).await.ok();
+                    udp.send_to(&packet, endpoint).await.ok();
                 }
             }
         }
@@ -373,11 +446,11 @@ impl WireguardHop {
         let streams = Arc::new(stream::StreamTable::new_with_side(
             stream::StreamSide::Initiator,
         ));
-        streams.observe(hop_id.clone(), events.clone());
+        streams.observe(hop_id.to_string(), events.clone());
         let inner = Arc::new(HopInner {
             tunnel: Mutex::new(tunnel),
             udp,
-            peer: std::sync::RwLock::new(params.peer_endpoint),
+            peer: std::sync::RwLock::new(endpoint),
             streams,
             tx,
         });
@@ -392,7 +465,7 @@ impl WireguardHop {
             })
         };
         if let Some(packet) = init {
-            inner.udp.send_to(&packet, params.peer_endpoint).await.ok();
+            inner.udp.send_to(&packet, endpoint).await.ok();
         }
         // The handshake is now `InitSent`; from here the pump's
         // `update_timers` tick owns retransmission (boringtun REKEY_TIMEOUT
@@ -402,7 +475,7 @@ impl WireguardHop {
 
         let pump_inner = Arc::downgrade(&inner);
         let pump_events = events.clone();
-        let pump_id = hop_id.clone();
+        let pump_id = hop_id.to_string();
         let pump = tokio::spawn(async move {
             pump_loop(pump_inner, tx_rx, pump_events, pump_id).await;
         });
@@ -423,10 +496,11 @@ impl WireguardHop {
         // actually retransmitted (finding 1a); forcing a retransmit here
         // instead (via `format_handshake_initiation(force_resend)`) would
         // also reset `time_sent` per attempt and race the pump's rekey
-        // driver. 15 s exceeds boringtun's REKEY_ATTEMPT_TIME (90 s is not
-        // reached; the engine's own dial timeout fires first) — this local
+        // driver. The budget is this endpoint's share of the total
+        // ([`HANDSHAKE_BUDGET`] divided by the address count, floor-bounded);
+        // the engine's own dial timeout remains the outer bound. This local
         // timeout is just the fail-closed backstop.
-        let ok = tokio::time::timeout(Duration::from_secs(15), async {
+        let ok = tokio::time::timeout(handshake_budget, async {
             loop {
                 let established = {
                     let tunnel = inner.tunnel.lock().unwrap();
@@ -443,20 +517,17 @@ impl WireguardHop {
         if !ok {
             drop(pump_guard);
             return Err(HopError::transport(
-                hop_id,
-                format!(
-                    "wireguard handshake to {} timed out (unreachable transport)",
-                    params.peer_endpoint
-                ),
+                hop_id.to_string(),
+                format!("wireguard handshake to {endpoint} timed out (unreachable transport)"),
             ));
         }
 
         let _ = events.send(HopEvent::Started {
-            hop_id: hop_id.clone(),
+            hop_id: hop_id.to_string(),
         });
         pump_guard.forget();
         Ok(Arc::new(WireguardHop {
-            hop_id,
+            hop_id: hop_id.to_string(),
             inner,
             events,
             pump: PumpGuard {
@@ -950,13 +1021,35 @@ mod tests {
 
     fn params() -> WgParams {
         WgParams {
-            peer_endpoint: "127.0.0.1:1".parse().unwrap(),
+            peer_endpoints: vec!["127.0.0.1:1".parse().expect("static literal")],
             private_key: [7u8; 32],
             peer_public_key: [9u8; 32],
             preshared_key: None,
             keepalive: None,
             awg: None,
             noize: None,
+        }
+    }
+
+    struct DirectCarrier;
+
+    #[async_trait::async_trait]
+    impl Dialer for DirectCarrier {
+        async fn dial_tcp(&self, _dst: SocketAddr) -> Result<Box<dyn ByteStream>, HopError> {
+            Err(HopError::transport("test-carrier", "no uplink"))
+        }
+
+        async fn dial_udp(&self, _dst: SocketAddr) -> Result<Box<dyn UdpFlow>, HopError> {
+            Err(HopError::transport("test-carrier", "no uplink"))
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                accepts_tcp_carrier: true,
+                accepts_udp_carrier: true,
+                dials_tcp: true,
+                dials_udp: true,
+            }
         }
     }
 
@@ -1125,6 +1218,93 @@ mod tests {
             err.hop_id.as_deref(),
             Some("wg-nested-0"),
             "names hop: {err}"
+        );
+    }
+
+    /// Finding 2: every resolved address is an attempt, so a dead first
+    /// address (platform-ordered) cannot kill a hop whose second address is
+    /// live. Pre-fix `WgParams` carried one address, so the handshake could
+    /// never reach the responder behind an unreachable first address.
+    #[tokio::test]
+    async fn handshake_fails_over_to_the_next_resolved_endpoint() {
+        let (resp_secret, resp_public) = crate::test_support::generate_keypair();
+        let (cli_secret, cli_public) = crate::test_support::generate_keypair();
+        let responder = crate::test_support::WgResponder::spawn(
+            "127.0.0.1".parse().expect("static literal"),
+            resp_secret,
+            cli_public,
+        )
+        .await
+        .expect("responder");
+        // Bind-then-drop leaves a loopback UDP port with no listener: the
+        // first attempt can only time out.
+        let dead = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind")
+            .local_addr()
+            .expect("local addr");
+        let params = WgParams {
+            peer_endpoints: vec![dead, responder.addr],
+            private_key: cli_secret,
+            peer_public_key: resp_public,
+            preshared_key: None,
+            keepalive: None,
+            awg: None,
+            noize: None,
+        };
+        let hop = WireguardHop::bring_up_within(
+            "wg-failover-0".into(),
+            params,
+            Arc::new(DirectCarrier),
+            Duration::from_millis(600),
+        )
+        .await
+        .expect("the live second endpoint handshakes");
+        assert_eq!(hop.health(), HopHealth::Healthy);
+        hop.stop().await.expect("clean stop");
+    }
+
+    /// The aggregate names every attempted address: a timeout on the first
+    /// address must not be replaced by (or hide behind) the last failure.
+    #[tokio::test]
+    async fn every_endpoint_failure_is_aggregated() {
+        let local = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let local_addr = local.local_addr().expect("local addr");
+        let params = WgParams {
+            peer_endpoints: vec![local_addr, local_addr],
+            private_key: [7u8; 32],
+            peer_public_key: [9u8; 32],
+            preshared_key: None,
+            keepalive: None,
+            awg: None,
+            noize: None,
+        };
+        let err = match WireguardHop::bring_up_within(
+            "wg-agg-0".into(),
+            params,
+            Arc::new(DirectCarrier),
+            Duration::from_millis(300),
+        )
+        .await
+        {
+            Ok(_) => panic!("no responder on the bound socket"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind, HopErrorKind::Transport, "{err}");
+        assert!(
+            err.message.contains("every resolved endpoint"),
+            "aggregate marker: {err}"
+        );
+        assert_eq!(
+            err.message.matches("timed out").count(),
+            2,
+            "one timeout per attempted address: {err}"
+        );
+        assert!(
+            err.message.matches(&local_addr.to_string()).count() >= 2,
+            "every attempt names its address: {err}"
         );
     }
 

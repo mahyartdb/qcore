@@ -9,6 +9,11 @@
 use crate::WgParams;
 use qcore_transport_api::HopConfig;
 use std::net::SocketAddr;
+use std::time::Duration;
+
+/// Timeout for the DNS resolution of a hostname endpoint (fails closed; same
+/// policy as transport-masque's `ENDPOINT_RESOLVE_TIMEOUT`).
+const ENDPOINT_RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Parse `xx:xx:...:xx` hex into 32 bytes.
 pub fn parse_key_hex(s: &str) -> Result<[u8; 32], String> {
@@ -23,17 +28,71 @@ pub fn parse_key_hex(s: &str) -> Result<[u8; 32], String> {
     Ok(out)
 }
 
-/// Resolve `host:port` where host is an IP literal, `[v6]`, or DNS name.
-/// IP literals parse synchronously; names go through the async resolver with
-/// family filtering (dual keeps resolver order). Standard `.conf` files
-/// routinely carry hostnames — failing them at build with `bad endpoint`
-/// after import accepted them was late and confusing.
-pub async fn resolve_endpoint(hostport: &str, family: &str) -> Result<SocketAddr, String> {
+/// Endpoint address family policy (`family=dual|ipv4|ipv6`). Unknown values
+/// fail closed naming the field: a typo (`v4`, `IPv6`, `any`) must not be
+/// silently treated as `dual` — that silently connects over the stack the
+/// operator ruled out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Family {
+    Dual,
+    Ipv4,
+    Ipv6,
+}
+
+impl Family {
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        match raw {
+            "dual" => Ok(Family::Dual),
+            "ipv4" => Ok(Family::Ipv4),
+            "ipv6" => Ok(Family::Ipv6),
+            other => Err(format!("bad `family` value `{other}` (dual|ipv4|ipv6)")),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Family::Dual => "dual",
+            Family::Ipv4 => "ipv4",
+            Family::Ipv6 => "ipv6",
+        }
+    }
+
+    fn accepts(self, addr: &SocketAddr) -> bool {
+        match self {
+            Family::Dual => true,
+            Family::Ipv4 => addr.is_ipv4(),
+            Family::Ipv6 => addr.is_ipv6(),
+        }
+    }
+}
+
+/// Resolve `host:port` where host is an IP literal, `[v6]`, or DNS name into
+/// **every** address the name has (a literal is a one-element list). Callers
+/// try the addresses in order: "localhost" resolves to both `::1` and
+/// `127.0.0.1` and which one comes first is platform-ordered, so returning
+/// only the first silently broke one stack (masque fixed the same bug).
+/// `family` filters resolved addresses; a filter that leaves nothing fails
+/// closed naming the field. IP literals parse synchronously (their family is
+/// the operator's explicit choice); names go through the async resolver with
+/// a bounded timeout. Standard `.conf` files routinely carry hostnames —
+/// failing them at build with `bad endpoint` after import accepted them was
+/// late and confusing.
+pub async fn resolve_endpoint(hostport: &str, family: Family) -> Result<Vec<SocketAddr>, String> {
     if let Ok(addr) = hostport.parse::<SocketAddr>() {
         if addr.port() == 0 {
             return Err("bad endpoint: port `0` is not connectable".to_string());
         }
-        return Ok(addr);
+        // The literal arm returns before any filtering: explicit `ipv4` with
+        // a v6 literal (or the reverse) must fail closed naming the field,
+        // not silently connect over the stack the operator ruled out.
+        if !family.accepts(&addr) {
+            return Err(format!(
+                "bad endpoint: no {} address for `{hostport}` (family={})",
+                family.as_str(),
+                family.as_str()
+            ));
+        }
+        return Ok(vec![addr]);
     }
     // Bracketed v6 that failed to parse above is malformed, not a name.
     if hostport.starts_with('[') {
@@ -53,23 +112,44 @@ pub async fn resolve_endpoint(hostport: &str, family: &str) -> Result<SocketAddr
     if port == 0 {
         return Err("bad endpoint: port `0` is not connectable".to_string());
     }
-    let mut addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
-        .await
-        .map_err(|e| format!("bad endpoint: resolve `{host}`: {e}"))?
-        .collect();
-    match family {
-        "ipv4" => addrs.retain(|a| a.is_ipv4()),
-        "ipv6" => addrs.retain(|a| a.is_ipv6()),
-        _ => {}
+    let mut addrs = bounded_lookup(host, ENDPOINT_RESOLVE_TIMEOUT, async {
+        tokio::net::lookup_host((host, port))
+            .await
+            .map(|addrs| addrs.collect::<Vec<SocketAddr>>())
+    })
+    .await?;
+    addrs.retain(|a| family.accepts(a));
+    if addrs.is_empty() {
+        return Err(format!(
+            "bad endpoint: no {} address for `{host}` (family={})",
+            family.as_str(),
+            family.as_str()
+        ));
     }
-    addrs
-        .into_iter()
-        .next()
-        .ok_or_else(|| format!("bad endpoint: no {family} address for `{host}`"))
+    Ok(addrs)
 }
 
-/// Resolve factory fields into peer parameters.
-pub fn resolve(cfg: &HopConfig) -> Result<WgParams, String> {
+/// Resolve through `lookup`, bounded by `budget`. A resolver that never
+/// answers must fail closed with the field-named error rather than park the
+/// build forever (the seam also makes the guard testable: the system resolver
+/// cannot be made to hang on demand).
+async fn bounded_lookup<F>(
+    host: &str,
+    budget: Duration,
+    lookup: F,
+) -> Result<Vec<SocketAddr>, String>
+where
+    F: std::future::Future<Output = std::io::Result<Vec<SocketAddr>>>,
+{
+    let lookup = tokio::time::timeout(budget, lookup)
+        .await
+        .map_err(|_| format!("bad endpoint: resolve `{host}` timed out"))?;
+    lookup.map_err(|e| format!("bad endpoint: resolve `{host}`: {e}"))
+}
+
+/// Resolve factory fields into peer parameters. Async because a hostname
+/// `endpoint` goes through the resolver here; literals never await.
+pub async fn resolve(cfg: &HopConfig) -> Result<WgParams, String> {
     let peer = cfg.get("peer").unwrap_or("warp");
     match peer {
         "warp" | "imported" | "awg" => {
@@ -82,7 +162,7 @@ pub fn resolve(cfg: &HopConfig) -> Result<WgParams, String> {
                     ));
                 }
             }
-            resolve_fields(cfg, peer)
+            resolve_fields(cfg, peer).await
         }
         other => Err(format!(
             "unknown wireguard peer mode `{other}` (warp|imported|awg)"
@@ -90,7 +170,7 @@ pub fn resolve(cfg: &HopConfig) -> Result<WgParams, String> {
     }
 }
 
-fn resolve_fields(cfg: &HopConfig, peer: &str) -> Result<WgParams, String> {
+async fn resolve_fields(cfg: &HopConfig, peer: &str) -> Result<WgParams, String> {
     let has_import = cfg
         .get("import")
         .or_else(|| cfg.get("import_ref"))
@@ -113,17 +193,13 @@ fn resolve_fields(cfg: &HopConfig, peer: &str) -> Result<WgParams, String> {
     if peer == "awg" && cfg.get("awg_params").is_none() && cfg.get("import").is_none() {
         // Loopback/tests may pass raw keys; real AWG peers need params (US5).
     }
-    let endpoint: SocketAddr = cfg
+    let family = Family::parse(cfg.get("family").unwrap_or("dual"))?;
+    let endpoint = cfg
         .get("endpoint")
-        .ok_or_else(|| "wireguard hop requires endpoint=<ip:port>".to_string())?
-        .parse()
-        .map_err(|e: std::net::AddrParseError| format!("bad endpoint: {e}"))?;
-    // Same gate as `resolve_endpoint` (finding 7): the literal path
-    // previously accepted port 0 while the hostname path rejected it.
-    // Fail closed naming the field.
-    if endpoint.port() == 0 {
-        return Err("bad endpoint: `endpoint` port `0` is not connectable".to_string());
-    }
+        .ok_or_else(|| "wireguard hop requires endpoint=<ip:port>".to_string())?;
+    // Resolves every address the name has (a literal is a one-element list)
+    // and rejects port 0 and family mismatches naming the field.
+    let peer_endpoints = resolve_endpoint(endpoint, family).await?;
     let private_key = cfg
         .get("private_key")
         .ok_or_else(|| {
@@ -153,7 +229,7 @@ fn resolve_fields(cfg: &HopConfig, peer: &str) -> Result<WgParams, String> {
     let noize = qcore_transport_api::obfuscate::NoizeParams::try_from_fields(&cfg.fields)
         .map_err(|e| format!("wireguard hop: {e}"))?;
     Ok(WgParams {
-        peer_endpoint: endpoint,
+        peer_endpoints,
         private_key,
         peer_public_key,
         preshared_key,
@@ -191,31 +267,31 @@ mod tests {
         ]
     }
 
-    #[test]
-    fn awg_fields_forbidden_on_plain_modes() {
+    #[tokio::test]
+    async fn awg_fields_forbidden_on_plain_modes() {
         for peer in ["warp", "imported"] {
             let owned = keys();
             let mut pairs = vec![("peer", peer), ("import", "x"), ("awg_jc", "6")];
             pairs.extend(owned.iter().map(|(k, v)| (*k, v.as_str())));
-            let err = resolve(&cfg(&pairs)).expect_err("FR-021");
+            let err = resolve(&cfg(&pairs)).await.expect_err("FR-021");
             assert!(err.contains("awg_jc"), "names field: {err}");
             assert!(err.contains("peer=awg"), "names remedy: {err}");
         }
     }
 
-    #[test]
-    fn imported_requires_ref() {
+    #[tokio::test]
+    async fn imported_requires_ref() {
         let owned = keys();
         let pairs: Vec<(&str, &str)> = owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
         // Default peer is warp; force imported without ref.
         let mut v = vec![("peer", "imported")];
         v.extend(pairs);
-        let err = resolve(&cfg(&v)).expect_err("import required");
+        let err = resolve(&cfg(&v)).await.expect_err("import required");
         assert!(err.contains("import=<ref>"), "{err}");
     }
 
-    #[test]
-    fn imported_with_material_resolves() {
+    #[tokio::test]
+    async fn imported_with_material_resolves() {
         let k = "ab".repeat(32);
         let p = resolve(&cfg(&[
             ("peer", "imported"),
@@ -224,12 +300,13 @@ mod tests {
             ("private_key", &k),
             ("peer_public_key", &k),
         ]))
+        .await
         .expect("material resolves");
         assert!(p.awg.is_none());
     }
 
-    #[test]
-    fn awg_carries_params() {
+    #[tokio::test]
+    async fn awg_carries_params() {
         let k = "ab".repeat(32);
         let p = resolve(&cfg(&[
             ("peer", "awg"),
@@ -240,13 +317,14 @@ mod tests {
             ("awg_jc", "6"),
             ("awg_h1", "123"),
         ]))
+        .await
         .expect("awg resolves");
         let a = p.awg.expect("params carried");
         assert_eq!((a.jc, a.h1), (6, 123));
     }
 
-    #[test]
-    fn bad_awg_value_names_field() {
+    #[tokio::test]
+    async fn bad_awg_value_names_field() {
         let k = "ab".repeat(32);
         let err = resolve(&cfg(&[
             ("peer", "awg"),
@@ -255,12 +333,13 @@ mod tests {
             ("peer_public_key", &k),
             ("awg_jc", "many"),
         ]))
+        .await
         .expect_err("bad awg value");
         assert!(err.contains("awg_jc"), "{err}");
     }
 
-    #[test]
-    fn bad_keepalive_names_field() {
+    #[tokio::test]
+    async fn bad_keepalive_names_field() {
         let k = "ab".repeat(32);
         let err = resolve(&cfg(&[
             ("endpoint", "127.0.0.1:51820"),
@@ -268,16 +347,20 @@ mod tests {
             ("peer_public_key", &k),
             ("keepalive", "abc"),
         ]))
+        .await
         .expect_err("bad keepalive");
         assert!(err.contains("invalid keepalive"), "{err}");
-        assert!(
-            !err.contains("invalid digit found in string") || err.contains("invalid keepalive"),
-            "cause rides the field-named message: {err}"
-        );
+        // The contract: the message STARTS WITH the field-named prefix and a
+        // cause follows it — the field name deliberately precedes the raw
+        // parse error, so grep-for-field wins over the raw cause text.
+        let cause = err
+            .strip_prefix("invalid keepalive: ")
+            .expect("field-named prefix must lead the message");
+        assert!(!cause.is_empty(), "cause rides after the field name: {err}");
     }
 
-    #[test]
-    fn bad_preshared_key_names_field() {
+    #[tokio::test]
+    async fn bad_preshared_key_names_field() {
         let k = "ab".repeat(32);
         let err = resolve(&cfg(&[
             ("endpoint", "127.0.0.1:51820"),
@@ -285,48 +368,98 @@ mod tests {
             ("peer_public_key", &k),
             ("preshared_key", "zz"),
         ]))
+        .await
         .expect_err("bad preshared_key");
         assert!(err.contains("invalid preshared_key"), "{err}");
     }
 
-    #[test]
-    fn literal_endpoint_port_zero_rejected_naming_field() {
-        // Finding 7: resolve_fields parses the endpoint as a literal,
-        // bypassing resolve_endpoint's port-0 gate. Both paths must reject
-        // identically, naming the field.
+    #[tokio::test]
+    async fn literal_endpoint_port_zero_rejected_naming_field() {
+        // Both the literal and hostname paths share `resolve_endpoint`'s
+        // port gate now; the literal arm used to accept port 0.
         let k = "ab".repeat(32);
         let err = resolve(&cfg(&[
             ("endpoint", "127.0.0.1:0"),
             ("private_key", &k),
             ("peer_public_key", &k),
         ]))
+        .await
         .expect_err("port-0 literal endpoint must fail closed");
         assert!(err.contains("endpoint"), "names the field: {err}");
         assert!(err.contains("port `0`"), "names the port: {err}");
+    }
+
+    /// Finding 5: `family` is honoured on every endpoint path, including the
+    /// literal one where no resolver filter runs. An unknown value must not
+    /// silently behave as `dual`.
+    #[tokio::test]
+    async fn unknown_family_fails_closed_on_the_literal_path() {
+        let k = "ab".repeat(32);
+        let err = resolve(&cfg(&[
+            ("endpoint", "127.0.0.1:51820"),
+            ("family", "v4"),
+            ("private_key", &k),
+            ("peer_public_key", &k),
+        ]))
+        .await
+        .expect_err("family=`v4` must not behave as dual");
+        assert!(err.contains("family"), "names the field: {err}");
     }
 
     #[tokio::test]
     async fn endpoint_hostnames_resolve() {
         // `localhost` exercises the resolver path offline (hosts file, no
         // DNS); literals never touch the resolver.
-        let lit = resolve_endpoint("127.0.0.1:51820", "dual")
+        let lit = resolve_endpoint("127.0.0.1:51820", Family::Dual)
             .await
             .expect("literal");
-        assert_eq!(lit, "127.0.0.1:51820".parse().unwrap());
-        let via_dns = resolve_endpoint("localhost:51820", "dual")
+        assert_eq!(lit, vec!["127.0.0.1:51820".parse().unwrap()]);
+        let via_dns = resolve_endpoint("localhost:51820", Family::Dual)
             .await
             .expect("localhost");
-        assert!(via_dns.ip().is_loopback(), "{via_dns}");
-        assert!(resolve_endpoint("no-such-host.invalid:51820", "dual")
+        assert!(!via_dns.is_empty(), "localhost has an address");
+        assert!(via_dns.iter().all(|a| a.ip().is_loopback()), "{via_dns:?}");
+        assert!(resolve_endpoint("no-such-host.invalid:51820", Family::Dual)
             .await
             .is_err());
         assert!(
-            resolve_endpoint("::1", "dual").await.is_err(),
+            resolve_endpoint("::1", Family::Dual).await.is_err(),
             "unbracketed v6"
         );
         assert!(
-            resolve_endpoint("1.2.3.4:0", "dual").await.is_err(),
+            resolve_endpoint("1.2.3.4:0", Family::Dual).await.is_err(),
             "port 0"
         );
+        // Family filtering applies to literals too: an explicit stack that
+        // contradicts the literal fails closed instead of connecting anyway.
+        let err = resolve_endpoint("127.0.0.1:51820", Family::Ipv6)
+            .await
+            .expect_err("v4 literal under family=ipv6");
+        assert!(err.contains("family=ipv6"), "names value: {err}");
+        let err = resolve_endpoint("[::1]:51820", Family::Ipv4)
+            .await
+            .expect_err("v6 literal under family=ipv4");
+        assert!(err.contains("family=ipv4"), "names value: {err}");
+    }
+
+    /// Finding 6: pre-fix `lookup_host` had no timeout, so a resolver that
+    /// never answers parked the build forever. The system resolver cannot be
+    /// made to hang on demand, so the guard is exercised through the same
+    /// seam the production path uses; the outer timeout keeps a regression
+    /// failing fast instead of hanging the suite.
+    #[tokio::test]
+    async fn stalled_dns_lookup_times_out_instead_of_parking_the_build() {
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            bounded_lookup(
+                "stalled.invalid",
+                Duration::from_millis(20),
+                std::future::pending(),
+            ),
+        )
+        .await
+        .expect("the resolver guard must return, not park the build");
+        let err = result.expect_err("a resolver that never answers must fail closed");
+        assert!(err.contains("resolve `stalled.invalid` timed out"), "{err}");
     }
 }

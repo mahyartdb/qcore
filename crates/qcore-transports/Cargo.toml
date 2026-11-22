@@ -14,7 +14,7 @@ psiphon = ["dep:transport-psiphon"]
 mock = ["dep:transport-mock"]
 
 [dependencies]
-transport-wireguard = { version = "0.1.0", package = "qcore-transport-wireguard", path = "transport-wireguard", optional = true }
+transport-wireguard = { version = "0.2.0", package = "qcore-transport-wireguard", path = "transport-wireguard", optional = true }
 transport-masque = { version = "0.1.0", package = "qcore-transport-masque", path = "transport-masque", optional = true }
 transport-relay = { version = "0.1.0", package = "qcore-transport-relay", path = "transport-relay", optional = true }
 transport-tor = { version = "0.1.0", package = "qcore-transport-tor", path = "transport-tor", optional = true }

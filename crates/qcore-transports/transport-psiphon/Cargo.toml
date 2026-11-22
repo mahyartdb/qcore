@@ -15,7 +15,7 @@ tokio = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
-qcore-core = { version = "0.3.0", path = "../../qcore-core" }
+qcore-core = { version = "0.4.0", path = "../../qcore-core" }
 qcore-transports = { version = "0.1.0", path = ".." }
 transport-mock = { version = "0.1.0", package = "qcore-transport-mock", path = "../transport-mock" }
 tokio = { workspace = true }

@@ -6,8 +6,9 @@
 //!   every 15 s so NATed idle paths do not die under green health.
 //! - `alpn=h2`: HTTP/2 over TCP (h2 crate, prior knowledge); egress rides
 //!   per-dial POST streams, datagrams length-prefixed on a dedicated stream.
-//!   H2 sends are flow-window-bounded (`reserve_capacity` then
-//!   `poll_capacity`) so a fast writer cannot buffer unboundedly inside h2.
+//!   H2 sends (streams and datagrams alike) are flow-window-bounded
+//!   (`reserve_capacity` then `poll_capacity`) so a fast writer cannot
+//!   buffer unboundedly inside h2.
 //!
 //! Loopback-verified against [`test_support`] responders (real QUIC/TLS and
 //! HTTP/2 framing). Full MASQUE CONNECT-UDP proxy interop against third-party
@@ -59,71 +60,302 @@ impl qcore_transport_api::HopFactory for MasqueFactory {
         carrier: Arc<dyn Dialer>,
     ) -> Result<Arc<dyn RunningHop>, HopError> {
         let hop_id = cfg.get("hop_id").unwrap_or("masque-0").to_string();
-        let alpn = cfg.get("alpn").unwrap_or("h3");
+        let alpn = match cfg.get("alpn").unwrap_or("h3") {
+            "h3" => Alpn::H3,
+            "h2" => Alpn::H2,
+            other => {
+                return Err(HopError::new(
+                    HopErrorKind::Config,
+                    Some(hop_id),
+                    format!("unknown masque alpn `{other}` (h3|h2)"),
+                ));
+            }
+        };
+        let family = Family::parse(cfg.get("family").unwrap_or("dual"), &hop_id)?;
+        // The H2 arm is plain TCP with no TLS layer: `server_name` and a
+        // `insecure_skip_verify=true` are h3-only knobs, and honoring them on
+        // h2 would validate then silently drop a security-affecting flag.
+        // Reject before the resolve: a statically impossible config must not
+        // pay for (or depend on) a DNS lookup. `false` is a documented no-op
+        // on h2 — there is no verification to skip.
+        if alpn == Alpn::H2 {
+            if cfg.get("server_name").is_some() {
+                return Err(HopError::new(
+                    HopErrorKind::Config,
+                    Some(hop_id),
+                    "`server_name` requires alpn=h3 (alpn=h2 has no TLS layer)".to_string(),
+                ));
+            }
+            if cfg.get("insecure_skip_verify") == Some("true") {
+                return Err(HopError::new(
+                    HopErrorKind::Config,
+                    Some(hop_id),
+                    "`insecure_skip_verify=true` requires alpn=h3 (alpn=h2 has no TLS layer)"
+                        .to_string(),
+                ));
+            }
+        }
         // `build` is async, so hostnames resolve here (same policy as
         // transport-wireguard's `resolve_endpoint`): IP literals parse
         // synchronously, names go through `lookup_host` with a timeout, and
         // every failure is a Config error naming the field — never a chain
         // that cannot run.
-        let endpoints = resolve_endpoint(hop_id.clone(), cfg.get("endpoint")).await?;
-        let insecure = cfg.get("insecure_skip_verify") == Some("true");
+        let endpoint = resolve_endpoint(&hop_id, cfg.get("endpoint"), family).await?;
+        let server_name = resolve_server_name(&hop_id, cfg.get("server_name"), &endpoint.host)?;
+        // Strict at the transport boundary too: the factory compares against
+        // the canonical spelling, so anything else must fail closed naming the
+        // field instead of silently reading as "not true".
+        let insecure = match cfg.get("insecure_skip_verify") {
+            None | Some("false") => false,
+            Some("true") => true,
+            Some(other) => {
+                return Err(HopError::new(
+                    HopErrorKind::Config,
+                    Some(hop_id),
+                    format!("bad `insecure_skip_verify` `{other}` (true|false)"),
+                ));
+            }
+        };
         let fragment = obfuscate::fragment_size(&cfg)?;
         // Try each resolved address in order; the first successful bring-up
         // wins. Dual-stack names (`localhost` → `::1` + `127.0.0.1`) are
         // platform-ordered, so one address must not be picked upfront — that
         // silently broke IPv4-only peers on linux (the CI dry-run failure).
-        let mut last: Option<HopError> = None;
-        for endpoint in endpoints {
-            let result = match alpn {
-                "h3" => {
-                    MasqueHop::bring_up_h3(hop_id.clone(), endpoint, insecure, carrier.clone())
-                        .await
+        // One overall [`BUILD_BUDGET`] deadline caps the whole loop: a
+        // per-address floor may exceed the total for a long address list, and
+        // without the cap the engine's connection budget cancels mid-attempt,
+        // losing the aggregated cause.
+        let overall_deadline = tokio::time::Instant::now() + BUILD_BUDGET;
+        let budget = attempt_budget(BUILD_BUDGET, endpoint.addrs.len());
+        try_endpoints(
+            &hop_id,
+            alpn.as_str(),
+            endpoint.addrs,
+            overall_deadline,
+            budget,
+            |addr, deadline| {
+                let hop_id = hop_id.clone();
+                let carrier = carrier.clone();
+                let server_name = server_name.clone();
+                async move {
+                    match alpn {
+                        Alpn::H3 => {
+                            MasqueHop::bring_up_h3(
+                                hop_id,
+                                addr,
+                                &server_name,
+                                insecure,
+                                carrier,
+                                deadline,
+                            )
+                            .await
+                        }
+                        Alpn::H2 => {
+                            MasqueHop::bring_up_h2(hop_id, addr, carrier, fragment, deadline).await
+                        }
+                    }
                 }
-                "h2" => {
-                    MasqueHop::bring_up_h2(hop_id.clone(), endpoint, carrier.clone(), fragment)
-                        .await
-                }
-                other => {
-                    return Err(HopError::new(
-                        HopErrorKind::Config,
-                        Some(hop_id),
-                        format!("unknown masque alpn `{other}` (h3|h2)"),
-                    ));
-                }
-            };
-            match result {
-                Ok(hop) => return Ok(hop),
-                Err(e) => last = Some(e),
-            }
+            },
+        )
+        .await
+    }
+}
+
+/// Try each resolved address in order until one brings up a hop. The loop
+/// shares one [`BUILD_BUDGET`] deadline: an attempt gets
+/// `min(its share, time remaining)`, and once the overall budget is spent the
+/// remaining addresses are not attempted (letting the engine cancel mid-way
+/// would lose the aggregate). Every attempted address's failure is kept in
+/// the returned error.
+async fn try_endpoints<F, Fut>(
+    hop_id: &str,
+    alpn: &'static str,
+    addrs: Vec<SocketAddr>,
+    overall_deadline: tokio::time::Instant,
+    budget: std::time::Duration,
+    mut attempt: F,
+) -> Result<Arc<dyn RunningHop>, HopError>
+where
+    F: FnMut(SocketAddr, tokio::time::Instant) -> Fut,
+    Fut: std::future::Future<Output = Result<Arc<dyn RunningHop>, HopError>>,
+{
+    let total = addrs.len();
+    let mut failures: Vec<String> = Vec::new();
+    let mut attempted = 0usize;
+    for addr in addrs {
+        let Some(deadline) =
+            attempt_deadline(tokio::time::Instant::now(), budget, overall_deadline)
+        else {
+            break;
+        };
+        attempted += 1;
+        match attempt(addr, deadline).await {
+            Ok(hop) => return Ok(hop),
+            Err(e) => failures.push(format!("{addr}: {}", e.message)),
         }
-        Err(last.unwrap_or_else(|| {
-            HopError::new(
+    }
+    let detail = if attempted == total {
+        format!("every resolved endpoint ({})", failures.join("; "))
+    } else {
+        format!(
+            "{attempted} of {total} resolved endpoints before the build budget expired ({}); the rest were not attempted",
+            failures.join("; ")
+        )
+    };
+    Err(HopError::new(
+        HopErrorKind::Transport,
+        Some(hop_id.to_string()),
+        format!("masque {alpn} bring-up failed on {detail}"),
+    ))
+}
+
+/// Per-attempt deadline: the attempt's share of the build window, capped by
+/// the overall deadline. `None` means the overall budget is spent — stop
+/// trying addresses instead of letting the engine cancel mid-attempt.
+fn attempt_deadline(
+    now: tokio::time::Instant,
+    budget: std::time::Duration,
+    overall: tokio::time::Instant,
+) -> Option<tokio::time::Instant> {
+    if now >= overall {
+        None
+    } else {
+        Some((now + budget).min(overall))
+    }
+}
+
+/// QUIC/TCP bring-up protocol, resolved from the `alpn` field.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Alpn {
+    H3,
+    H2,
+}
+
+impl Alpn {
+    fn as_str(self) -> &'static str {
+        match self {
+            Alpn::H3 => "h3",
+            Alpn::H2 => "h2",
+        }
+    }
+}
+
+/// Total bring-up budget for one hop build, divided across the resolved
+/// endpoint addresses (the engine's 30 s connection budget is the outer
+/// bound).
+const BUILD_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Floor for one endpoint attempt's share of [`BUILD_BUDGET`]: a dual-stack
+/// name must still leave a blackholed address enough time to be told apart
+/// from a slow handshake.
+const MIN_ATTEMPT_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Divide `total` across `endpoints` attempts, floor-bounded by
+/// [`MIN_ATTEMPT_BUDGET`] (a min-bound may exceed `total` for very long
+/// address lists, which is the documented trade: never give an attempt an
+/// unusably short window).
+fn attempt_budget(total: std::time::Duration, endpoints: usize) -> std::time::Duration {
+    let n = u32::try_from(endpoints.max(1)).unwrap_or(u32::MAX);
+    (total / n).max(MIN_ATTEMPT_BUDGET)
+}
+
+/// Endpoint address family policy (`family=dual|ipv4|ipv6`). The core parse
+/// gate rejects unknown values too; this is the transport boundary, so it
+/// fails closed naming the field instead of silently treating a typo as
+/// `dual`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Family {
+    Dual,
+    Ipv4,
+    Ipv6,
+}
+
+impl Family {
+    fn parse(raw: &str, hop_id: &str) -> Result<Self, HopError> {
+        match raw {
+            "dual" => Ok(Family::Dual),
+            "ipv4" => Ok(Family::Ipv4),
+            "ipv6" => Ok(Family::Ipv6),
+            other => Err(HopError::new(
                 HopErrorKind::Config,
-                Some(hop_id),
-                "endpoint resolved to no addresses".to_string(),
-            )
-        }))
+                Some(hop_id.to_string()),
+                format!("unknown `family` value `{other}` (dual|ipv4|ipv6)"),
+            )),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Family::Dual => "dual",
+            Family::Ipv4 => "ipv4",
+            Family::Ipv6 => "ipv6",
+        }
+    }
+
+    fn accepts(self, addr: &SocketAddr) -> bool {
+        match self {
+            Family::Dual => true,
+            Family::Ipv4 => addr.is_ipv4(),
+            Family::Ipv6 => addr.is_ipv6(),
+        }
     }
 }
 
 /// Timeout for the DNS resolution of a hostname `endpoint` (fails closed).
 const ENDPOINT_RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// A resolved `endpoint`: every address to try, plus the host as written
+/// (the default TLS server name for `alpn=h3` — a hostname endpoint must not
+/// present an IP as SNI, and an IP literal must present the IP, never the
+/// hardcoded `localhost` the pre-fix code sent against every real server).
+#[derive(Debug)]
+struct ResolvedEndpoint {
+    addrs: Vec<SocketAddr>,
+    host: String,
+}
+
 /// Resolve `endpoint=<ip:port|host:port>` into every address the name has
 /// (a literal is a one-element list). Callers try the addresses in order —
 /// "localhost" resolves to both `::1` and `127.0.0.1` and which one comes
 /// first is platform-ordered, so a single-address pick silently breaks
-/// dual-stack peers (the linux CI failure). Fails closed with a Config
-/// error naming the field, like `transport-wireguard::modes::resolve_endpoint`.
-async fn resolve_endpoint(hop_id: String, raw: Option<&str>) -> Result<Vec<SocketAddr>, HopError> {
-    let config_err = |msg: String| HopError::new(HopErrorKind::Config, Some(hop_id.clone()), msg);
+/// dual-stack peers (the linux CI failure). `family` filters resolved
+/// addresses like `transport-wireguard::modes::resolve_endpoint`; a filter
+/// that leaves nothing fails closed naming the field. Fails closed with a
+/// Config error naming the field.
+async fn resolve_endpoint(
+    hop_id: &str,
+    raw: Option<&str>,
+    family: Family,
+) -> Result<ResolvedEndpoint, HopError> {
+    let config_err =
+        |msg: String| HopError::new(HopErrorKind::Config, Some(hop_id.to_string()), msg);
     let Some(s) = raw else {
         return Err(config_err(
             "masque hop requires endpoint=<ip:port>".to_string(),
         ));
     };
     if let Ok(addr) = s.parse::<SocketAddr>() {
-        return Ok(vec![addr]);
+        // The hostname arm has always rejected port 0; the literal arm
+        // accepted it (finding 4). One gate for both.
+        if addr.port() == 0 {
+            return Err(config_err(
+                "bad endpoint: port `0` is not connectable".to_string(),
+            ));
+        }
+        // The literal arm returns before the resolver filter: an explicit
+        // `family` that contradicts the literal must fail closed, not
+        // silently connect over the stack the operator ruled out.
+        if !family.accepts(&addr) {
+            return Err(config_err(format!(
+                "bad endpoint: no {} address for `{s}` (family={})",
+                family.as_str(),
+                family.as_str()
+            )));
+        }
+        return Ok(ResolvedEndpoint {
+            host: addr.ip().to_string(),
+            addrs: vec![addr],
+        });
     }
     // Bracketed v6 that failed to parse above is malformed, not a name.
     if s.starts_with('[') {
@@ -152,13 +384,43 @@ async fn resolve_endpoint(hop_id: String, raw: Option<&str>) -> Result<Vec<Socke
     )
     .await
     .map_err(|_| config_err(format!("bad endpoint: resolve `{host}` timed out")))?;
-    let resolved: Vec<SocketAddr> = lookup
+    let mut addrs: Vec<SocketAddr> = lookup
         .map_err(|e| config_err(format!("bad endpoint: resolve `{host}`: {e}")))?
         .collect();
-    if resolved.is_empty() {
-        return Err(config_err(format!("bad endpoint: no address for `{host}`")));
+    addrs.retain(|a| family.accepts(a));
+    if addrs.is_empty() {
+        return Err(config_err(format!(
+            "bad endpoint: no {} address for `{host}` (family={})",
+            family.as_str(),
+            family.as_str()
+        )));
     }
-    Ok(resolved)
+    Ok(ResolvedEndpoint {
+        addrs,
+        host: host.to_string(),
+    })
+}
+
+/// TLS server name for `alpn=h3`: the explicit `server_name` when set,
+/// otherwise the endpoint host as written. Validated at the boundary so a
+/// malformed name is a Config error naming the field, not a handshake
+/// failure deep inside rustls.
+fn resolve_server_name(
+    hop_id: &str,
+    explicit: Option<&str>,
+    endpoint_host: &str,
+) -> Result<String, HopError> {
+    let Some(name) = explicit else {
+        return Ok(endpoint_host.to_string());
+    };
+    rustls::pki_types::ServerName::try_from(name).map_err(|e| {
+        HopError::new(
+            HopErrorKind::Config,
+            Some(hop_id.to_string()),
+            format!("bad `server_name` `{name}`: {e}"),
+        )
+    })?;
+    Ok(name.to_string())
 }
 
 enum Conn {
@@ -198,8 +460,10 @@ impl MasqueHop {
     async fn bring_up_h3(
         hop_id: String,
         endpoint: SocketAddr,
+        server_name: &str,
         insecure: bool,
         carrier: Arc<dyn Dialer>,
+        deadline: tokio::time::Instant,
     ) -> Result<Arc<dyn RunningHop>, HopError> {
         let mut endpoint_builder = quinn::Endpoint::client(unspecified_bind(&endpoint))
             .map_err(|e| HopError::transport(hop_id.clone(), format!("quinn bind: {e}")))?;
@@ -208,11 +472,11 @@ impl MasqueHop {
             .local_addr()
             .map_err(|e| HopError::transport(hop_id.clone(), format!("quinn local: {e}")))?;
         let connecting = endpoint_builder
-            .connect(endpoint, "localhost")
+            .connect(endpoint, server_name)
             .map_err(|e| {
                 HopError::transport(hop_id.clone(), format!("masque QUIC connect: {e}"))
             })?;
-        let conn = tokio::time::timeout(std::time::Duration::from_secs(15), connecting)
+        let conn = tokio::time::timeout_at(deadline, connecting)
             .await
             .map_err(|_| {
                 HopError::transport(
@@ -247,6 +511,7 @@ impl MasqueHop {
         endpoint: SocketAddr,
         carrier: Arc<dyn Dialer>,
         fragment: Option<usize>,
+        deadline: tokio::time::Instant,
     ) -> Result<Arc<dyn RunningHop>, HopError> {
         // Nested uplink (T058): an encapsulated carrier drives H2 over a
         // carrier TCP stream; a direct carrier keeps the OS TCP socket.
@@ -255,39 +520,36 @@ impl MasqueHop {
         // The bring-up sender is dropped: per-dial H2 egress opens a fresh
         // connection (see H2DialerRef); the driver task keeps the conn alive.
         let (_, task, local) = if nested {
-            let stream = tokio::time::timeout(
-                std::time::Duration::from_secs(15),
-                carrier.dial_tcp(endpoint),
-            )
-            .await
-            .map_err(|_| {
-                HopError::transport(
-                    hop_id.clone(),
-                    format!("nested uplink via carrier: masque H2 connect to {endpoint} timed out"),
-                )
-            })?
-            .map_err(|e| {
-                HopError::transport(
-                    hop_id.clone(),
-                    format!("nested uplink via carrier: {}", e.message),
-                )
-            })?;
-            let (sender, conn) = tokio::time::timeout(
-                std::time::Duration::from_secs(15),
-                h2::client::handshake(stream),
-            )
-            .await
-            .map_err(|_| {
-                HopError::transport(
-                    hop_id.clone(),
-                    format!(
-                        "nested uplink via carrier: masque H2 handshake to {endpoint} timed out"
-                    ),
-                )
-            })?
-            .map_err(|e| {
-                HopError::transport(hop_id.clone(), format!("masque H2 handshake: {e}"))
-            })?;
+            let stream = tokio::time::timeout_at(deadline, carrier.dial_tcp(endpoint))
+                .await
+                .map_err(|_| {
+                    HopError::transport(
+                        hop_id.clone(),
+                        format!(
+                            "nested uplink via carrier: masque H2 connect to {endpoint} timed out"
+                        ),
+                    )
+                })?
+                .map_err(|e| {
+                    HopError::transport(
+                        hop_id.clone(),
+                        format!("nested uplink via carrier: {}", e.message),
+                    )
+                })?;
+            let (sender, conn) =
+                tokio::time::timeout_at(deadline, h2::client::handshake(stream))
+                    .await
+                    .map_err(|_| {
+                        HopError::transport(
+                            hop_id.clone(),
+                            format!(
+                                "nested uplink via carrier: masque H2 handshake to {endpoint} timed out"
+                            ),
+                        )
+                    })?
+                    .map_err(|e| {
+                        HopError::transport(hop_id.clone(), format!("masque H2 handshake: {e}"))
+                    })?;
             let task = tokio::spawn(async move {
                 let mut conn = conn;
                 let _ = (&mut conn).await;
@@ -295,35 +557,33 @@ impl MasqueHop {
             let local: SocketAddr = unspecified_bind(&endpoint);
             (sender, task, local)
         } else {
-            let tcp = tokio::time::timeout(
-                std::time::Duration::from_secs(15),
-                tokio::net::TcpStream::connect(endpoint),
-            )
-            .await
-            .map_err(|_| {
-                HopError::transport(
-                    hop_id.clone(),
-                    format!("masque H2 connect to {endpoint} timed out (unreachable transport)"),
-                )
-            })?
-            .map_err(|e| HopError::transport(hop_id.clone(), format!("masque H2 TCP: {e}")))?;
+            let tcp = tokio::time::timeout_at(deadline, tokio::net::TcpStream::connect(endpoint))
+                .await
+                .map_err(|_| {
+                    HopError::transport(
+                        hop_id.clone(),
+                        format!(
+                            "masque H2 connect to {endpoint} timed out (unreachable transport)"
+                        ),
+                    )
+                })?
+                .map_err(|e| HopError::transport(hop_id.clone(), format!("masque H2 TCP: {e}")))?;
             let local = tcp
                 .local_addr()
                 .map_err(|e| HopError::transport(hop_id.clone(), format!("h2 local: {e}")))?;
-            let (sender, conn) = tokio::time::timeout(
-                std::time::Duration::from_secs(15),
-                h2::client::handshake(tcp),
-            )
-            .await
-            .map_err(|_| {
-                HopError::transport(
-                    hop_id.clone(),
-                    format!("masque H2 handshake to {endpoint} timed out (unreachable transport)"),
-                )
-            })?
-            .map_err(|e| {
-                HopError::transport(hop_id.clone(), format!("masque H2 handshake: {e}"))
-            })?;
+            let (sender, conn) = tokio::time::timeout_at(deadline, h2::client::handshake(tcp))
+                .await
+                .map_err(|_| {
+                    HopError::transport(
+                        hop_id.clone(),
+                        format!(
+                            "masque H2 handshake to {endpoint} timed out (unreachable transport)"
+                        ),
+                    )
+                })?
+                .map_err(|e| {
+                    HopError::transport(hop_id.clone(), format!("masque H2 handshake: {e}"))
+                })?;
             let task = tokio::spawn(async move {
                 let mut conn = conn;
                 let _ = (&mut conn).await;
@@ -1049,6 +1309,53 @@ fn push_pending(pending: &mut Vec<u8>, data: &[u8], hop_id: &str) -> Result<(), 
     Ok(())
 }
 
+/// Window-bounded H2 datagram send: reserve capacity for the next chunk,
+/// await the assignment, then hand h2 no more than that assignment — the
+/// same reserve→poll→send pairing as `H2Stream::poll_write`. `send_data`
+/// without a reservation buffers the frame unboundedly inside h2 while the
+/// window is closed (h2's own docs say so), so `send_to` returned `Ok` and
+/// the WireGuard pump's wedge timeout never saw a wedged peer. A frame may
+/// span several DATA frames — `recv_from` reassembles from the
+/// length-prefixed byte stream — so each piece is capped by the assigned
+/// window instead of the whole frame being buffered.
+async fn send_frame_bounded(
+    send: &mut h2::SendStream<Bytes>,
+    frame: &[u8],
+    hop_id: &str,
+) -> Result<(), HopError> {
+    /// Largest chunk per iteration: one h2 max DATA frame.
+    const CHUNK: usize = 16384;
+    let mut off = 0;
+    while off < frame.len() {
+        let want = (frame.len() - off).min(CHUNK);
+        // Reserve FIRST: capacity is only assigned in response to a
+        // reservation, so polling without reserving parks forever.
+        send.reserve_capacity(want);
+        let assigned = match std::future::poll_fn(|cx| send.poll_capacity(cx)).await {
+            Some(Ok(c)) => c,
+            Some(Err(e)) => {
+                send.reserve_capacity(0);
+                return Err(HopError::transport(hop_id, format!("datagram send: {e}")));
+            }
+            // `None`: the stream is no longer streaming (closed/reset).
+            None => {
+                send.reserve_capacity(0);
+                return Err(HopError::transport(hop_id, "datagram stream closed"));
+            }
+        };
+        // Never exceed the assignment: h2 decrements the reservation as data
+        // is sent, so a larger send would over-buffer (the bug this fixes).
+        let n = want.min(assigned);
+        send.send_data(Bytes::copy_from_slice(&frame[off..off + n]), false)
+            .map_err(|e| {
+                send.reserve_capacity(0);
+                HopError::transport(hop_id, format!("datagram send: {e}"))
+            })?;
+        off += n;
+    }
+    Ok(())
+}
+
 #[async_trait::async_trait]
 impl UdpFlow for H2Dgrams {
     async fn send_to(&self, buf: &[u8], dst: SocketAddr) -> Result<(), HopError> {
@@ -1062,12 +1369,10 @@ impl UdpFlow for H2Dgrams {
         let mut frame = Vec::with_capacity(4 + buf.len());
         frame.extend_from_slice(&(buf.len() as u32).to_be_bytes());
         frame.extend_from_slice(buf);
-        self.send
-            .lock()
-            .await
-            .send_data(Bytes::from(frame), false)
-            .map_err(|e| HopError::transport(self.hop_id.clone(), e.to_string()))?;
-        Ok(())
+        // `UdpFlow::send_to` is async, so the window wait is awaited here
+        // rather than handed to h2's unbounded internal buffer.
+        let mut send = self.send.lock().await;
+        send_frame_bounded(&mut send, &frame, &self.hop_id).await
     }
 
     async fn recv_from(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr), HopError> {
@@ -1457,14 +1762,208 @@ mod tests {
         );
     }
 
+    /// Finding 4: the hostname arm always rejected port 0; the literal arm
+    /// accepted it and only failed later inside connect. One gate now.
+    #[tokio::test]
+    async fn literal_endpoint_port_zero_fails_closed() {
+        let mut cfg = HopConfig::new("masque");
+        cfg.fields.insert("hop_id".into(), "masque-p0-0".into());
+        cfg.fields.insert("alpn".into(), "h2".into());
+        cfg.fields.insert("endpoint".into(), "127.0.0.1:0".into());
+        let err = match MasqueFactory.build(cfg, Arc::new(RefusingCarrier)).await {
+            Ok(_) => panic!("literal port 0 must fail closed"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind, HopErrorKind::Config, "Config, not connect: {err}");
+        assert!(err.message.contains("endpoint"), "names field: {err}");
+        assert!(err.message.contains("port `0`"), "names port: {err}");
+    }
+
+    // --- Finding 5: family is honoured at the transport boundary ---
+
+    #[test]
+    fn family_filter_selects_one_family() {
+        let v4: SocketAddr = "127.0.0.1:443".parse().expect("static literal");
+        let v6: SocketAddr = "[::1]:443".parse().expect("static literal");
+        assert!(Family::Dual.accepts(&v4) && Family::Dual.accepts(&v6));
+        assert!(Family::Ipv4.accepts(&v4) && !Family::Ipv4.accepts(&v6));
+        assert!(Family::Ipv6.accepts(&v6) && !Family::Ipv6.accepts(&v4));
+    }
+
+    #[test]
+    fn unknown_family_is_a_config_error_naming_the_field() {
+        let err = Family::parse("v4", "masque-fam-0").expect_err("unknown family");
+        assert_eq!(err.kind, HopErrorKind::Config);
+        assert!(err.message.contains("family"), "names field: {err}");
+        assert!(err.message.contains("v4"), "names value: {err}");
+    }
+
+    /// Family filtering applies to literals too: the literal arm returns
+    /// before the resolver filter, so `family=ipv6` with an IPv4 literal used
+    /// to connect over IPv4 anyway.
+    #[tokio::test]
+    async fn literal_endpoint_family_mismatch_fails_closed() {
+        let err = resolve_endpoint("masque-fam-lit-0", Some("127.0.0.1:443"), Family::Ipv6)
+            .await
+            .expect_err("v4 literal under family=ipv6");
+        assert_eq!(err.kind, HopErrorKind::Config);
+        assert!(err.message.contains("family=ipv6"), "names value: {err}");
+    }
+
+    /// `family=ipv6` must filter the resolved IPv4 address out instead of
+    /// silently falling back to it: the responder listens on 127.0.0.1 only,
+    /// so pre-fix (family ignored) the build connected anyway.
+    #[tokio::test]
+    async fn family_ipv6_never_falls_back_to_the_ipv4_responder() {
+        let responder =
+            test_support::H2Responder::spawn("127.0.0.1".parse().expect("static literal"))
+                .await
+                .expect("h2 responder");
+        let endpoint = format!("localhost:{}", responder.addr.port());
+
+        let mut cfg = HopConfig::new("masque");
+        cfg.fields.insert("hop_id".into(), "masque-v4-0".into());
+        cfg.fields.insert("alpn".into(), "h2".into());
+        cfg.fields.insert("endpoint".into(), endpoint.clone());
+        cfg.fields.insert("family".into(), "ipv4".into());
+        let hop = MasqueFactory
+            .build(cfg, Arc::new(DirectCarrier))
+            .await
+            .expect("family=ipv4 keeps the ipv4 address");
+        hop.stop().await.expect("clean stop");
+
+        let mut cfg = HopConfig::new("masque");
+        cfg.fields.insert("hop_id".into(), "masque-v6-0".into());
+        cfg.fields.insert("alpn".into(), "h2".into());
+        cfg.fields.insert("endpoint".into(), endpoint);
+        cfg.fields.insert("family".into(), "ipv6".into());
+        let err = match MasqueFactory.build(cfg, Arc::new(DirectCarrier)).await {
+            Ok(_) => panic!("family=ipv6 must not reach the ipv4 responder"),
+            Err(e) => e,
+        };
+        assert!(
+            !err.message.contains("127.0.0.1"),
+            "the filtered ipv4 address must never be attempted: {err}"
+        );
+    }
+
+    // --- Finding 3: per-address budget + aggregated failures ---
+
+    #[test]
+    fn build_budget_is_divided_and_floor_bounded() {
+        assert_eq!(attempt_budget(BUILD_BUDGET, 1), BUILD_BUDGET);
+        assert_eq!(
+            attempt_budget(BUILD_BUDGET, 2),
+            std::time::Duration::from_secs(15)
+        );
+        // A name with many addresses may exceed the total (floor-bounded by
+        // design), but one attempt never gets the whole build window.
+        assert_eq!(attempt_budget(BUILD_BUDGET, 100), MIN_ATTEMPT_BUDGET);
+        assert!(
+            attempt_budget(BUILD_BUDGET, 2) < BUILD_BUDGET,
+            "fallback addresses share the window"
+        );
+    }
+
+    /// Every per-address failure must survive into the final error — pre-fix
+    /// only the last attempt's message was reported, hiding the cause that
+    /// mattered (usually the first, platform-ordered address).
+    #[tokio::test]
+    async fn endpoint_failures_are_aggregated_not_last_only() {
+        let resolved = resolve_endpoint("masque-agg-0", Some("localhost:1"), Family::Dual)
+            .await
+            .expect("localhost resolves offline");
+        assert!(!resolved.addrs.is_empty(), "localhost has an address");
+        let mut cfg = HopConfig::new("masque");
+        cfg.fields.insert("hop_id".into(), "masque-agg-0".into());
+        cfg.fields.insert("alpn".into(), "h2".into());
+        cfg.fields.insert("endpoint".into(), "localhost:1".into());
+        let build = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            MasqueFactory.build(cfg, Arc::new(DirectCarrier)),
+        )
+        .await
+        .expect("closed loopback ports refuse fast");
+        let err = match build {
+            Ok(_) => panic!("nothing listens on localhost:1"),
+            Err(e) => e,
+        };
+        assert!(
+            err.message.contains("every resolved endpoint"),
+            "aggregate marker: {err}"
+        );
+        for addr in &resolved.addrs {
+            assert!(
+                err.message.contains(&addr.to_string()),
+                "keeps the failure for {addr}: {err}"
+            );
+        }
+    }
+
+    /// The per-address floor (5 s) exceeds the total budget for a long
+    /// address list, so the loop needs one overall deadline: attempts stop
+    /// once it is spent and the error aggregates only what was attempted.
+    #[tokio::test]
+    async fn build_budget_caps_the_whole_attempt_loop() {
+        let addrs: Vec<SocketAddr> = (1..=8)
+            .map(|i| {
+                format!("127.0.0.1:{i}")
+                    .parse()
+                    .expect("static loopback literal")
+            })
+            .collect();
+        let overall = tokio::time::Instant::now() + std::time::Duration::from_millis(100);
+        let started = tokio::time::Instant::now();
+        let err = match try_endpoints(
+            "masque-budget-0",
+            "h2",
+            addrs,
+            overall,
+            std::time::Duration::from_secs(5),
+            |addr, deadline| async move {
+                // Burn the whole attempt window, as a blackholed address does.
+                tokio::time::sleep_until(deadline).await;
+                Err(HopError::transport(
+                    "masque-budget-0",
+                    format!("blackholed {addr}"),
+                ))
+            },
+        )
+        .await
+        {
+            Ok(_) => panic!("nothing succeeds"),
+            Err(e) => e,
+        };
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "loop must stop at the overall deadline, took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            err.message.contains("1 of 8 resolved endpoints"),
+            "stops after the attempted address: {err}"
+        );
+        assert!(
+            err.message.contains("127.0.0.1:1"),
+            "aggregates the attempted address: {err}"
+        );
+        assert!(
+            !err.message.contains("127.0.0.1:2"),
+            "never claims an unattempted address: {err}"
+        );
+    }
+
     // --- Fix 4: h2 writes are flow-window bounded (reserve THEN poll) ---
 
-    /// An H2Stream paired with a real h2 server peer whose window the test
-    /// controls: the server never releases inbound capacity, so a bounded
-    /// writer must stop making progress instead of buffering forever.
-    /// Returns the stream and the server connection (the test owns the
-    /// server task's abort handle to reap it with the test).
-    async fn h2_stream_pair() -> (H2Stream, tokio::task::AbortHandle) {
+    /// Real h2 pair whose server peer keeps a 1-byte stream window and never
+    /// polls the request body, so it never releases inbound capacity. Returns
+    /// the client send/recv halves plus the server driver's abort handle (the
+    /// test owns it so the connection is reaped with the test).
+    async fn h2_stalled_pair() -> (
+        h2::SendStream<Bytes>,
+        h2::RecvStream,
+        tokio::task::AbortHandle,
+    ) {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let client_task = tokio::spawn(async move {
             let (sender, conn) = h2::client::handshake(client_io)
@@ -1511,14 +2010,21 @@ mod tests {
         // The driver must run before awaiting the response, or the queued
         // 200 HEADERS never reach the client and this await hangs forever.
         let client_recv = resp_fut.await.expect("response").into_body();
-        let stream = H2Stream {
-            send,
-            recv: client_recv,
-            fragment: None,
-            pending: Vec::new(),
-            driver: driver.abort_handle(),
-        };
-        (stream, driver.abort_handle())
+        (send, client_recv, driver.abort_handle())
+    }
+
+    async fn h2_stream_pair() -> (H2Stream, tokio::task::AbortHandle) {
+        let (send, recv, driver) = h2_stalled_pair().await;
+        (
+            H2Stream {
+                send,
+                recv,
+                fragment: None,
+                pending: Vec::new(),
+                driver: driver.clone(),
+            },
+            driver,
+        )
     }
 
     #[tokio::test]
@@ -1548,6 +2054,42 @@ mod tests {
         assert!(
             second.is_err(),
             "write past exhausted window must await capacity, not buffer"
+        );
+    }
+
+    /// `H2Dgrams::send_to` must obey the same window bound as `H2Stream`:
+    /// the datagram's whole length-prefixed frame pre-fix went into
+    /// `send_data` with no reservation, so h2 buffered it unboundedly and
+    /// `send_to` returned `Ok` on a peer that had granted one byte — the
+    /// WireGuard pump's wedge guard only sees a `send_to` that actually
+    /// waits. Post-fix the send stays parked until the window reopens.
+    #[tokio::test]
+    async fn h2_datagram_send_is_window_bounded_not_unbounded() {
+        let dst: SocketAddr = "127.0.0.1:9".parse().expect("static literal");
+        let (send, recv, driver) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), h2_stalled_pair())
+                .await
+                .expect("pair built");
+        let local: SocketAddr = "127.0.0.1:0".parse().expect("static literal");
+        let flow = H2Dgrams {
+            hop_id: "masque-h2-dg-0".into(),
+            send: tokio::sync::Mutex::new(send),
+            recv: tokio::sync::Mutex::new(recv),
+            pending: tokio::sync::Mutex::new(Vec::new()),
+            dst,
+            local,
+            driver,
+        };
+        // 12-byte frame (4-byte length prefix + 8-byte payload) against the
+        // server's 1-byte window.
+        let sent = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            flow.send_to(b"12345678", dst),
+        )
+        .await;
+        assert!(
+            sent.is_err(),
+            "send_to past a 1-byte window must await capacity, not buffer the frame"
         );
     }
 
@@ -1617,5 +2159,202 @@ mod tests {
                 local
             ),
         }
+    }
+
+    // --- Finding 7: the h3 TLS server name is the endpoint host / configured
+    //     `server_name`, never the hardcoded `localhost` ---
+
+    fn self_signed(subject: &str) -> (Vec<u8>, Vec<u8>) {
+        let key = rcgen::generate_simple_self_signed(vec![subject.to_string()])
+            .expect("self-signed cert");
+        (key.cert.der().to_vec(), key.signing_key.serialize_der())
+    }
+
+    /// The pre-fix connect hardcoded `localhost` as the TLS server name, so
+    /// against a real server (whose certificate/SNI gate names its own host)
+    /// verified TLS could not succeed. The explicit `server_name` wins; the
+    /// default is the endpoint host, which for an IP literal means no SNI at
+    /// all (RFC 6066) — never the old hardcoded `localhost`.
+    #[tokio::test]
+    async fn h3_server_name_reaches_the_wire() {
+        let (cert_der, key_der) = self_signed("masque.test");
+        let responder = test_support::QuinnResponder::spawn_requiring_sni(
+            "127.0.0.1".parse().expect("static literal"),
+            cert_der.clone(),
+            key_der.clone(),
+            "masque.test",
+        )
+        .await
+        .expect("sni-gated responder");
+
+        // Explicit override wins over the literal endpoint's IP.
+        let mut cfg = HopConfig::new("masque");
+        cfg.fields.insert("hop_id".into(), "masque-sni-0".into());
+        cfg.fields.insert("alpn".into(), "h3".into());
+        cfg.fields
+            .insert("endpoint".into(), responder.addr.to_string());
+        cfg.fields
+            .insert("insecure_skip_verify".into(), "true".into());
+        cfg.fields
+            .insert("server_name".into(), "masque.test".into());
+        let hop = MasqueFactory
+            .build(cfg, Arc::new(DirectCarrier))
+            .await
+            .expect("server_name reaches the peer as SNI");
+        assert_eq!(hop.health(), HopHealth::Healthy);
+        hop.stop().await.expect("clean stop");
+
+        // Omitted: the endpoint host is the default server name. An IP
+        // literal is a name too (`ServerName::IpAddress`), and rustls sends
+        // no SNI for it — a gate that requires SNI to be absent is what tells
+        // this apart from the old `localhost`.
+        let no_sni = test_support::QuinnResponder::spawn_requiring_no_sni(
+            "127.0.0.1".parse().expect("static literal"),
+            cert_der,
+            key_der,
+        )
+        .await
+        .expect("no-sni-gated responder");
+        let mut cfg = HopConfig::new("masque");
+        cfg.fields.insert("hop_id".into(), "masque-sni-1".into());
+        cfg.fields.insert("alpn".into(), "h3".into());
+        cfg.fields
+            .insert("endpoint".into(), no_sni.addr.to_string());
+        cfg.fields
+            .insert("insecure_skip_verify".into(), "true".into());
+        let hop = MasqueFactory
+            .build(cfg, Arc::new(DirectCarrier))
+            .await
+            .expect("an IP endpoint default sends no SNI, not `localhost`");
+        assert_eq!(hop.health(), HopHealth::Healthy);
+        hop.stop().await.expect("clean stop");
+    }
+
+    #[tokio::test]
+    async fn malformed_server_name_fails_closed_naming_the_field() {
+        let mut cfg = HopConfig::new("masque");
+        cfg.fields.insert("hop_id".into(), "masque-sni-2".into());
+        cfg.fields.insert("alpn".into(), "h3".into());
+        cfg.fields.insert("endpoint".into(), "127.0.0.1:443".into());
+        cfg.fields.insert("server_name".into(), "not a name".into());
+        let err = match MasqueFactory.build(cfg, Arc::new(RefusingCarrier)).await {
+            Ok(_) => panic!("malformed server_name must fail closed"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind, HopErrorKind::Config);
+        assert!(err.message.contains("server_name"), "names field: {err}");
+    }
+
+    // --- h2 has no TLS layer: server_name / insecure_skip_verify are
+    //     h3-only knobs and must fail closed on an h2 hop instead of
+    //     validating then silently doing nothing ---
+
+    #[tokio::test]
+    async fn h2_hop_rejects_server_name_naming_field_and_alpn() {
+        let mut cfg = HopConfig::new("masque");
+        cfg.fields.insert("hop_id".into(), "masque-h2-tls-0".into());
+        cfg.fields.insert("alpn".into(), "h2".into());
+        cfg.fields.insert("endpoint".into(), "127.0.0.1:443".into());
+        cfg.fields
+            .insert("server_name".into(), "masque.test".into());
+        let err = match MasqueFactory.build(cfg, Arc::new(RefusingCarrier)).await {
+            Ok(_) => panic!("server_name on alpn=h2 must fail closed"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind, HopErrorKind::Config);
+        assert!(err.message.contains("server_name"), "names field: {err}");
+        assert!(err.message.contains("alpn=h3"), "names remedy: {err}");
+    }
+
+    #[tokio::test]
+    async fn h2_hop_rejects_insecure_skip_verify_naming_field_and_alpn() {
+        let mut cfg = HopConfig::new("masque");
+        cfg.fields.insert("hop_id".into(), "masque-h2-tls-1".into());
+        cfg.fields.insert("alpn".into(), "h2".into());
+        cfg.fields.insert("endpoint".into(), "127.0.0.1:443".into());
+        cfg.fields
+            .insert("insecure_skip_verify".into(), "true".into());
+        let err = match MasqueFactory.build(cfg, Arc::new(RefusingCarrier)).await {
+            Ok(_) => panic!("insecure_skip_verify on alpn=h2 must fail closed"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind, HopErrorKind::Config);
+        assert!(
+            err.message.contains("insecure_skip_verify"),
+            "names field: {err}"
+        );
+        assert!(err.message.contains("alpn=h3"), "names remedy: {err}");
+    }
+
+    /// Only `true` is security-affecting on h2 (there is no TLS layer to
+    /// skip); `false` is a documented no-op and must build, not fail parse.
+    #[tokio::test]
+    async fn h2_hop_allows_insecure_skip_verify_false_as_noop() {
+        let responder =
+            test_support::H2Responder::spawn("127.0.0.1".parse().expect("static literal"))
+                .await
+                .expect("h2 responder");
+        let mut cfg = HopConfig::new("masque");
+        cfg.fields.insert("hop_id".into(), "masque-h2-tls-2".into());
+        cfg.fields.insert("alpn".into(), "h2".into());
+        cfg.fields
+            .insert("endpoint".into(), responder.addr.to_string());
+        cfg.fields
+            .insert("insecure_skip_verify".into(), "false".into());
+        let hop = MasqueFactory
+            .build(cfg, Arc::new(DirectCarrier))
+            .await
+            .expect("insecure_skip_verify=false is a no-op on h2");
+        assert_eq!(hop.health(), HopHealth::Healthy);
+        hop.stop().await.expect("clean stop");
+    }
+
+    /// The h2 TLS-knob rejection is statically decidable and must run before
+    /// the endpoint resolve: pre-fix a bogus hostname paid the DNS lookup
+    /// (up to the resolve timeout) before the Config error.
+    #[tokio::test]
+    async fn h2_rejects_tls_knobs_before_resolving_the_endpoint() {
+        let mut cfg = HopConfig::new("masque");
+        cfg.fields.insert("hop_id".into(), "masque-order-0".into());
+        cfg.fields.insert("alpn".into(), "h2".into());
+        cfg.fields
+            .insert("endpoint".into(), "bogus.invalid.example:443".into());
+        cfg.fields
+            .insert("server_name".into(), "masque.test".into());
+        let err = match tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            MasqueFactory.build(cfg, Arc::new(RefusingCarrier)),
+        )
+        .await
+        .expect("rejected before the DNS resolve")
+        {
+            Ok(_) => panic!("server_name on alpn=h2 must fail closed"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind, HopErrorKind::Config);
+        assert!(err.message.contains("server_name"), "names field: {err}");
+        assert!(
+            !err.message.contains("endpoint"),
+            "no resolve happened: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_insecure_skip_verify_fails_closed_naming_the_field() {
+        let mut cfg = HopConfig::new("masque");
+        cfg.fields.insert("hop_id".into(), "masque-sni-3".into());
+        cfg.fields.insert("alpn".into(), "h3".into());
+        cfg.fields.insert("endpoint".into(), "127.0.0.1:443".into());
+        cfg.fields
+            .insert("insecure_skip_verify".into(), "yes".into());
+        let err = match MasqueFactory.build(cfg, Arc::new(RefusingCarrier)).await {
+            Ok(_) => panic!("malformed insecure_skip_verify must fail closed"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind, HopErrorKind::Config);
+        assert!(
+            err.message.contains("insecure_skip_verify"),
+            "names field: {err}"
+        );
     }
 }

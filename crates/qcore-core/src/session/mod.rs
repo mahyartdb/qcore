@@ -264,6 +264,44 @@ pub struct SessionHandle {
     /// while held), and every consumer — engine reports, FFI, the CLI proxy
     /// serve loop — is sync or must not block on the runtime.
     pub(crate) started: Arc<std::sync::RwLock<Vec<StartedHop>>>,
+    /// Hops an in-flight rebuild has started but not installed yet, published
+    /// by [`lifecycle::bring_up_tracked`] as each one comes up. `stop_all`
+    /// sweeps this slot: a stop aborts the watchdog task (or wins its stop
+    /// select), which drops the rebuild future — dropping a future cannot
+    /// await `RunningHop::stop`, and `StartedHop::drop` only aborts watchers,
+    /// so without this slot the already-started hops keep live sockets.
+    pub(crate) pending_rebuild: Arc<PendingRebuild>,
+    /// Instances already stopped while rebuilding (by [`StartedHop::instance`]).
+    /// The degraded window keeps the stopped segment in the live vec until
+    /// the swap, and `stop()` is not an idempotent transport contract, so
+    /// `stop_all` consults this set to avoid stopping an instance twice.
+    /// Both teardown actors claim through it — the watchdog's unwind inserts
+    /// each instance right before stopping it, and `stop_all` does the same —
+    /// so whichever reaches an instance first owns it and the other skips.
+    /// Every entry names an instance some live structure still owns: the
+    /// watchdog inserts before its stop and the swap clears the set before
+    /// dropping the old vec, while hops whose owner drops earlier park their
+    /// `Arc`s in [`SessionHandle::retired`] — so a stale address can never
+    /// match a later allocation. A std lock: insert/contains/clear only,
+    /// never held across an await.
+    pub(crate) unwound: lifecycle::Claims,
+    /// `RunningHop` allocations kept alive solely because a claim in
+    /// [`SessionHandle::unwound`] still names their address. A claim is
+    /// cleared only with the structure that owns the hop; a hop whose owner
+    /// drops first (the bring-up error path's drained pending slot, the
+    /// vanished rebuild arm's segment) parks its `Arc` here instead, so the
+    /// set never names freed memory. Shared with the watchdog (and with the
+    /// detached teardown tasks it starts) so parking survives the watchdog
+    /// task being aborted. Cleared with the claims (swap / terminal), where
+    /// the set is dropped too. A std lock: push/clear only, never held
+    /// across an await.
+    pub(crate) retired: Retired,
+    /// Engine cleanup run on the watchdog's terminal (give-up) path. The
+    /// watchdog removes the live entry itself, so the engine cannot observe
+    /// that removal; this drops the per-session relay-counter entry filed by
+    /// session id (same rule as every other leave-live path). `None` for
+    /// bare/embedder handles.
+    pub(crate) give_up_cleanup: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Current egress (exit dialer + tunnel resolver), refreshed by the
     /// watchdog on rebuild so a CLI proxy that captured this handle serves
     /// new connections through the rebuilt exit without learning about
@@ -304,6 +342,69 @@ pub struct SessionHandle {
 pub struct LiveExit {
     pub dialer: Option<Arc<dyn Dialer>>,
     pub resolver: Option<Arc<crate::session::resolver::TunnelResolver>>,
+}
+
+/// See [`SessionHandle::retired`]. Shared with the watchdog so a detached
+/// teardown can park a hop after the watchdog task itself was aborted.
+pub(crate) type Retired = Arc<std::sync::Mutex<Vec<Arc<dyn qcore_transport_api::RunningHop>>>>;
+
+/// A hop a rebuild has started but not installed, in the pieces teardown
+/// needs. Deliberately not a `StartedHop`: that type aborts its watchers on
+/// drop, and discarding bookkeeping must never abort the watchers of a hop
+/// that went on to be installed. Dropping this record is inert.
+pub(crate) struct PendingHop {
+    hop: Arc<dyn qcore_transport_api::RunningHop>,
+    keepalive: Option<tokio::task::AbortHandle>,
+    forwarder: Option<tokio::task::AbortHandle>,
+}
+
+impl PendingHop {
+    pub(crate) fn from_started(s: &StartedHop) -> Self {
+        PendingHop {
+            hop: Arc::clone(&s.hop),
+            keepalive: s.keepalive.clone(),
+            forwarder: s.forwarder.clone(),
+        }
+    }
+
+    /// Same identity rule as [`StartedHop::instance`]: a rebuild reuses hop
+    /// ids, so teardown dedupes by allocation, never by id.
+    pub(crate) fn instance(&self) -> usize {
+        Arc::as_ptr(&self.hop) as *const () as usize
+    }
+}
+
+/// Hops a rebuild has started but not yet installed (or discarded). The
+/// rebuild future publishes each hop here as it comes up; because that
+/// future can be dropped at any await (stop abort / stop select), the slot is
+/// the only place `stop_all` can find those instances and call their
+/// `stop()`. A std lock: push/take are synchronous, never held across await.
+#[derive(Default)]
+pub(crate) struct PendingRebuild {
+    hops: std::sync::Mutex<Vec<PendingHop>>,
+}
+
+impl PendingRebuild {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<PendingHop>> {
+        self.hops
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub(crate) fn publish(&self, hop: &StartedHop) {
+        self.lock().push(PendingHop::from_started(hop));
+    }
+
+    /// Take the current hops (teardown); the slot is left empty.
+    pub(crate) fn take(&self) -> Vec<PendingHop> {
+        std::mem::take(&mut *self.lock())
+    }
+
+    /// Drop bookkeeping for hops whose ownership moved on (installed in the
+    /// live vec, or already unwound by the rebuild).
+    pub(crate) fn clear(&self) {
+        self.lock().clear();
+    }
 }
 
 /// Egress for a session whose hops are gone (watchdog give-up cleared the
@@ -407,6 +508,10 @@ impl SessionHandle {
             exit_hop_id: exit_hop_id.into(),
             chain,
             started: Arc::new(std::sync::RwLock::new(started)),
+            pending_rebuild: Arc::new(PendingRebuild::default()),
+            unwound: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            retired: Arc::new(std::sync::Mutex::new(Vec::new())),
+            give_up_cleanup: None,
             exit: Arc::new(std::sync::RwLock::new(LiveExit::default())),
             events,
             stop_signal: Arc::new(stop_tx),
@@ -443,6 +548,15 @@ impl SessionHandle {
     /// Sender half of the give-up signal (watchdog terminal path).
     pub(crate) fn give_up_sender(&self) -> Arc<tokio::sync::watch::Sender<bool>> {
         self.give_up_tx.clone()
+    }
+
+    /// Run the engine's give-up cleanup hook (relay-counter forget); no-op
+    /// for bare/embedder handles. The watchdog calls this after removing the
+    /// live entry it alone can observe.
+    pub(crate) fn run_give_up_cleanup(&self) {
+        if let Some(cleanup) = &self.give_up_cleanup {
+            cleanup();
+        }
     }
 
     /// A dialer that stays live across watchdog rebuilds (R1.1): every dial
@@ -548,11 +662,34 @@ impl SessionHandle {
     /// watchdog selects out of a rebuild promptly — a stop never waits out
     /// the reconnect budget — and the watchdog task itself aborts with the
     /// other watchers.
-    /// The CURRENT hop set is torn down (the shared vec: a rebuilt session
-    /// stops the rebuilt hops, not the pre-rebuild ones).
+    /// Each round's stops run in a spawned task this call joins: the claim→
+    /// stop pair is the non-cancellable core of the protocol (see below).
+    /// Teardown is instance-keyed, not id-keyed: a rebuild swaps in new
+    /// `RunningHop` allocations that reuse their hop ids, so identity decides
+    /// what was already stopped (see [`StartedHop::instance`]). Each round
+    /// re-reads BOTH sources — the live vec (a rebuild that completed
+    /// concurrently) and the pending-rebuild slot (hops a dropped rebuild
+    /// future started but never installed) — and the shared `unwound` set
+    /// (re-consulted EVERY round, so claims that land mid-teardown are
+    /// honored), until nothing uncovered is left. Each instance is claimed
+    /// (inserted into `unwound`) immediately before its stop, so a detached
+    /// unwind racing this sweep converges on exactly one stop per instance
+    /// — whichever actor claims first owns it, the other skips. The round
+    /// cap only bounds a producer that ignores its abort; the watchdog is
+    /// aborted before the first round, so anything past the second is
+    /// already pathological.
+    /// Each round's stops run in a spawned task this call joins: the claim→
+    /// stop pair is the non-cancellable core of the protocol. A stop dropped
+    /// mid-flight (the FFI stop budget's `tokio::time::timeout`, an embedder
+    /// cancelling the stop future) would leave the instance claimed in
+    /// `unwound` but never actually stopped — every later teardown skips it
+    /// forever. Spawning makes the abort land on the *joining* await instead,
+    /// and a dropped join still leaves the spawned loop running to
+    /// completion: every claim made here is always backed by a stop.
     /// Best effort like `unwind`: a failing exit hop must not abandon inner
     /// hops still running.
     pub async fn stop_all(&self) -> Result<(), qcore_transport_api::HopError> {
+        const SWEEP_ROUNDS: usize = 4;
         let mut first_err = None;
         // Signal + abort the watchdog and every per-hop watcher first, yield
         // so aborts land, then stop hops: same anti-race phasing as `unwind`.
@@ -560,41 +697,36 @@ impl SessionHandle {
         if let Some(wd) = &self.watchdog {
             wd.abort();
         }
-        // The CURRENT hop set (shared vec): a post-rebuild teardown stops
-        // the rebuilt hops, not the pre-rebuild ones (R1.2).
-        let started = self.started_hops();
-        let stopped_ids: std::collections::HashSet<String> =
-            started.iter().map(|s| s.hop_id.clone()).collect();
-        for s in started.iter() {
-            if let Some(keepalive) = &s.keepalive {
-                keepalive.abort();
+        let mut stopped: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for _ in 0..SWEEP_ROUNDS {
+            // Snapshot the vec and the unwound set under the vec's read lock:
+            // the swap writes both under its write guard, so this pair is
+            // always one generation (old vec + populated set, or new vec +
+            // cleared set) — never the old stopped segment with the set
+            // already cleared.
+            let (snapshot, unwound) = {
+                let started = self
+                    .started
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let unwound = self
+                    .unwound
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                (started.clone(), unwound)
+            };
+            let mut batch: Vec<PendingHop> =
+                snapshot.iter().map(PendingHop::from_started).collect();
+            batch.extend(self.pending_rebuild.take());
+            // The rebuild's unwind already stopped its segment but leaves it
+            // in the live vec until the swap: `stop()` is not idempotent, so
+            // skip the instances the watchdog reports as unwound.
+            batch.retain(|s| !stopped.contains(&s.instance()) && !unwound.contains(&s.instance()));
+            if batch.is_empty() {
+                break;
             }
-            if let Some(forwarder) = &s.forwarder {
-                forwarder.abort();
-            }
-        }
-        tokio::task::yield_now().await;
-        for s in started.iter().rev() {
-            if let Err(e) = s.hop.stop().await {
-                if first_err.is_none() {
-                    first_err = Some(e);
-                }
-            }
-        }
-        // Sweep the race window (S1.2): a rebuild completing between the
-        // snapshot above and teardown swaps a fresh segment into the shared
-        // vec — snapshot-only teardown would orphan it (live tunnels, no
-        // owner). Re-read the vec and stop anything the snapshot did not
-        // cover (matched by hop id; a same-id rebuild replaced hops the
-        // snapshot already stopped). Best effort like the main loop: the
-        // sweep never abandons remaining hops on an error.
-        let late = self.started_hops();
-        let late_uncovered: Vec<&crate::session::lifecycle::StartedHop> = late
-            .iter()
-            .filter(|s| !stopped_ids.contains(&s.hop_id))
-            .collect();
-        if !late_uncovered.is_empty() {
-            for s in late_uncovered.iter() {
+            for s in batch.iter() {
                 if let Some(keepalive) = &s.keepalive {
                     keepalive.abort();
                 }
@@ -603,11 +735,42 @@ impl SessionHandle {
                 }
             }
             tokio::task::yield_now().await;
-            for s in late_uncovered.into_iter().rev() {
-                if let Err(e) = s.hop.stop().await {
-                    if first_err.is_none() {
-                        first_err = Some(e);
+            // The stop loop (claim immediately before each stop, skip already
+            // claimed) runs detached: see this method's doc — a cancelled
+            // `stop_all` must never leave a claim without its stop behind it.
+            let claims = self.unwound.clone();
+            let sweeping = tokio::spawn(async move {
+                let mut errs: Vec<(usize, qcore_transport_api::HopError)> = Vec::new();
+                let mut done: Vec<usize> = Vec::new();
+                for s in batch.iter().rev() {
+                    let claimed = claims
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(s.instance());
+                    if !claimed {
+                        continue;
                     }
+                    if let Err(e) = s.hop.stop().await {
+                        errs.push((s.instance(), e));
+                    }
+                    done.push(s.instance());
+                }
+                (errs, done)
+            });
+            let (errs, done) = match sweeping.await {
+                Ok(pair) => pair,
+                // The spawned loop panicked inside a transport: its claims are
+                // moot for this process run, but nothing was left claimed-
+                // unstopped — the loop stops (or errors) each claim in order.
+                Err(join_err) => {
+                    eprintln!("qcore: stop sweep task failed: {join_err}");
+                    (Vec::new(), Vec::new())
+                }
+            };
+            stopped.extend(done);
+            for (_, e) in errs {
+                if first_err.is_none() {
+                    first_err = Some(e);
                 }
             }
         }

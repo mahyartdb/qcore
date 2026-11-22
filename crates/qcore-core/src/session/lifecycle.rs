@@ -53,6 +53,24 @@ pub struct StartedHop {
     pub(crate) forwarder: Option<tokio::task::AbortHandle>,
 }
 
+/// Shared set of hop instances whose single `stop()` some actor already owns,
+/// keyed by [`StartedHop::instance`]. `RunningHop::stop` is not an idempotent
+/// transport contract, so every teardown actor claims an instance (inserts it
+/// here) immediately before stopping it and skips one whose insert returns
+/// `false`: whoever claims first owns that stop. A std lock — insert/
+/// contains/clear only, never held across an await.
+pub type Claims = Arc<std::sync::Mutex<std::collections::HashSet<usize>>>;
+
+/// Poison-tolerant guard for a [`Claims`] set (same restore policy as the
+/// live session map).
+pub(crate) fn lock_claims(
+    claims: &Claims,
+) -> std::sync::MutexGuard<'_, std::collections::HashSet<usize>> {
+    claims
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Per-hop material merged into factory configs at bring-up (in memory
 /// only; chain > import > profile precedence, never persisted).
 pub struct BringUpMaterials<'a> {
@@ -106,17 +124,32 @@ pub struct DepthContext<'a> {
     /// Carrier label for the segment's first hop (`via` reporting; "root"
     /// for a fresh chain, the kept carrier hop's id for a rebuild).
     pub carrier_label: &'a str,
+    /// Instance-claim set the failure teardown claims through ([`unwind`]).
+    /// A fresh chain has no session handle yet and no competing teardown
+    /// actor, so it owns a private set ([`DepthContext::root`]); a watchdog
+    /// rebuild attaches the session's shared set so the rebuild's unwind and
+    /// a concurrent `stop_all` never both stop one instance
+    /// ([`DepthContext::with_claims`]).
+    pub claims: Claims,
 }
 
 impl<'a> DepthContext<'a> {
-    /// Fresh-chain context (depth 0, root carrier label).
+    /// Fresh-chain context (depth 0, root carrier label, private claim set).
     pub fn root(registry: &'a TransportRegistry, materials: BringUpMaterials<'a>) -> Self {
         DepthContext {
             registry,
             materials,
             depth_offset: 0,
             carrier_label: "root",
+            claims: Claims::default(),
         }
+    }
+
+    /// Attach a shared claim set (a rebuild passes the session's; see
+    /// [`DepthContext::claims`]).
+    pub fn with_claims(mut self, claims: Claims) -> Self {
+        self.claims = claims;
+        self
     }
 }
 
@@ -131,17 +164,43 @@ impl<'a> DepthContext<'a> {
 /// hop dials through.
 pub async fn bring_up(
     chain: &Chain,
-    mut carrier: Arc<dyn Dialer>,
+    carrier: Arc<dyn Dialer>,
     events: &tokio::sync::broadcast::Sender<HopEvent>,
     keepalive: &KeepalivePolicy,
     deadline: Instant,
     ctx: DepthContext<'_>,
 ) -> Result<Vec<StartedHop>, FailureReport> {
+    bring_up_tracked(
+        chain,
+        carrier,
+        events,
+        keepalive,
+        deadline,
+        ctx,
+        &|_: &StartedHop| {},
+    )
+    .await
+}
+
+/// [`bring_up`] with a publication sink: `publish` runs the moment each hop
+/// is started (before the next hop's build awaits), so an owner that can be
+/// dropped mid-chain — the watchdog's rebuild future, cancelled by a stop —
+/// still has a handle on every live hop. Cancellation cannot land between a
+/// build returning and its publish: no await separates them.
+pub(crate) async fn bring_up_tracked(
+    chain: &Chain,
+    mut carrier: Arc<dyn Dialer>,
+    events: &tokio::sync::broadcast::Sender<HopEvent>,
+    keepalive: &KeepalivePolicy,
+    deadline: Instant,
+    ctx: DepthContext<'_>,
+    publish: &(dyn Fn(&StartedHop) + Send + Sync),
+) -> Result<Vec<StartedHop>, FailureReport> {
     let registry = ctx.registry;
     let mut started: Vec<StartedHop> = Vec::new();
     for (depth, spec) in chain.hops.iter().enumerate() {
         if Instant::now() >= deadline {
-            unwind(&started).await;
+            unwind(started, ctx.claims.clone()).await;
             return Err(FailureReport::new(
                 FailureLayer::Chain,
                 spec.id.clone(),
@@ -161,7 +220,7 @@ pub async fn bring_up(
         let inner_mtu = layer_mtu(depth as u32 + ctx.depth_offset);
         let kind = spec.config.kind();
         let Some(factory) = registry.factory(kind) else {
-            unwind(&started).await;
+            unwind(started, ctx.claims.clone()).await;
             return Err(FailureReport::new(
                 FailureLayer::Chain,
                 spec.id.clone(),
@@ -209,7 +268,7 @@ pub async fn bring_up(
         let hop = match tokio::time::timeout(remaining, factory.build(fcfg, carrier.clone())).await
         {
             Err(_) => {
-                unwind(&started).await;
+                unwind(started, ctx.claims.clone()).await;
                 return Err(FailureReport::new(
                     FailureLayer::Chain,
                     spec.id.clone(),
@@ -218,7 +277,7 @@ pub async fn bring_up(
                 ));
             }
             Ok(Err(e)) => {
-                unwind(&started).await;
+                unwind(started, ctx.claims.clone()).await;
                 return Err(to_report(&spec.id, e));
             }
             Ok(Ok(hop)) => hop,
@@ -255,7 +314,7 @@ pub async fn bring_up(
             endpoint: endpoint.clone().unwrap_or_else(|| family.clone()),
         });
         carrier = hop.dialer();
-        started.push(StartedHop {
+        let started_hop = StartedHop {
             hop_id: spec.id.clone(),
             kind: kind.to_string(),
             family,
@@ -268,7 +327,9 @@ pub async fn bring_up(
             congested_drops: forwarder_drops,
             keepalive: keepalive_abort,
             forwarder: Some(forwarder_abort),
-        });
+        };
+        publish(&started_hop);
+        started.push(started_hop);
     }
     Ok(started)
 }
@@ -309,22 +370,43 @@ fn spawn_forwarder(
 /// `pub(crate)`: the F2 watchdog reuses it for sub-chain teardown before a
 /// rebuild (same abort-before-stop phasing — a spurious post-teardown
 /// `Failed` must not re-trigger the watchdog it raced).
-pub(crate) async fn unwind(started: &[StartedHop]) {
-    for s in started.iter() {
-        if let Some(keepalive) = &s.keepalive {
-            keepalive.abort();
-        }
-        if let Some(forwarder) = &s.forwarder {
-            forwarder.abort();
-        }
+///
+/// Every instance is claimed in `claims` immediately before its `stop()`, and
+/// skipped when the insert returns `false` — another actor owns that stop.
+/// The stop loop runs in a detached task that this call joins: callers are
+/// watchdog-internal futures a `stop_all` aborts, and an abort landing inside
+/// a parked `stop()` would otherwise drop the rest of the segment unstopped
+/// while leaving claims for stops that never run. Detaching keeps the claims
+/// honest — the task always finishes what it claimed — and the normal path
+/// still returns only once every stop completed.
+pub(crate) async fn unwind(started: Vec<StartedHop>, claims: Claims) {
+    if started.is_empty() {
+        return;
     }
-    // One scheduler pass so abort delivery wins over the socket close below
-    // (transport `health()` racing `stop()` on another task is still the
-    // transport's own contract to honor).
-    tokio::task::yield_now().await;
-    for s in started.iter().rev() {
-        let _ = s.hop.stop().await;
-    }
+    let stopping = tokio::spawn(async move {
+        for s in started.iter() {
+            if let Some(keepalive) = &s.keepalive {
+                keepalive.abort();
+            }
+            if let Some(forwarder) = &s.forwarder {
+                forwarder.abort();
+            }
+        }
+        // One scheduler pass so abort delivery wins over the socket close
+        // below (transport `health()` racing `stop()` on another task is
+        // still the transport's own contract to honor).
+        tokio::task::yield_now().await;
+        for s in started.iter().rev() {
+            let claimed = lock_claims(&claims).insert(s.instance());
+            if !claimed {
+                continue;
+            }
+            let _ = s.hop.stop().await;
+        }
+    });
+    // A panicking transport is its own bug; the caller still has the bring-up
+    // error that sent it here to return.
+    let _ = stopping.await;
 }
 
 impl Drop for StartedHop {
@@ -340,6 +422,16 @@ impl Drop for StartedHop {
         if let Some(forwarder) = &self.forwarder {
             forwarder.abort();
         }
+    }
+}
+
+impl StartedHop {
+    /// Allocation identity of the running hop. A watchdog rebuild reuses the
+    /// configured hop id, so teardown bookkeeping (`stop_all`'s sweep, the
+    /// watchdog's once-per-instance unwind) keys on this, never on `hop_id`.
+    /// Two distinct instances cannot share it while both are alive.
+    pub(crate) fn instance(&self) -> usize {
+        Arc::as_ptr(&self.hop) as *const () as usize
     }
 }
 
@@ -458,7 +550,7 @@ mod tests {
             forwarder: None,
         }];
         assert!(!abort.is_finished());
-        unwind(&started).await;
+        unwind(started, Claims::default()).await;
         // Abort delivery needs a scheduler pass; bound the wait instead of
         // sleeping (no wall-clock dependence).
         let mut finished = false;

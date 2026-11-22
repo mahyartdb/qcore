@@ -120,11 +120,17 @@ impl ConnectionReport {
 
 /// Exactly one JSON document (stdout contract). The failure cause is
 /// redacted like in [`to_text`]: `--json` stdout and FFI status buffers are
-/// sinks too (FR-026). Serialization of this shape is infallible in
-/// practice; the fallback keeps the no-panic convention (and the
-/// one-document contract) on the impossible path.
+/// sinks too (FR-026). Chain hop ids (including the exit id, which is one of
+/// them) go through the same masker: an authored chain-file id can be
+/// secret-shaped and must not leak. Serialization of this shape is
+/// infallible in practice; the fallback keeps the no-panic convention (and
+/// the one-document contract) on the impossible path.
 pub fn to_json(r: &ConnectionReport) -> String {
     let mut redacted = r.clone();
+    redacted.exit_hop_id = masked_value("hop_id", &redacted.exit_hop_id);
+    for h in redacted.ordered_chain.iter_mut() {
+        h.hop_id = masked_value("hop_id", &h.hop_id);
+    }
     if let Some(f) = redacted.failure.as_mut() {
         f.cause = masked_value("cause", &f.cause);
         // Same masking as the text sink (`masked_failure_line` masks hop_id):
@@ -161,11 +167,14 @@ fn encode_fallback() -> String {
 /// Human form (stdout; diagnostics stay on stderr).
 pub fn to_text(r: &ConnectionReport) -> String {
     let mut out = String::new();
-    out.push_str(&format!("exit: {}\n", r.exit_hop_id));
+    out.push_str(&format!(
+        "exit: {}\n",
+        masked_value("hop_id", &r.exit_hop_id)
+    ));
     for h in &r.ordered_chain {
         out.push_str(&format!(
             "hop {} `{}` family={} endpoint={} status={} via={} nested={} mtu={}\n",
-            h.hop_id,
+            masked_value("hop_id", &h.hop_id),
             h.kind,
             h.family,
             h.endpoint.as_deref().unwrap_or("-"),
@@ -296,7 +305,10 @@ mod tests {
             !text.contains("xT4vN7qW"),
             "secret-like cause leaked: {text}"
         );
-        assert!(text.contains("cause=<redacted>"), "got: {text}");
+        // Token-scan masking (redact.rs): multi-word values are never
+        // redacted wholesale, so the benign word survives and the
+        // secret-like token is masked in place — context kept, secret gone.
+        assert!(text.contains("cause=boom <redacted>"), "got: {text}");
         // Ordinary causes render through the shared masked helper — pinned
         // here, not against Display (Display renders the raw cause and must
         // never reach a sink).
@@ -380,6 +392,60 @@ mod tests {
         assert!(
             plain_doc.contains("\"hop_id\":\"wg-0\""),
             "ordinary hop id must not be masked: {plain_doc}"
+        );
+    }
+
+    #[test]
+    fn chain_hop_ids_mask_secret_shaped_values_in_both_sinks() {
+        // A chain-file hop id is authored data, but `status` is a sink like
+        // any other: a secret-shaped id (a UUID pasted into a label) must not
+        // ride out raw, exactly like the failure hop_id above.
+        const UUID: &str = "123e4567-e89b-12d3-a456-426614174000";
+        let hop = |id: &str| HopReport {
+            hop_id: id.into(),
+            kind: "wireguard".into(),
+            family: "ipv4".into(),
+            endpoint: None,
+            status: "up".into(),
+            via: "root".into(),
+            nested: false,
+            mtu: 1420,
+            obfuscation: None,
+            dropped: 0,
+        };
+        let r = ConnectionReport::new(vec![hop(UUID)], UUID);
+        let doc = to_json(&r);
+        assert!(
+            !doc.contains(UUID),
+            "secret-shaped chain hop id leaked through --json: {doc}"
+        );
+        let back: ConnectionReport = serde_json::from_str(&doc).expect("round-trips");
+        assert_eq!(
+            back.ordered_chain[0].hop_id, "<redacted>",
+            "the ordered chain masks the id: {doc}"
+        );
+        assert_eq!(
+            back.exit_hop_id, "<redacted>",
+            "the exit id is the same hop id and masks identically: {doc}"
+        );
+        let text = to_text(&r);
+        assert!(!text.contains(UUID), "text sink leaked: {text}");
+        assert!(
+            text.contains("exit: <redacted>") && text.contains("hop <redacted> `wireguard`"),
+            "the text sink masks both id positions: {text}"
+        );
+
+        // Benign ids stay readable in both sinks (no over-redaction).
+        let benign = ConnectionReport::new(vec![hop("wg-0")], "wg-0");
+        let doc = to_json(&benign);
+        assert!(
+            doc.contains("\"hop_id\":\"wg-0\"") && doc.contains("\"exit_hop_id\":\"wg-0\""),
+            "benign chain ids must not be masked: {doc}"
+        );
+        let text = to_text(&benign);
+        assert!(
+            text.contains("exit: wg-0") && text.contains("hop wg-0 `wireguard`"),
+            "benign chain ids stay readable in text: {text}"
         );
     }
 

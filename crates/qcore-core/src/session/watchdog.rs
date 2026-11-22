@@ -27,17 +27,23 @@
 //! same ownership rule as keepalive/forwarder handles), so `stop()` never
 //! waits out a rebuild. A stop landing mid-`bring_up` drops the in-flight
 //! future: factory builds release their own partial resources by contract
-//! (`HopFactory::build` cancellation safety); hops already pushed to the
-//! segment get watcher aborts from `StartedHop::drop`, and socket reclamation
-//! rides process exit — the prompt-stop contract wins over teardown tidiness
-//! on this one path.
+//! (`HopFactory::build` cancellation safety), and hops already started are
+//! published to the handle's pending-rebuild slot (`bring_up_tracked`) so
+//! `stop_all` still calls their `stop()` — dropping a future cannot, and
+//! `StartedHop::drop` only aborts watchers.
+//!
+//! Stale events: `HopEvent` names a hop only by id, and a rebuild reuses the
+//! id. `run_watchdog` drains failures already queued for the segment it is
+//! about to rebuild (and, after a successful build, any queued failure the
+//! new instances do not corroborate) so a dying instance's event is never
+//! replayed against its replacement.
 
 use crate::config::profile_dir::ProfileDirs;
 use crate::session::lifecycle::{self, StartedHop};
 use crate::session::report::ConnectionReport;
 use crate::session::{LiveExit, Session, SessionHandle, SessionState};
-use qcore_transport_api::{FailureLayer, FailureReport, HopEvent};
-use std::collections::HashMap;
+use qcore_transport_api::{FailureLayer, FailureReport, HopEvent, HopHealth};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -201,14 +207,39 @@ pub struct Watchdog {
     /// Cumulative successful rebuilds (mirrored into `session.json` and the
     /// shared handle counter).
     pub reconnects: u32,
+    /// Instances this watchdog already unwound, by [`StartedHop::instance`].
+    /// Retries re-snapshot the same stopped segment; `stop()` is not an
+    /// idempotent transport contract, so each instance is stopped once.
+    /// Shared with the handle so `stop_all` skips the same instances while
+    /// the degraded window keeps them in the live vec. Cleared when the swap
+    /// installs the rebuilt segment (before the old vec drops) and on the
+    /// terminal path (before the vec is cleared).
+    unwound: crate::session::lifecycle::Claims,
+    /// Instances claimed into `unwound` whose `RunningHop` the owning
+    /// structure may drop before the claim: the pre-rebuild segment rides the
+    /// live vec until the swap, but claims from sources that drop the hop
+    /// (the bring-up-error path drains the pending slot, the vanished arm
+    /// drops its segment) park the `Arc`s here instead, so a freed instance's
+    /// address can never match a later allocation while its claim is still in
+    /// the set (the stale-address rule in `SessionHandle::unwound`'s doc).
+    /// Shared with the handle — the vanished arm's teardown outlives this
+    /// task when a stop aborts it. Cleared with the set (swap / terminal),
+    /// where the claims themselves are dropped too.
+    retired: crate::session::Retired,
 }
 
 impl Watchdog {
-    pub fn new(cfg: WatchdogConfig) -> Self {
+    pub fn new(
+        cfg: WatchdogConfig,
+        unwound: crate::session::lifecycle::Claims,
+        retired: crate::session::Retired,
+    ) -> Self {
         Watchdog {
             cfg,
             reconnect_times: Vec::new(),
             reconnects: 0,
+            unwound,
+            retired,
         }
     }
 
@@ -260,7 +291,18 @@ impl Watchdog {
         // prefix (both the watchdog task and every handle holder see the
         // same shared vec — this clone is the working copy for this attempt).
         let current = entry.started_hops();
-        lifecycle::unwind(&current[failed_idx..]).await;
+        let segment: Vec<StartedHop> = {
+            let unwound = lock_unwound(&self.unwound);
+            current[failed_idx..]
+                .iter()
+                .filter(|s| !unwound.contains(&s.instance()))
+                .cloned()
+                .collect()
+        };
+        // `unwind` claims each instance immediately before its stop (skipping
+        // ones an earlier attempt or `stop_all` already owns), so the set is
+        // up to date when it returns; no second claim pass here.
+        lifecycle::unwind(segment, self.unwound.clone()).await;
         let kept: Vec<StartedHop> = current[..failed_idx].to_vec();
 
         // Ring first: rewrite the failed hop's spec with a fresher verified
@@ -294,13 +336,18 @@ impl Watchdog {
         let owned_materials = self.cfg.resolve_materials(&registry, &hops)?;
         let deadline = Instant::now() + self.cfg.attempt_timeout;
         let events = entry.events.clone();
+        // Publish every started hop into the handle's pending slot: a stop
+        // that drops this rebuild future mid-chain (abort or stop select)
+        // leaves the already-started hops unreachable otherwise, and Drop
+        // cannot call `stop()`.
+        let pending = entry.pending_rebuild.clone();
         let chain = crate::chain::Chain {
             hops,
             max_depth: entry.chain.max_depth,
         };
         // The borrow lives exactly for this await; `owned_materials` (and
         // the identity secrets in it) drop when the attempt ends.
-        let segment = lifecycle::bring_up(
+        let result = lifecycle::bring_up_tracked(
             &chain,
             carrier,
             &events,
@@ -311,10 +358,38 @@ impl Watchdog {
                 materials: owned_materials.borrow(),
                 depth_offset: kept.len() as u32,
                 carrier_label: &carrier_label,
+                // The session's shared claim set: the rebuild's failure
+                // teardown and a concurrent `stop_all` must never both stop
+                // one instance (the pending slot publishes these hops before
+                // the attempt resolves).
+                claims: self.unwound.clone(),
             },
+            &|hop: &StartedHop| pending.publish(hop),
         )
-        .await?;
-        Ok(RebuildOutcome { segment, kept })
+        .await;
+        match result {
+            Ok(segment) => Ok(RebuildOutcome { segment, kept }),
+            Err(e) => {
+                // bring_up unwound everything it started on its error paths;
+                // the slot only holds stopped instances now. Claim the
+                // stopped instances so a `stop_all` sweeping the pending
+                // slot (or the live vec, where the pre-rebuild segment
+                // still sits) cannot re-stop them (`stop()` is not an
+                // idempotent transport contract). Only instances bring_up
+                // actually started and unwound are named here — the slot is
+                // drained first so no record of a hop that was never built
+                // survives. The drained `RunningHop`s park in `retired`:
+                // the claim must not outlive the allocation it names, or a
+                // reused address would make a later `stop_all` skip a fresh
+                // hop (see the stale-address rule on `SessionHandle::unwound`).
+                let stopped: Vec<crate::session::PendingHop> = pending.take();
+                pending.clear();
+                lock_unwound(&self.unwound)
+                    .extend(stopped.iter().map(crate::session::PendingHop::instance));
+                lock_retired(&self.retired).extend(stopped.into_iter().map(|h| h.hop));
+                Err(e)
+            }
+        }
     }
 
     /// Drive one `Failed` event to a conclusion: bounded retries within the
@@ -364,6 +439,9 @@ impl Watchdog {
             match self.attempt_rebuild(live, session_id, failed_idx).await {
                 Ok(outcome) => {
                     self.note_reconnect();
+                    // The unwound set stays populated until the caller swaps
+                    // the rebuilt segment in: `stop_all` may run in that
+                    // window and must not re-stop the old segment.
                     return WatchOutcome::Rebuilt(outcome);
                 }
                 Err(e) => last_err = Some(e),
@@ -400,6 +478,25 @@ fn lock_map(live: &LiveMap) -> std::sync::MutexGuard<'_, HashMap<String, Session
 /// is never held across an await).
 fn lock_entry(live: &LiveMap, session_id: &str) -> Option<SessionHandle> {
     lock_map(live).get(session_id).cloned()
+}
+
+/// Poison-tolerant guard for the shared unwound-instance set. A std lock:
+/// insert/contains/clear only, never held across an await (same policy as
+/// the handle's `started` vec).
+fn lock_unwound(
+    unwound: &crate::session::lifecycle::Claims,
+) -> std::sync::MutexGuard<'_, HashSet<usize>> {
+    crate::session::lifecycle::lock_claims(unwound)
+}
+
+/// Poison-tolerant guard for the parked retired-`Arc` vec (see
+/// [`SessionHandle::retired`]). Same std-lock policy: push/clear only.
+fn lock_retired(
+    retired: &crate::session::Retired,
+) -> std::sync::MutexGuard<'_, Vec<Arc<dyn qcore_transport_api::RunningHop>>> {
+    retired
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Degrade the durable record (`Up -> Degraded`) — best effort: the tunnel
@@ -473,14 +570,36 @@ pub(crate) async fn publish_report(
 /// every reader of the egress slot sees a consistent pair.
 fn swap_rebuilt_exit(
     h: &mut SessionHandle,
-    started: &[StartedHop],
+    started: Vec<StartedHop>,
     dns_resolver: Option<std::net::IpAddr>,
 ) {
+    let exit_dialer = started
+        .last()
+        .expect("rebuilt segment has at least one hop")
+        .hop
+        .dialer();
     // Same shared vec (Arc): the write through the map entry's handle
-    // reaches every holder.
-    *h.started
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = started.to_vec();
+    // reaches every holder. Ownership of the segment MOVES here — passing a
+    // slice and cloning it would leave the caller holding `StartedHop`s
+    // whose `Drop` aborts the installed hops' keepalive/forwarders.
+    //
+    // Clear the unwound set and install the rebuilt vec under ONE started
+    // write guard: `stop_all` snapshots both under the read side, so it sees
+    // either the stopped pre-swap segment with the set populated (skips it)
+    // or the new segment with the set cleared (stops it) — never the old vec
+    // with the set already cleared, which would re-stop the unwound hops.
+    // Clearing here is still before the old instances drop (the assignment),
+    // so no retained address can match a later allocation; the retired
+    // `Arc`s (allocations parked for claims) drop with the same rule.
+    {
+        let mut installed = h
+            .started
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        lock_unwound(&h.unwound).clear();
+        lock_retired(&h.retired).clear();
+        *installed = started;
+    }
     // Refresh the egress under ONE write guard: the rebuilt exit's dialer
     // (so handle reads — the CLI's live adapter resolves through this — dial
     // the NEW chain) plus the re-wired tunnel resolver when the session had
@@ -493,32 +612,60 @@ fn swap_rebuilt_exit(
         .exit
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    exit.dialer = Some(
-        started
-            .last()
-            .expect("rebuilt segment has at least one hop")
-            .hop
-            .dialer(),
-    );
     if exit.resolver.is_some() {
-        if let (Some(ip), Some(exit_hop)) = (dns_resolver, started.last()) {
-            if exit_hop.hop.dialer().capabilities().dials_udp {
+        if let Some(ip) = dns_resolver {
+            if exit_dialer.capabilities().dials_udp {
                 exit.resolver = Some(std::sync::Arc::new(
-                    crate::session::resolver::TunnelResolver::new(exit_hop.hop.dialer(), ip),
+                    crate::session::resolver::TunnelResolver::new(exit_dialer.clone(), ip),
                 ));
             }
         }
     }
+    exit.dialer = Some(exit_dialer);
 }
 
 /// Next event from the session bus; `None` only when every sender dropped
 /// (session torn down and forgotten — the task then ends on its own).
-async fn next_event(rx: &mut tokio::sync::broadcast::Receiver<HopEvent>) -> Option<HopEvent> {
+/// Deferred events (queued while a rebuild was in flight) come first so the
+/// loop sees them in the order they arrived.
+async fn next_event(
+    deferred: &mut VecDeque<HopEvent>,
+    rx: &mut tokio::sync::broadcast::Receiver<HopEvent>,
+) -> Option<HopEvent> {
+    if let Some(e) = deferred.pop_front() {
+        return Some(e);
+    }
     loop {
         match rx.recv().await {
             Ok(e) => return Some(e),
             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
             Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+        }
+    }
+}
+
+/// Discard `Failed` events already queued for hop ids `stale` attributes to
+/// an instance the caller is retiring; every other event is deferred so the
+/// loop still sees it (in order) once the current rebuild concludes.
+///
+/// `HopEvent` carries only the hop id, and a rebuild reuses it, so an event
+/// that was queued before the rebuilt segment was installed cannot be
+/// distinguished from a fresh failure of the new instance by the event
+/// alone. Queued-before-the-rebuild is the discriminator: those events were
+/// emitted by instances this watchdog is stopping, and replaying them
+/// against the rebuilt segment rebuilds a healthy chain.
+fn drain_queued_failed(
+    rx: &mut tokio::sync::broadcast::Receiver<HopEvent>,
+    deferred: &mut VecDeque<HopEvent>,
+    stale: impl Fn(&str) -> bool,
+) {
+    loop {
+        match rx.try_recv() {
+            Ok(HopEvent::Failed { hop_id, .. }) if stale(&hop_id) => continue,
+            Ok(event) => deferred.push_back(event),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+            Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
         }
     }
 }
@@ -565,12 +712,13 @@ async fn run_watchdog(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     mut rx: tokio::sync::broadcast::Receiver<HopEvent>,
 ) {
-    let mut wd = Watchdog::new(cfg);
+    let mut wd = Watchdog::new(cfg, handle.unwound.clone(), handle.retired.clone());
+    let mut deferred: VecDeque<HopEvent> = VecDeque::new();
     loop {
         let event = tokio::select! {
             biased;
             _ = shutdown.wait_for(|stopped| *stopped) => break,
-            e = next_event(&mut rx) => match e {
+            e = next_event(&mut deferred, &mut rx) => match e {
                 Some(e) => e,
                 None => break,
             },
@@ -589,10 +737,22 @@ async fn run_watchdog(
         let Some(entry) = lock_entry(&live, &handle.id) else {
             break;
         };
-        let Some(failed_idx) = entry.started_hops().iter().position(|s| s.hop_id == hop_id) else {
+        let current = entry.started_hops();
+        let Some(failed_idx) = current.iter().position(|s| s.hop_id == hop_id) else {
             // Stale or foreign event (hop already rebuilt away).
             continue;
         };
+        // Every hop from the failed index on is about to be rebuilt, and
+        // handlers are id-keyed. Any Failed for those ids already queued
+        // (a duplicate from the dying instance, or a transitively dead
+        // downstream hop) belongs to an instance this rebuild retires;
+        // replaying it after the swap would rebuild the new segment.
+        let rebuilt_ids: HashSet<String> = current[failed_idx..]
+            .iter()
+            .map(|s| s.hop_id.clone())
+            .collect();
+        drop(current);
+        drain_queued_failed(&mut rx, &mut deferred, |id| rebuilt_ids.contains(id));
         handle
             .degraded
             .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -632,20 +792,43 @@ async fn run_watchdog(
                         fresh.failure = Some(report.clone());
                         *slot.write().await = fresh;
                     }
-                    let started = entry.started_hops();
-                    lifecycle::unwind(&started).await;
-                    // The hops are stopped: drop them from the shared vec
-                    // so no holder keeps stopped hops alive.
-                    *entry
-                        .started
-                        .write()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Vec::new();
+                    // Instances the attempts already unwound are stopped;
+                    // `stop()` is not idempotent, so the terminal teardown
+                    // only covers what is still live (the kept prefix).
+                    let unwound = lock_unwound(&wd.unwound).clone();
+                    let started: Vec<StartedHop> = entry
+                        .started_hops()
+                        .into_iter()
+                        .filter(|s| !unwound.contains(&s.instance()))
+                        .collect();
+                    lifecycle::unwind(started, wd.unwound.clone()).await;
+                    // Clear the claims and install the empty vec under ONE
+                    // started write guard (same generation rule as
+                    // `swap_rebuilt_exit`): `stop_all` reads the vec and the
+                    // set under the read side, so it sees either the stopped
+                    // vec with its claims populated (skips them) or the empty
+                    // vec with the claims cleared — never the stopped vec
+                    // with the claims already gone, which would re-stop them.
+                    // Claims drop first, then the allocations they name.
+                    {
+                        let mut installed = entry
+                            .started
+                            .write()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        lock_unwound(&wd.unwound).clear();
+                        lock_retired(&wd.retired).clear();
+                        *installed = Vec::new();
+                    }
                     *entry
                         .exit
                         .write()
                         .unwrap_or_else(std::sync::PoisonError::into_inner) = LiveExit::default();
                 }
                 lock_map(&live).remove(&handle.id);
+                // The watchdog removed the entry itself, so the engine's
+                // leave-live bookkeeping cannot observe it: run its cleanup
+                // hook (relay-counter forget) here.
+                handle.run_give_up_cleanup();
                 // Fire the give-up signal BEFORE clearing the degraded
                 // flag: the serving CLI observes terminal-ness while the
                 // session bus is still alive, and exits with the failure.
@@ -660,13 +843,42 @@ async fn run_watchdog(
                 // + segment; hop ids unchanged) and refresh the shared
                 // egress so proxy connections opened after the rebuild dial
                 // the NEW exit — the CLI's handle clone shares this state.
+                // Instances the rebuilt segment itself reported as failing
+                // while it was being built are not stale: only a queued
+                // failure the new instance does not corroborate is dropped.
+                let segment_health: HashMap<String, bool> = outcome
+                    .segment
+                    .iter()
+                    .map(|s| {
+                        (
+                            s.hop_id.clone(),
+                            matches!(s.hop.health(), HopHealth::Healthy | HopHealth::Starting),
+                        )
+                    })
+                    .collect();
                 let mut started = outcome.kept;
                 started.extend(outcome.segment);
+                drain_queued_failed(&mut rx, &mut deferred, |id| {
+                    segment_health.get(id).copied().unwrap_or(false)
+                });
+                // Ownership of the segment moves into the entry on success;
+                // the Option keeps it for the vanished path (unwind) without
+                // ever cloning it (a leftover `StartedHop` aborts the live
+                // hops' watchers on drop).
+                let mut segment = Some(started);
                 let vanished = {
                     let mut map = lock_map(&live);
                     match map.get_mut(&handle.id) {
                         Some(h) => {
-                            swap_rebuilt_exit(h, &started, wd.cfg.dns_resolver);
+                            swap_rebuilt_exit(
+                                h,
+                                segment.take().expect("segment installed once"),
+                                wd.cfg.dns_resolver,
+                            );
+                            // The swap cleared the shared unwound set and the
+                            // parked retired `Arc`s under the same started
+                            // write guard (old segment's claims retire with
+                            // it), so nothing is left here.
                             false
                         }
                         // The entry vanished mid-rebuild (stop_session won
@@ -679,8 +891,32 @@ async fn run_watchdog(
                         None => true,
                     }
                 };
+                // The slot's records were bookkeeping only: on success the
+                // segment is now installed (they point at the live
+                // instances) and on the vanished path it is unwound below,
+                // so either way the slot must not be left for a later
+                // `stop_all` to act on the same instances again.
+                handle.pending_rebuild.clear();
                 if vanished {
-                    lifecycle::unwind(&started).await;
+                    let orphaned = segment.take().expect("segment retained when not installed");
+                    // Park the `Arc`s in the handle-shared retired vec BEFORE
+                    // unwinding: `unwind` detaches its stop loop, so a
+                    // concurrent `stop_all` can abort this task while the
+                    // stops are still in flight — the claims it inserts must
+                    // keep naming live allocations past the abort (the
+                    // stale-address rule on `SessionHandle::unwound`).
+                    lock_retired(&wd.retired).extend(orphaned.iter().map(|s| Arc::clone(&s.hop)));
+                    // The unwind itself is abort-safe (see its doc): the
+                    // detached stop loop survives this task and completes
+                    // every stop it claimed, so the vanished segment is never
+                    // dropped unstopped and never stopped twice.
+                    lifecycle::unwind(orphaned, wd.unwound.clone()).await;
+                    // A session whose entry is gone has no success to
+                    // report: counting the reconnect, clearing `degraded`,
+                    // or flipping the record to Up would describe a live
+                    // session the caller already stopped (Degraded -> Up
+                    // after the entry vanished).
+                    continue;
                 }
                 // Clear the degraded flag BEFORE the durable Up record: the
                 // flag belongs to the degraded period, which ended when the
@@ -819,10 +1055,14 @@ mod tests {
 
     #[test]
     fn flap_cap_counts_within_window() {
-        let mut w = Watchdog::new(WatchdogConfig {
-            dirs: dirs("flap"),
-            ..WatchdogConfig::default()
-        });
+        let mut w = Watchdog::new(
+            WatchdogConfig {
+                dirs: dirs("flap"),
+                ..WatchdogConfig::default()
+            },
+            fresh_unwound(),
+            fresh_retired(),
+        );
         for _ in 0..(tuning::FLAP_CAP - 1) {
             w.note_reconnect();
         }
@@ -941,8 +1181,26 @@ mod tests {
     static HOP_REG: std::sync::LazyLock<std::sync::Mutex<Vec<Arc<AtomicU64>>>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
 
+    /// Each build's own event bus, push-ordered like `HOP_REG`. The forwarder
+    /// holds the only receiver on it while the hop is owned, so both
+    /// `receiver_count` and a round-trip through the session bus show whether
+    /// the watcher is alive.
+    static HOP_EVENTS: std::sync::LazyLock<
+        std::sync::Mutex<Vec<tokio::sync::broadcast::Sender<HopEvent>>>,
+    > = std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+
     fn hop_reg_reset() {
         HOP_REG.lock().unwrap().clear();
+        HOP_EVENTS.lock().unwrap().clear();
+    }
+
+    fn hop_events(build: usize) -> tokio::sync::broadcast::Sender<HopEvent> {
+        HOP_EVENTS
+            .lock()
+            .unwrap()
+            .get(build)
+            .expect("hop build registered its event bus")
+            .clone()
     }
 
     fn hop_stops(build: usize) -> u64 {
@@ -1012,11 +1270,13 @@ mod tests {
             hold_if_armed().await;
             let stops = Arc::new(AtomicU64::new(0));
             HOP_REG.lock().unwrap().push(stops.clone());
+            let events = tokio::sync::broadcast::channel(16).0;
+            HOP_EVENTS.lock().unwrap().push(events.clone());
             Ok(Arc::new(RecoverHop {
                 hop_id: cfg.get("hop_id").unwrap_or("wdog-0").to_string(),
                 fail_after_first: n == 0,
                 health_checks: AtomicU64::new(0),
-                events: tokio::sync::broadcast::channel(16).0,
+                events,
                 stops,
                 dialer: Arc::new(StubDialer),
             }))
@@ -1055,12 +1315,14 @@ mod tests {
             if n >= 1 {
                 return Err(HopError::transport("boom", "rebuild build always fails"));
             }
+            let stops = Arc::new(AtomicU64::new(0));
+            HOP_REG.lock().unwrap().push(stops.clone());
             Ok(Arc::new(RecoverHop {
                 hop_id: cfg.get("hop_id").unwrap_or("flaky-0").to_string(),
                 fail_after_first: false,
                 health_checks: AtomicU64::new(0),
                 events: tokio::sync::broadcast::channel(16).0,
-                stops: Arc::new(AtomicU64::new(0)),
+                stops,
                 dialer: Arc::new(StubDialer),
             }))
         }
@@ -1117,6 +1379,144 @@ mod tests {
     qcore_transport_api::register_plugin!(&FLAKY_FACTORY);
     qcore_transport_api::register_plugin!(&PENDING_FACTORY);
 
+    /// Mid-segment abort double: builds 0 and 1 are the initial chain, build
+    /// 2 is a rebuild's first hop (completes, so its socket is live), and
+    /// every later build never resolves — the rebuild parks after starting
+    /// exactly one hop, which is the shape a stop must not orphan.
+    static STALL_BUILDS: AtomicU64 = AtomicU64::new(0);
+    static STALL_STARTED: AtomicU64 = AtomicU64::new(0);
+    const STALL_HANG_FROM: u64 = 3;
+
+    static STALL_DESC: TransportDescriptor = TransportDescriptor {
+        kind: "wdog-stall",
+        capabilities: Capabilities {
+            accepts_tcp_carrier: true,
+            accepts_udp_carrier: true,
+            dials_tcp: true,
+            dials_udp: true,
+        },
+        obfuscation_families: &[],
+        config_schema: "wdog-stall/v1",
+        needs_sidecar: false,
+    };
+
+    struct StallFactory;
+
+    #[async_trait::async_trait]
+    impl qcore_transport_api::HopFactory for StallFactory {
+        fn descriptor(&self) -> &'static TransportDescriptor {
+            &STALL_DESC
+        }
+        async fn build(
+            &self,
+            cfg: qcore_transport_api::HopConfig,
+            _carrier: Arc<dyn Dialer>,
+        ) -> Result<Arc<dyn RunningHop>, HopError> {
+            let n = STALL_BUILDS.fetch_add(1, Ordering::SeqCst);
+            if n >= STALL_HANG_FROM {
+                std::future::pending::<()>().await;
+            }
+            let stops = Arc::new(AtomicU64::new(0));
+            HOP_REG.lock().unwrap().push(stops.clone());
+            STALL_STARTED.fetch_add(1, Ordering::SeqCst);
+            Ok(Arc::new(RecoverHop {
+                hop_id: cfg.get("hop_id").unwrap_or("stall-0").to_string(),
+                fail_after_first: false,
+                health_checks: AtomicU64::new(0),
+                events: tokio::sync::broadcast::channel(16).0,
+                stops,
+                dialer: Arc::new(StubDialer),
+            }))
+        }
+    }
+
+    /// Snapshot-vs-sweep double: build 0's `stop()` blocks until the test
+    /// opens [`GATED_GATE`], pinning the window between `stop_all`'s hop
+    /// snapshot and its late sweep so a swap can be interleaved there.
+    static GATED_BUILDS: AtomicU64 = AtomicU64::new(0);
+    static GATED_STOP_ENTERED: AtomicU64 = AtomicU64::new(0);
+    static GATED_GATE: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+        std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(0)));
+
+    static GATED_DESC: TransportDescriptor = TransportDescriptor {
+        kind: "wdog-gated",
+        capabilities: Capabilities {
+            accepts_tcp_carrier: true,
+            accepts_udp_carrier: true,
+            dials_tcp: true,
+            dials_udp: true,
+        },
+        obfuscation_families: &[],
+        config_schema: "wdog-gated/v1",
+        needs_sidecar: false,
+    };
+
+    struct GatedHop {
+        stops: Arc<AtomicU64>,
+        /// Only the snapshot's hop parks; the swapped-in segment must be
+        /// stoppable while the first stop is still held.
+        gated: bool,
+        events: tokio::sync::broadcast::Sender<HopEvent>,
+    }
+
+    #[async_trait::async_trait]
+    impl RunningHop for GatedHop {
+        fn descriptor(&self) -> &'static TransportDescriptor {
+            &GATED_DESC
+        }
+        fn dialer(&self) -> Arc<dyn Dialer> {
+            Arc::new(StubDialer)
+        }
+        fn health(&self) -> HopHealth {
+            HopHealth::Healthy
+        }
+        fn events(&self) -> tokio::sync::broadcast::Receiver<HopEvent> {
+            self.events.subscribe()
+        }
+        async fn stop(&self) -> Result<(), HopError> {
+            self.stops.fetch_add(1, Ordering::SeqCst);
+            if self.gated {
+                GATED_STOP_ENTERED.fetch_add(1, Ordering::SeqCst);
+                let permit = GATED_GATE
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .expect("gated stop: semaphore open");
+                permit.forget();
+            }
+            Ok(())
+        }
+    }
+
+    struct GatedFactory;
+
+    #[async_trait::async_trait]
+    impl qcore_transport_api::HopFactory for GatedFactory {
+        fn descriptor(&self) -> &'static TransportDescriptor {
+            &GATED_DESC
+        }
+        async fn build(
+            &self,
+            _cfg: qcore_transport_api::HopConfig,
+            _carrier: Arc<dyn Dialer>,
+        ) -> Result<Arc<dyn RunningHop>, HopError> {
+            let n = GATED_BUILDS.fetch_add(1, Ordering::SeqCst);
+            let stops = Arc::new(AtomicU64::new(0));
+            HOP_REG.lock().unwrap().push(stops.clone());
+            Ok(Arc::new(GatedHop {
+                stops,
+                gated: n == 0,
+                events: tokio::sync::broadcast::channel(16).0,
+            }))
+        }
+    }
+
+    static STALL_FACTORY: StallFactory = StallFactory;
+    static GATED_FACTORY: GatedFactory = GatedFactory;
+
+    qcore_transport_api::register_plugin!(&STALL_FACTORY);
+    qcore_transport_api::register_plugin!(&GATED_FACTORY);
+
     /// Test gate: when armed, any subsequent factory build parks until
     /// released, so a Degraded window is deterministically observable by a
     /// poll (no sleeps). Arming tests run their initial bring-up BEFORE
@@ -1171,6 +1571,17 @@ mod tests {
         f()
     }
 
+    /// Fresh shared unwound-instance set for direct `Watchdog` probes (the
+    /// spawn path takes the handle's shared one).
+    fn fresh_unwound() -> crate::session::lifecycle::Claims {
+        Arc::new(std::sync::Mutex::new(HashSet::new()))
+    }
+
+    /// Fresh retired-`Arc` vec paired with [`fresh_unwound`].
+    fn fresh_retired() -> crate::session::Retired {
+        Arc::new(std::sync::Mutex::new(Vec::new()))
+    }
+
     fn test_watchdog_cfg(d: &ProfileDirs) -> WatchdogConfig {
         WatchdogConfig {
             dirs: d.clone(),
@@ -1193,13 +1604,23 @@ mod tests {
     }
 
     fn fixture(tag: &str, kind: &str) -> Fixture {
+        fixture_chain(tag, vec![plugin_spec(kind, "h-0")])
+    }
+
+    /// Multi-hop fixture: the watchdog rebuilds the specs in `handle.chain`,
+    /// so a mid-chain test needs the real spec list, not a one-hop stand-in.
+    fn fixture_chain(tag: &str, specs: Vec<crate::config::HopSpec>) -> Fixture {
         let d = dirs(tag);
         d.ensure_dirs().unwrap();
         let (events, _drain) = tokio::sync::broadcast::channel::<HopEvent>(256);
-        let chain = chain_of(vec![plugin_spec(kind, "h-0")]);
+        let exit_hop_id = specs
+            .last()
+            .map(|s| s.id.clone())
+            .unwrap_or_else(|| "h-0".to_string());
+        let chain = chain_of(specs);
         let handle = SessionHandle::bare(
             "sess-wd",
-            "h-0",
+            exit_hop_id,
             crate::session::ChainSer::from(&chain),
             Vec::new(),
             events,
@@ -1244,9 +1665,19 @@ mod tests {
         events: &tokio::sync::broadcast::Sender<HopEvent>,
         keepalive: crate::session::net::KeepalivePolicy,
     ) -> Vec<StartedHop> {
+        initial_bring_up_chain(vec![plugin_spec(kind, "h-0")], events, keepalive).await
+    }
+
+    /// Multi-hop variant of [`initial_bring_up`] (the specs the fixture's
+    /// chain carries).
+    async fn initial_bring_up_chain(
+        specs: Vec<crate::config::HopSpec>,
+        events: &tokio::sync::broadcast::Sender<HopEvent>,
+        keepalive: crate::session::net::KeepalivePolicy,
+    ) -> Vec<StartedHop> {
         let registry = crate::registry::TransportRegistry::global();
         lifecycle::bring_up(
-            &chain_of(vec![plugin_spec(kind, "h-0")]),
+            &chain_of(specs),
             Arc::new(StubDialer),
             events,
             &keepalive,
@@ -1460,6 +1891,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn always_failing_rebuild_gives_up_naming_attempts() {
         FLAKY_BUILDS.store(0, Ordering::SeqCst);
+        hop_reg_reset();
         let f = fixture("budget", "wdog-flaky");
         // Real started hop (build 0 succeeds); the Failed event is injected
         // on the session bus — the same signal the keepalive/forwarder path
@@ -1501,6 +1933,11 @@ mod tests {
         );
         assert_eq!(record.reconnects, 0, "no successful rebuild");
         // Terminal cleanup: hops unwound, entry removed, task done.
+        assert_eq!(
+            hop_stops(0),
+            1,
+            "the failed hop is stopped once across three attempts and the terminal teardown"
+        );
         assert!(
             lock_entry(&f.live, &handle.id).is_none(),
             "give-up removes the live entry"
@@ -1651,6 +2088,100 @@ mod tests {
         let _ = std::fs::remove_dir_all(&f.dirs.config_dir);
     }
 
+    /// (S2) A stop landing mid-rebuild must tear down the hops the rebuild
+    /// already started, not only the pre-rebuild segment: the rebuild future
+    /// is dropped (stop select / abort), so nobody else can call `stop()` on
+    /// them — `StartedHop::drop` only aborts watchers. The two-hop stall
+    /// double builds its first rebuilt hop and parks on the second, so the
+    /// first one is live and unowned when the stop lands.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_mid_rebuild_stops_hops_built_before_the_abort() {
+        STALL_BUILDS.store(0, Ordering::SeqCst);
+        STALL_STARTED.store(0, Ordering::SeqCst);
+        hop_reg_reset();
+        let specs = vec![
+            plugin_spec("wdog-stall", "h-0"),
+            plugin_spec("wdog-stall", "h-1"),
+        ];
+        let f = fixture_chain("stall", specs.clone());
+        let started = initial_bring_up_chain(
+            specs,
+            &f.handle.events,
+            crate::session::net::KeepalivePolicy {
+                enabled: false,
+                interval_secs: 1,
+            },
+        )
+        .await;
+        let handle = reinsert(&f, |h| {
+            h.wire_exit(started, None, None);
+            h
+        });
+        // The hung second build would otherwise time out at the attempt
+        // budget; the stop must land first.
+        let cfg = WatchdogConfig {
+            attempts: 1,
+            backoff_secs: Vec::new(),
+            budget: Duration::from_secs(30),
+            attempt_timeout: Duration::from_secs(30),
+            ..test_watchdog_cfg(&f.dirs)
+        };
+        let abort = spawn(handle.clone(), cfg, f.live.clone(), f.stop_rx.clone());
+        handle
+            .events
+            .send(HopEvent::Failed {
+                hop_id: "h-0".into(),
+                cause: "injected death".into(),
+            })
+            .expect("session bus send");
+        // Rebuild shape: builds 0/1 are the initial chain, build 2 completes
+        // (the rebuilt h-0), build 3 parks forever (the rebuilt h-1).
+        let mid_segment = poll_until(Instant::now() + Duration::from_secs(5), || {
+            (STALL_BUILDS.load(Ordering::SeqCst) > STALL_HANG_FROM
+                && STALL_STARTED.load(Ordering::SeqCst) == STALL_HANG_FROM)
+                .then_some(())
+        })
+        .await;
+        assert!(
+            mid_segment.is_some(),
+            "rebuild must park after starting exactly one hop (builds={}, started={})",
+            STALL_BUILDS.load(Ordering::SeqCst),
+            STALL_STARTED.load(Ordering::SeqCst)
+        );
+        assert_eq!(hop_stops(0), 1, "the rebuild unwound the initial h-0");
+        assert_eq!(hop_stops(1), 1, "the rebuild unwound the initial h-1");
+        assert_eq!(
+            hop_stops(2),
+            0,
+            "the rebuilt h-0 is live but not installed (precondition)"
+        );
+
+        let t0 = Instant::now();
+        handle.stop_all().await.expect("stop_all");
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "stop during rebuild returned in {elapsed:?}, contract is <2 s"
+        );
+        assert_eq!(
+            hop_stops(2),
+            1,
+            "stop_all must stop the hop the dropped rebuild future had already started"
+        );
+        assert_eq!(
+            hop_stops(0),
+            1,
+            "stop_all must not re-stop a hop the rebuild already unwound"
+        );
+        assert_eq!(
+            hop_stops(1),
+            1,
+            "stop_all must not re-stop a hop the rebuild already unwound"
+        );
+        abort.abort();
+        let _ = std::fs::remove_dir_all(&f.dirs.config_dir);
+    }
+
     /// Stale Failed events (a hop id no longer in the live chain) are
     /// ignored: no degrade, no rebuild.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1680,6 +2211,106 @@ mod tests {
             "record stays Up"
         );
         abort.abort();
+        let _ = std::fs::remove_dir_all(&f.dirs.config_dir);
+    }
+
+    /// (S2) A duplicate `Failed` from the dying instance, queued before the
+    /// rebuild, must not be replayed against the rebuilt hop that reuses the
+    /// hop id: a spurious rebuild would flap a healthy chain into the cap.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn duplicate_failed_after_rebuild_does_not_rebuild_again() {
+        RECOVER_BUILDS.store(u64::MAX - 3, Ordering::SeqCst); // healthy builds only
+        let base = RECOVER_BUILDS.load(Ordering::SeqCst);
+        hop_reg_reset();
+        let f = fixture("dup-failed", "wdog-hop");
+        let started = initial_bring_up(
+            "wdog-hop",
+            &f.handle.events,
+            crate::session::net::KeepalivePolicy {
+                enabled: false,
+                interval_secs: 1,
+            },
+        )
+        .await;
+        let handle = reinsert(&f, |h| {
+            h.wire_exit(started, None, None);
+            h
+        });
+        let cfg = test_watchdog_cfg(&f.dirs);
+        let abort = spawn(handle.clone(), cfg, f.live.clone(), f.stop_rx.clone());
+        // Two failures from the same dying instance land before the watchdog
+        // reads either one (keepalive + hop bus both report the death).
+        for _ in 0..2 {
+            handle
+                .events
+                .send(HopEvent::Failed {
+                    hop_id: "h-0".into(),
+                    cause: "injected death".into(),
+                })
+                .expect("session bus send");
+        }
+        let up = poll_until(Instant::now() + Duration::from_secs(10), || {
+            Session::load(&f.dirs)
+                .ok()
+                .and_then(|s| (s.state == SessionState::Up && s.reconnects == 1).then_some(s))
+        })
+        .await;
+        assert!(
+            up.is_some(),
+            "first failure rebuilds to Up/reconnects=1, got {:?}",
+            Session::load(&f.dirs).map(|s| (s.state, s.reconnects))
+        );
+        // Give the watchdog a bounded window to replay the duplicate.
+        let spurious = poll_until(Instant::now() + Duration::from_secs(1), || {
+            Session::load(&f.dirs)
+                .ok()
+                .filter(|s| s.reconnects >= 2)
+                .map(|_| ())
+        })
+        .await;
+        assert!(
+            spurious.is_none(),
+            "the queued duplicate Failed must not rebuild the rebuilt hop"
+        );
+        assert_eq!(
+            RECOVER_BUILDS.load(Ordering::SeqCst) - base,
+            2,
+            "initial build + one rebuild, no second rebuild"
+        );
+        assert_eq!(hop_stops(0), 1, "the dying hop stopped exactly once");
+        assert_eq!(hop_stops(1), 0, "the rebuilt hop is still the live one");
+        // The pending slot and the swap are bookkeeping, not ownership:
+        // neither may abort the watchers of the installed hops
+        // (`StartedHop::drop` aborts them, so a stored/leftover clone would).
+        // The forwarder is the hop bus's only receiver and pumps it into the
+        // session bus, so a live watcher is observable end to end.
+        let live = handle.started_hops();
+        assert_eq!(live.len(), 1, "one hop installed");
+        let hop_bus = hop_events(1);
+        let forwarded = poll_until(Instant::now() + Duration::from_secs(2), || {
+            (hop_bus.receiver_count() >= 1).then_some(())
+        })
+        .await;
+        assert!(
+            forwarded.is_some(),
+            "the installed hop's forwarder must survive the rebuild (receivers={}, buses={})",
+            hop_bus.receiver_count(),
+            HOP_EVENTS.lock().unwrap().len()
+        );
+        let mut session_rx = handle.events.subscribe();
+        hop_bus
+            .send(HopEvent::Congested {
+                hop_id: "h-0".into(),
+                dropped: 1,
+            })
+            .expect("the live forwarder keeps the hop bus subscribed");
+        let reached = tokio::time::timeout(Duration::from_secs(2), session_rx.recv()).await;
+        assert!(
+            matches!(reached, Ok(Ok(HopEvent::Congested { dropped: 1, .. }))),
+            "the rebuilt hop's events still reach the session bus"
+        );
+        abort.abort();
+        handle.stop_all().await.expect("teardown");
         let _ = std::fs::remove_dir_all(&f.dirs.config_dir);
     }
 
@@ -1834,16 +2465,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&f.dirs.config_dir);
     }
 
-    /// (S1.2) `stop_all` sweeps hops that appeared after its snapshot: a
-    /// rebuild completing between the snapshot and teardown leaves a fresh
-    /// segment in the shared vec, and the snapshot-only teardown would leak
-    /// it. The sweep re-reads the vec after teardown and stops anything not
-    /// covered.
+    /// (S2) A rebuild whose entry vanished must not resurrect the session's
+    /// bookkeeping: no reconnect count, no `Degraded -> Up` flip of the
+    /// record. The Rebuilt arm's success path belongs to a session that is
+    /// still live; running it after the entry disappeared reports Up for a
+    /// session the caller already stopped.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn stop_all_sweeps_hops_that_appear_after_the_snapshot() {
-        RECOVER_BUILDS.store(u64::MAX - 3, Ordering::SeqCst);
+    async fn vanished_entry_does_not_flip_the_record_back_to_up() {
+        RECOVER_BUILDS.store(u64::MAX - 3, Ordering::SeqCst); // healthy builds only
         hop_reg_reset();
-        let f = fixture("sweep", "wdog-hop");
+        let f = fixture("vanished-record", "wdog-hop");
         let started = initial_bring_up(
             "wdog-hop",
             &f.handle.events,
@@ -1857,31 +2488,595 @@ mod tests {
             h.wire_exit(started, None, None);
             h
         });
-        // Interleave: after stop_all snapshots the vec, a (watchdog-driven)
-        // rebuild swaps in a new segment; the teardown must still stop it.
-        // Deterministically simulated by wiring a rebuild AFTER the snapshot:
-        // stop_all reads the shared vec live, so instead simulate the race
-        // shape directly — snapshot now, then swap the vec, then stop.
-        let snapshot = handle.started_hops();
-        assert_eq!(snapshot.len(), 1);
-        let (events, _drain) = tokio::sync::broadcast::channel::<HopEvent>(8);
-        let rebuilt = initial_bring_up(
-            "wdog-hop",
-            &events,
+        let cfg = test_watchdog_cfg(&f.dirs);
+        let abort = spawn(handle.clone(), cfg, f.live.clone(), f.stop_rx.clone());
+        arm_hold();
+        handle
+            .events
+            .send(HopEvent::Failed {
+                hop_id: "h-0".into(),
+                cause: "injected death".into(),
+            })
+            .expect("session bus send");
+        let unwound = poll_until(Instant::now() + Duration::from_secs(5), || {
+            (hop_stops(0) >= 1).then_some(())
+        })
+        .await;
+        assert!(unwound.is_some(), "watchdog unwound the failed hop");
+        lock_map(&f.live).remove(&handle.id);
+        release_hold();
+        // The unwind of the rebuilt segment is the last observable step
+        // before the (buggy) success bookkeeping; wait for it, then give the
+        // arm a bounded window to write Up.
+        let rebuilt_stopped = poll_until(Instant::now() + Duration::from_secs(5), || {
+            (hop_stops(1) >= 1).then_some(())
+        })
+        .await;
+        assert!(rebuilt_stopped.is_some(), "rebuilt segment unwound");
+        let flipped = poll_until(Instant::now() + Duration::from_millis(500), || {
+            Session::load(&f.dirs)
+                .ok()
+                .filter(|s| s.state == SessionState::Up)
+                .map(|_| ())
+        })
+        .await;
+        assert!(
+            flipped.is_none(),
+            "a vanished session must not have its record flipped back to Up"
+        );
+        let stored = Session::load(&f.dirs).expect("record");
+        assert_eq!(
+            stored.state,
+            SessionState::Degraded,
+            "record stays degraded while the vanished session is unresolved"
+        );
+        assert_eq!(stored.reconnects, 0, "no reconnect is counted");
+        assert_eq!(
+            handle.reconnects.load(Ordering::SeqCst),
+            0,
+            "shared counter not bumped for a vanished session"
+        );
+        assert!(
+            handle.degraded.load(Ordering::SeqCst),
+            "degraded flag not cleared by the vanished arm"
+        );
+        abort.abort();
+        let _ = std::fs::remove_dir_all(&f.dirs.config_dir);
+    }
+
+    /// (S1.2, review R2) The vanished arm's unwind runs INSIDE the watchdog
+    /// task, so a concurrent `stop_all` aborting the task can land on the
+    /// unwind's first await before any `stop()` ran — the segment then drops
+    /// unstopped (`MasqueHop::stop` is the only reaper of its H2 driver). The
+    /// unwind must be detached (`tokio::spawn`) so a watchdog abort cannot
+    /// cancel the stops, and the segment's instances must be claimed in the
+    /// shared `unwound` set so a racing `stop_all` never re-stops them.
+    ///
+    /// Deterministic gate: the vanished segment's `stop()` parks until the
+    /// test opens the gate. The stop counter increments only AFTER the park,
+    /// so a cancelled unwind is observable (counter stays 0 — the leak the
+    /// review flagged) and a completed one reads exactly 1 (no double-stop).
+    static VANISH_GATE: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+        std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(0)));
+    static VANISH_STOP_ENTERED: AtomicU64 = AtomicU64::new(0);
+
+    /// Build 0 is the initial chain; build 1+ (the vanished arm's freshly
+    /// built segment) park inside `stop()` on [`VANISH_GATE`].
+    static VANISH_BUILDS: AtomicU64 = AtomicU64::new(0);
+
+    static VANISH_DESC: TransportDescriptor = TransportDescriptor {
+        kind: "wdog-vanish",
+        capabilities: Capabilities {
+            accepts_tcp_carrier: true,
+            accepts_udp_carrier: true,
+            dials_tcp: true,
+            dials_udp: true,
+        },
+        obfuscation_families: &[],
+        config_schema: "wdog-vanish/v1",
+        needs_sidecar: false,
+    };
+
+    struct VanishHop {
+        stops: Arc<AtomicU64>,
+        parks_in_stop: bool,
+        events: tokio::sync::broadcast::Sender<HopEvent>,
+    }
+
+    #[async_trait::async_trait]
+    impl RunningHop for VanishHop {
+        fn descriptor(&self) -> &'static TransportDescriptor {
+            &VANISH_DESC
+        }
+        fn dialer(&self) -> Arc<dyn Dialer> {
+            Arc::new(StubDialer)
+        }
+        fn health(&self) -> HopHealth {
+            HopHealth::Healthy
+        }
+        fn events(&self) -> tokio::sync::broadcast::Receiver<HopEvent> {
+            self.events.subscribe()
+        }
+        async fn stop(&self) -> Result<(), HopError> {
+            if self.parks_in_stop {
+                VANISH_STOP_ENTERED.fetch_add(1, Ordering::SeqCst);
+                let permit = VANISH_GATE
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .expect("vanish stop: semaphore open");
+                permit.forget();
+            }
+            // Counted only once the stop COMPLETES: a unwind cancelled at
+            // the park above never increments, which is what makes the leak
+            // observable (an increment-before-park could not tell a
+            // completed stop from a cancelled one).
+            self.stops.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    struct VanishFactory;
+
+    #[async_trait::async_trait]
+    impl qcore_transport_api::HopFactory for VanishFactory {
+        fn descriptor(&self) -> &'static TransportDescriptor {
+            &VANISH_DESC
+        }
+        async fn build(
+            &self,
+            _cfg: qcore_transport_api::HopConfig,
+            _carrier: Arc<dyn Dialer>,
+        ) -> Result<Arc<dyn RunningHop>, HopError> {
+            let n = VANISH_BUILDS.fetch_add(1, Ordering::SeqCst);
+            hold_if_armed().await;
+            let stops = Arc::new(AtomicU64::new(0));
+            HOP_REG.lock().unwrap().push(stops.clone());
+            Ok(Arc::new(VanishHop {
+                stops,
+                parks_in_stop: n >= 1,
+                events: tokio::sync::broadcast::channel(16).0,
+            }))
+        }
+    }
+
+    static VANISH_FACTORY: VanishFactory = VanishFactory;
+
+    qcore_transport_api::register_plugin!(&VANISH_FACTORY);
+
+    /// Drive the session into the vanished-arm shape: initial hop up, rebuild
+    /// parked mid-build, entry removed, rebuild released — the Rebuilt arm
+    /// then finds no entry and unwinds the fresh segment. Returns after the
+    /// fresh segment's stop has entered (parked on [`VANISH_GATE`]).
+    async fn vanished_arm_setup(tag: &str) -> (Fixture, SessionHandle, tokio::task::AbortHandle) {
+        VANISH_BUILDS.store(0, Ordering::SeqCst);
+        VANISH_STOP_ENTERED.store(0, Ordering::SeqCst);
+        hop_reg_reset();
+        let f = fixture(tag, "wdog-vanish");
+        let started = initial_bring_up(
+            "wdog-vanish",
+            &f.handle.events,
             crate::session::net::KeepalivePolicy {
                 enabled: false,
                 interval_secs: 1,
             },
         )
         .await;
+        let handle = reinsert(&f, |h| {
+            h.wire_exit(started, None, None);
+            h
+        });
+        let cfg = test_watchdog_cfg(&f.dirs);
+        let abort = spawn(handle.clone(), cfg, f.live.clone(), f.stop_rx.clone());
+        // Park the rebuild mid-build so the entry can be removed first.
+        arm_hold();
         handle
+            .events
+            .send(HopEvent::Failed {
+                hop_id: "h-0".into(),
+                cause: "injected death".into(),
+            })
+            .expect("session bus send");
+        // Wait until the rebuild has unwound the failed hop (post-snapshot
+        // signal, same as the S1.2 test above).
+        let unwound = poll_until(Instant::now() + Duration::from_secs(5), || {
+            (hop_stops(0) >= 1).then_some(())
+        })
+        .await;
+        assert!(unwound.is_some(), "watchdog unwound the failed hop");
+        // The entry vanishes (stop_session removed it mid-rebuild), then the
+        // rebuild completes: the Rebuilt arm finds no entry and unwinds the
+        // fresh segment.
+        lock_map(&f.live).remove(&handle.id);
+        release_hold();
+        let parked = poll_until(Instant::now() + Duration::from_secs(5), || {
+            (VANISH_STOP_ENTERED.load(Ordering::SeqCst) >= 1).then_some(())
+        })
+        .await;
+        assert!(
+            parked.is_some(),
+            "the vanished arm's unwind reached the fresh segment's stop (parked)"
+        );
+        (f, handle, abort)
+    }
+
+    /// (S1.2, review R2) Aborting the watchdog DURING the vanished arm's
+    /// unwind must not leak the fresh segment: the unwind is detached, so the
+    /// abort cannot cancel the stop, and the hop is stopped exactly once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watchdog_abort_during_vanished_unwind_still_stops_every_hop_once() {
+        let (f, _handle, abort) = vanished_arm_setup("orphan-abort").await;
+        // Abort the watchdog mid-unwind (the stop is parked): the detached
+        // unwind must survive and finish the stop — before the fix, the
+        // abort cancelled the inline unwind at this await and the stop never
+        // completed (leak).
+        abort.abort();
+        // Let the parked stop complete.
+        VANISH_GATE.add_permits(1);
+        let done = poll_until(Instant::now() + Duration::from_secs(5), || {
+            (hop_stops(1) >= 1).then_some(())
+        })
+        .await;
+        assert!(
+            done.is_some(),
+            "the detached unwind must complete the stop despite the mid-unwind abort (leak), got stops={}",
+            hop_stops(1)
+        );
+        // No double-stop: `stop()` is not an idempotent transport contract.
+        tokio::time::timeout(Duration::from_millis(300), async {
+            loop {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                assert!(
+                    hop_stops(1) <= 1,
+                    "the vanished segment's hop must not be stopped twice, got {}",
+                    hop_stops(1)
+                );
+            }
+        })
+        .await
+        .expect_err("no double-stop within the window");
+        assert_eq!(
+            hop_stops(0),
+            1,
+            "the initial hop is not re-stopped by the vanished arm either"
+        );
+        let _ = std::fs::remove_dir_all(&f.dirs.config_dir);
+    }
+
+    /// (S1.2, review R2) `stop_all` racing the vanished arm's detached unwind:
+    /// stop_all aborts the watchdog task while the spawned unwind is parked
+    /// mid-stop on the fresh segment — the abort must NOT cancel the detached
+    /// unwind, and each instance must be stopped exactly once (`stop()` is
+    /// documented non-idempotent, session/mod.rs). The spawned unwind claims
+    /// the fresh segment in the shared `unwound` set before stopping;
+    /// `stop_all` consults that set every sweep round, so the fresh segment
+    /// is never re-stopped, and the initial hop (claimed by the rebuild's own
+    /// unwind) is skipped too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_all_racing_the_vanished_unwind_stops_each_hop_once() {
+        let (f, _handle, abort) = vanished_arm_setup("orphan-race").await;
+        // Wire the real abort handle into the stop_all target: the sweep must
+        // abort the watchdog task (belt) while the detached unwind survives
+        // it (the assertion).
+        let abort_for_handle = abort.clone();
+        let stopping = reinsert(&f, |mut h| {
+            h.watchdog = Some(abort_for_handle);
+            h
+        });
+        let stopper = stopping.clone();
+        let stop_task = tokio::spawn(async move { stopper.stop_all().await });
+        stop_task
+            .await
+            .expect("stop task joins")
+            .expect("stop_all succeeds");
+        // The detached unwind still owns the fresh segment: open the gate so
+        // its stop completes.
+        VANISH_GATE.add_permits(1);
+        let done = poll_until(Instant::now() + Duration::from_secs(5), || {
+            (hop_stops(1) >= 1).then_some(())
+        })
+        .await;
+        assert!(
+            done.is_some(),
+            "the fresh segment must be stopped exactly once across the race (leak), got stops={}",
+            hop_stops(1)
+        );
+        tokio::time::timeout(Duration::from_millis(300), async {
+            loop {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                assert_eq!(
+                    hop_stops(1),
+                    1,
+                    "each instance must be stopped exactly once across the race, got {}",
+                    hop_stops(1)
+                );
+            }
+        })
+        .await
+        .expect_err("no double-stop within the window");
+        assert_eq!(
+            hop_stops(0),
+            1,
+            "the initial hop is not re-stopped by stop_all either"
+        );
+        abort.abort();
+        let _ = std::fs::remove_dir_all(&f.dirs.config_dir);
+    }
+
+    // --- mid-unwind abort (review R2) ---------------------------------------
+
+    /// Per-build stop counters for the mid-unwind double. `entered` counts
+    /// `stop()` calls; `completed` counts stops that ran to completion — a
+    /// stop cancelled mid-flight leaves `entered > completed`, which is the
+    /// leak the claim-before-stop protocol must not leave behind.
+    #[derive(Default)]
+    struct MidStops {
+        entered: AtomicU64,
+        completed: AtomicU64,
+    }
+
+    static MID_BUILDS: AtomicU64 = AtomicU64::new(0);
+    static MID_STOP_ENTERED: AtomicU64 = AtomicU64::new(0);
+    static MID_GATE: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+        std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(0)));
+    static MID_REG: std::sync::LazyLock<std::sync::Mutex<Vec<Arc<MidStops>>>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+
+    static MID_DESC: TransportDescriptor = TransportDescriptor {
+        kind: "wdog-mid",
+        capabilities: Capabilities {
+            accepts_tcp_carrier: true,
+            accepts_udp_carrier: true,
+            dials_tcp: true,
+            dials_udp: true,
+        },
+        obfuscation_families: &[],
+        config_schema: "wdog-mid/v1",
+        needs_sidecar: false,
+    };
+
+    fn mid_entered(build: usize) -> u64 {
+        MID_REG
+            .lock()
+            .unwrap()
+            .get(build)
+            .map(|c| c.entered.load(Ordering::SeqCst))
+            .unwrap_or(0)
+    }
+
+    fn mid_completed(build: usize) -> u64 {
+        MID_REG
+            .lock()
+            .unwrap()
+            .get(build)
+            .map(|c| c.completed.load(Ordering::SeqCst))
+            .unwrap_or(0)
+    }
+
+    struct MidHop {
+        stops: Arc<MidStops>,
+        events: tokio::sync::broadcast::Sender<HopEvent>,
+    }
+
+    #[async_trait::async_trait]
+    impl RunningHop for MidHop {
+        fn descriptor(&self) -> &'static TransportDescriptor {
+            &MID_DESC
+        }
+        fn dialer(&self) -> Arc<dyn Dialer> {
+            Arc::new(StubDialer)
+        }
+        fn health(&self) -> HopHealth {
+            HopHealth::Healthy
+        }
+        fn events(&self) -> tokio::sync::broadcast::Receiver<HopEvent> {
+            self.events.subscribe()
+        }
+        async fn stop(&self) -> Result<(), HopError> {
+            self.stops.entered.fetch_add(1, Ordering::SeqCst);
+            MID_STOP_ENTERED.fetch_add(1, Ordering::SeqCst);
+            let permit = MID_GATE
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("mid stop: semaphore open");
+            permit.forget();
+            self.stops.completed.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    struct MidFactory;
+
+    #[async_trait::async_trait]
+    impl qcore_transport_api::HopFactory for MidFactory {
+        fn descriptor(&self) -> &'static TransportDescriptor {
+            &MID_DESC
+        }
+        async fn build(
+            &self,
+            _cfg: qcore_transport_api::HopConfig,
+            _carrier: Arc<dyn Dialer>,
+        ) -> Result<Arc<dyn RunningHop>, HopError> {
+            MID_BUILDS.fetch_add(1, Ordering::SeqCst);
+            let stops = Arc::new(MidStops::default());
+            MID_REG.lock().unwrap().push(stops.clone());
+            Ok(Arc::new(MidHop {
+                stops,
+                events: tokio::sync::broadcast::channel(16).0,
+            }))
+        }
+    }
+
+    static MID_FACTORY: MidFactory = MidFactory;
+
+    qcore_transport_api::register_plugin!(&MID_FACTORY);
+
+    /// (review R2) The rebuild's segment unwind is itself cancellable: it runs
+    /// inside the watchdog task, which `stop_all` aborts. If the unwind is
+    /// stopped mid-`stop()`, an inline unwind drops the rest of the segment
+    /// unstopped and leaves no claim, so the sweep re-stops the instance whose
+    /// stop was already in flight — a double-stop of a non-idempotent
+    /// operation. Claim-before-stop plus a non-cancellable stop loop must give
+    /// every instance exactly one completed stop.
+    ///
+    /// Deterministic gate: the segment's `stop()` parks on [`MID_GATE`]; the
+    /// reverse-order unwind reaches h-1 first, so h-1 is parked mid-stop when
+    /// `stop_all` aborts the watchdog and h-0 is still untouched.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_all_aborting_a_segment_unwind_stops_each_instance_once() {
+        MID_BUILDS.store(0, Ordering::SeqCst);
+        MID_STOP_ENTERED.store(0, Ordering::SeqCst);
+        MID_REG.lock().unwrap().clear();
+        let specs = vec![
+            plugin_spec("wdog-mid", "h-0"),
+            plugin_spec("wdog-mid", "h-1"),
+        ];
+        let f = fixture_chain("mid-unwind", specs.clone());
+        let started = initial_bring_up_chain(
+            specs,
+            &f.handle.events,
+            crate::session::net::KeepalivePolicy {
+                enabled: false,
+                interval_secs: 1,
+            },
+        )
+        .await;
+        let handle = reinsert(&f, |h| {
+            h.wire_exit(started, None, None);
+            h
+        });
+        // The abort, not an attempt timeout, must end the rebuild.
+        let cfg = WatchdogConfig {
+            attempts: 1,
+            backoff_secs: Vec::new(),
+            budget: Duration::from_secs(30),
+            attempt_timeout: Duration::from_secs(30),
+            ..test_watchdog_cfg(&f.dirs)
+        };
+        let abort = spawn(handle.clone(), cfg, f.live.clone(), f.stop_rx.clone());
+        // Production's map entry carries the abort handle (the fixture's does
+        // not): wire it so `stop_all` really cancels the watchdog mid-unwind.
+        let abort_for_handle = abort.clone();
+        let stopping = reinsert(&f, |mut h| {
+            h.watchdog = Some(abort_for_handle);
+            h
+        });
+        handle
+            .events
+            .send(HopEvent::Failed {
+                hop_id: "h-0".into(),
+                cause: "injected death".into(),
+            })
+            .expect("session bus send");
+        // The unwind stops reverse-order: h-1 enters stop() and parks.
+        let parked = poll_until(Instant::now() + Duration::from_secs(5), || {
+            (mid_entered(1) >= 1).then_some(())
+        })
+        .await;
+        assert!(
+            parked.is_some(),
+            "the segment unwind must park inside h-1's stop (entered={})",
+            mid_entered(1)
+        );
+        assert_eq!(
+            mid_entered(0),
+            0,
+            "h-0's stop is not reached while h-1 is parked"
+        );
+        let stopper = stopping.clone();
+        let stop_task = tokio::spawn(async move { stopper.stop_all().await });
+        // Open the gate for whichever actor owns each stop.
+        MID_GATE.add_permits(2);
+        stop_task
+            .await
+            .expect("stop task joins")
+            .expect("stop_all succeeds");
+        let settled = poll_until(Instant::now() + Duration::from_secs(5), || {
+            (mid_completed(0) == 1 && mid_completed(1) == 1).then_some(())
+        })
+        .await;
+        assert!(
+            settled.is_some(),
+            "both instances must complete their stop, got h-0 entered/completed={}/{}, h-1={}/{}",
+            mid_entered(0),
+            mid_completed(0),
+            mid_entered(1),
+            mid_completed(1)
+        );
+        assert_eq!(
+            mid_entered(0),
+            1,
+            "h-0 stopped exactly once (the sweep's own stop, not a second one)"
+        );
+        assert_eq!(
+            mid_entered(1),
+            1,
+            "h-1 stopped exactly once: the abort must neither cancel its stop nor let the sweep repeat it"
+        );
+        abort.abort();
+        let _ = std::fs::remove_dir_all(&f.dirs.config_dir);
+    }
+
+    /// (S1.2/S2) `stop_all` sweeps hops that appeared after its snapshot: a
+    /// rebuild completing between the snapshot and teardown leaves a fresh
+    /// segment in the shared vec, and the snapshot-only teardown would leak
+    /// it. The gated double pins the window: its `stop()` parks until the
+    /// swap is installed, so the swapped segment provably appears AFTER the
+    /// snapshot (the previous version appended before `stop_all` ran, which
+    /// the main loop already covered — it proved nothing about the sweep).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_all_sweeps_hops_that_appear_after_the_snapshot() {
+        GATED_BUILDS.store(0, Ordering::SeqCst);
+        GATED_STOP_ENTERED.store(0, Ordering::SeqCst);
+        hop_reg_reset();
+        let f = fixture("sweep", "wdog-gated");
+        let started = initial_bring_up(
+            "wdog-gated",
+            &f.handle.events,
+            crate::session::net::KeepalivePolicy {
+                enabled: false,
+                interval_secs: 1,
+            },
+        )
+        .await;
+        let handle = reinsert(&f, |h| {
+            h.wire_exit(started, None, None);
+            h
+        });
+        // stop_all snapshots the vec before its first hop stop; park that
+        // stop so the swap below is deterministically past the snapshot.
+        let stopper = handle.clone();
+        let stop_task = tokio::spawn(async move { stopper.stop_all().await });
+        let entered = poll_until(Instant::now() + Duration::from_secs(5), || {
+            (GATED_STOP_ENTERED.load(Ordering::SeqCst) >= 1).then_some(())
+        })
+        .await;
+        assert!(
+            entered.is_some(),
+            "stop_all reached the snapshot hop's stop (gate)"
+        );
+        // A rebuild completes now (HOP_REG build 1): a different instance
+        // that reuses no id of the snapshot's hop... the sweep cannot key on
+        // the hop id, only on the instance.
+        let rebuilt = initial_bring_up(
+            "wdog-gated",
+            &handle.events,
+            crate::session::net::KeepalivePolicy {
+                enabled: false,
+                interval_secs: 1,
+            },
+        )
+        .await;
+        *handle
             .started
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .extend(rebuilt);
-        handle.stop_all().await.expect("stop_all");
-        // Build 0 was covered by the snapshot; the appended rebuilt hop
-        // (HOP_REG build 1) appeared after it — the sweep must stop it.
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = rebuilt;
+        GATED_GATE.add_permits(1);
+        stop_task
+            .await
+            .expect("stop task joins")
+            .expect("stop_all succeeds");
         assert_eq!(
             hop_stops(1),
             1,
@@ -2077,7 +3272,7 @@ mod tests {
             attempt_timeout: Duration::from_secs(2),
             ..WatchdogConfig::default()
         };
-        let mut wd = Watchdog::new(wd_cfg);
+        let mut wd = Watchdog::new(wd_cfg, fresh_unwound(), fresh_retired());
         // Direct probe of the ownership contract: the resolved material is
         // owned (Arc maps) and drops when the attempt scope ends.
         let hops = vec![plugin_spec("wdog-flaky", "h-0")];
@@ -2121,6 +3316,58 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&d.config_dir);
+        let _ = std::fs::remove_dir_all(&f.dirs.config_dir);
+    }
+
+    /// (S2) Retries re-snapshot the same segment; `stop()` is not an
+    /// idempotent transport contract, so each instance is unwound exactly
+    /// once across the attempt budget.
+    #[tokio::test]
+    async fn repeated_rebuild_attempts_stop_the_failed_segment_once() {
+        FLAKY_BUILDS.store(0, Ordering::SeqCst);
+        hop_reg_reset();
+        let f = fixture("stop-once", "wdog-flaky");
+        let started = initial_bring_up(
+            "wdog-flaky",
+            &f.handle.events,
+            crate::session::net::KeepalivePolicy {
+                enabled: false,
+                interval_secs: 1,
+            },
+        )
+        .await;
+        let handle = reinsert(&f, |h| {
+            h.wire_exit(started, None, None);
+            h
+        });
+        let mut wd = Watchdog::new(
+            WatchdogConfig {
+                attempts: 3,
+                backoff_secs: vec![0, 0, 0],
+                budget: Duration::from_secs(10),
+                attempt_timeout: Duration::from_secs(2),
+                ..test_watchdog_cfg(&f.dirs)
+            },
+            fresh_unwound(),
+            fresh_retired(),
+        );
+        let outcome = wd
+            .on_failed(&f.live, &handle.id, 0, "stop-once probe")
+            .await;
+        assert!(
+            matches!(outcome, WatchOutcome::GaveUp(_)),
+            "the flaky factory never rebuilds"
+        );
+        assert_eq!(
+            FLAKY_BUILDS.load(Ordering::SeqCst),
+            4,
+            "one initial build + three attempts"
+        );
+        assert_eq!(
+            hop_stops(0),
+            1,
+            "three attempts must stop the failed segment exactly once"
+        );
         let _ = std::fs::remove_dir_all(&f.dirs.config_dir);
     }
 

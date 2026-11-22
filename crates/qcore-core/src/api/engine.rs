@@ -80,7 +80,10 @@ pub struct Engine {
     /// the proxy serve path increments (attached via
     /// `proxy::attach_relay_counters` at start), filed by session id so
     /// `session_report` surfaces bytes_in/bytes_out for THIS session.
-    relay_counters: std::sync::Mutex<HashMap<String, Arc<crate::session::proxy::RelayCounters>>>,
+    /// Arc-shared so the watchdog's give-up path can forget the entry through
+    /// the handle's cleanup hook (it removes the live entry itself).
+    relay_counters:
+        Arc<std::sync::Mutex<HashMap<String, Arc<crate::session::proxy::RelayCounters>>>>,
 }
 
 impl Engine {
@@ -94,6 +97,31 @@ impl Engine {
         })
     }
 
+    /// Drop a session's relay-byte aggregate. Called wherever a session
+    /// leaves `live`, so no counter entry outlives its session (and no
+    /// counter keeps serving bytes for an id nobody can address).
+    fn forget_relay_counters(&self, id: &str) {
+        self.relay_counters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(id);
+    }
+
+    /// Cleanup hook handed to a session handle for the watchdog's terminal
+    /// path: the watchdog removes the live entry itself, so the engine cannot
+    /// observe that removal. The hook applies the same leave-live rule as
+    /// every other path (counter entry forgotten with the session).
+    fn relay_cleanup_hook(&self, id: &str) -> Arc<dyn Fn() + Send + Sync> {
+        let counters = Arc::clone(&self.relay_counters);
+        let id = id.to_string();
+        Arc::new(move || {
+            counters
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&id);
+        })
+    }
+
     pub fn new(config: EngineConfig) -> Self {
         let (events, _) = tokio::sync::broadcast::channel(256);
         Engine {
@@ -101,7 +129,7 @@ impl Engine {
             registry: TransportRegistry::global(),
             events,
             live: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            relay_counters: std::sync::Mutex::new(HashMap::new()),
+            relay_counters: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -173,8 +201,22 @@ impl Engine {
                     "validation",
                 )
             })?;
-        let carrier = root_dialer(policy, Duration::from_secs(self.config.timeout_secs.max(1)));
-        let deadline = Instant::now() + Duration::from_secs(self.config.timeout_secs.max(1));
+        let budget = Duration::from_secs(self.config.timeout_secs.max(1));
+        let carrier = root_dialer(policy, budget);
+        // `timeout_secs` is caller-controlled (FFI config JSON / embedder
+        // config): an unrepresentable budget is a typed validation failure,
+        // never a panic out of the deadline arithmetic.
+        let deadline = Instant::now().checked_add(budget).ok_or_else(|| {
+            FailureReport::new(
+                FailureLayer::Validation,
+                "-",
+                format!(
+                    "timeout_secs {} does not fit the host clock; choose a smaller budget",
+                    self.config.timeout_secs
+                ),
+                "validation",
+            )
+        })?;
         // US2: merge stored import material (endpoint/keys/AWG params) for
         // resolution at build time; secrets stay in memory only.
         let imports =
@@ -256,6 +298,10 @@ impl Engine {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(handle.id.clone(), relay_counters);
+        // The watchdog's terminal path removes the live entry itself, so it
+        // needs this session's counter-forget hook (same rule as every other
+        // leave-live path: no counter entry outlives its session).
+        handle.give_up_cleanup = Some(self.relay_cleanup_hook(&handle.id));
         // F2 watchdog: subscribe to the session bus; on any hop Failed it
         // degrades honestly and rebuilds through the same primitives with a
         // bounded budget. The abort handle rides the handle so `stop_all`
@@ -323,6 +369,7 @@ impl Engine {
         let degrading = handle.degraded.load(std::sync::atomic::Ordering::SeqCst);
         if !degrading && self_dead(&reports) {
             self.lock_live().remove(id);
+            self.forget_relay_counters(id);
         }
         let mut report =
             crate::session::report::ConnectionReport::new(reports, handle.exit_hop_id.clone());
@@ -361,6 +408,7 @@ impl Engine {
                 FailureReport::new(FailureLayer::Chain, "-", "no such live session", "chain")
             })?
         };
+        self.forget_relay_counters(id);
         handle.stop_all().await.map_err(|e| {
             FailureReport::new(
                 FailureLayer::Chain,
@@ -385,6 +433,7 @@ impl Engine {
             if !removed {
                 continue;
             }
+            self.forget_relay_counters(&handle.id);
             if let Err(e) = handle.stop_all().await {
                 if first_err.is_none() {
                     first_err = Some(FailureReport::new(
@@ -1552,6 +1601,8 @@ mod tests {
                 obfuscation: None,
                 family: "dual".to_string(),
                 endpoint: endpoint.map(str::to_string),
+                server_name: None,
+                insecure_skip_verify: None,
             }),
         };
         let expanded = |hops: &[HopSpec]| {
@@ -1660,5 +1711,227 @@ mod tests {
             second_stopped.load(std::sync::atomic::Ordering::SeqCst),
             "second session's stop still ran after the first errored"
         );
+    }
+
+    #[tokio::test]
+    async fn start_rejects_a_timeout_that_cannot_be_a_deadline() {
+        // `timeout_secs` is caller-controlled (FFI config JSON). u64::MAX
+        // seconds used to panic in `Instant::now() + Duration`, which the
+        // FFI surface saw only as the catch_unwind -1 with no typed failure.
+        let engine = Engine::new(EngineConfig {
+            timeout_secs: u64::MAX,
+            ..EngineConfig::default()
+        });
+        let specs = engine
+            .parse_chain("registry-test")
+            .expect("registered plugin kind parses");
+        let err = engine
+            .start(specs)
+            .await
+            .expect_err("an unrepresentable deadline is a typed failure");
+        assert_eq!(err.layer, FailureLayer::Validation);
+        assert!(
+            err.cause.contains("timeout_secs"),
+            "names the field: {}",
+            err.cause
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_counters_do_not_outlive_their_session() {
+        // Every path that removes a session from `live` must drop its
+        // relay-counter entry too: a leaked entry keeps serving bytes for a
+        // session id nobody can address.
+        let engine = test_engine();
+        let attach = |id: &str| {
+            let counters = crate::session::proxy::attach_relay_counters();
+            engine
+                .relay_counters
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(id.to_string(), counters);
+        };
+        let has_counters = |id: &str| {
+            engine
+                .relay_counters
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(id)
+        };
+        // 1. Self-dead reap through session_report.
+        engine.lock_live().insert(
+            "dead".to_string(),
+            handle_with_health("dead", qcore_transport_api::HopHealth::Failed),
+        );
+        attach("dead");
+        engine
+            .session_report("dead")
+            .expect("final report served once");
+        assert!(!has_counters("dead"), "reaped session's counters dropped");
+
+        // 2. Explicit stop_session.
+        engine
+            .lock_live()
+            .insert("stopped".to_string(), dummy_handle("stopped"));
+        attach("stopped");
+        engine.stop_session("stopped").await.expect("stops");
+        assert!(
+            !has_counters("stopped"),
+            "stopped session's counters dropped"
+        );
+
+        // 3. stop-all sweep.
+        engine
+            .lock_live()
+            .insert("all-1".to_string(), dummy_handle("all-1"));
+        engine
+            .lock_live()
+            .insert("all-2".to_string(), dummy_handle("all-2"));
+        attach("all-1");
+        attach("all-2");
+        engine.stop().await.expect("stop-all");
+        assert!(
+            !has_counters("all-1") && !has_counters("all-2"),
+            "swept sessions' counters dropped"
+        );
+    }
+
+    // --- watchdog give-up counter cleanup ----------------------------------
+
+    static GIVEUP_BUILDS: AtomicU64 = AtomicU64::new(0);
+
+    static GIVEUP_DESC: qcore_transport_api::TransportDescriptor =
+        qcore_transport_api::TransportDescriptor {
+            kind: "engine-giveup",
+            capabilities: qcore_transport_api::Capabilities {
+                accepts_tcp_carrier: true,
+                accepts_udp_carrier: true,
+                dials_tcp: true,
+                dials_udp: true,
+            },
+            obfuscation_families: &[],
+            config_schema: "engine-giveup/v1",
+            needs_sidecar: false,
+        };
+
+    struct GiveUpHop {
+        events: tokio::sync::broadcast::Sender<HopEvent>,
+    }
+
+    #[async_trait::async_trait]
+    impl qcore_transport_api::RunningHop for GiveUpHop {
+        fn descriptor(&self) -> &'static qcore_transport_api::TransportDescriptor {
+            &GIVEUP_DESC
+        }
+        fn dialer(&self) -> std::sync::Arc<dyn qcore_transport_api::Dialer> {
+            std::sync::Arc::new(UnusedDialer)
+        }
+        fn health(&self) -> qcore_transport_api::HopHealth {
+            qcore_transport_api::HopHealth::Healthy
+        }
+        fn events(&self) -> tokio::sync::broadcast::Receiver<HopEvent> {
+            self.events.subscribe()
+        }
+        async fn stop(&self) -> Result<(), qcore_transport_api::HopError> {
+            Ok(())
+        }
+    }
+
+    struct GiveUpFactory;
+
+    #[async_trait::async_trait]
+    impl qcore_transport_api::HopFactory for GiveUpFactory {
+        fn descriptor(&self) -> &'static qcore_transport_api::TransportDescriptor {
+            &GIVEUP_DESC
+        }
+        async fn build(
+            &self,
+            _cfg: qcore_transport_api::HopConfig,
+            _carrier: std::sync::Arc<dyn qcore_transport_api::Dialer>,
+        ) -> Result<
+            std::sync::Arc<dyn qcore_transport_api::RunningHop>,
+            qcore_transport_api::HopError,
+        > {
+            if GIVEUP_BUILDS.fetch_add(1, Ordering::SeqCst) >= 1 {
+                return Err(qcore_transport_api::HopError::transport(
+                    "boom",
+                    "rebuild build always fails",
+                ));
+            }
+            Ok(std::sync::Arc::new(GiveUpHop {
+                events: tokio::sync::broadcast::channel(16).0,
+            }))
+        }
+    }
+
+    static GIVEUP_FACTORY: GiveUpFactory = GiveUpFactory;
+
+    qcore_transport_api::register_plugin!(&GIVEUP_FACTORY);
+
+    /// The watchdog's give-up path removes the live entry itself, so the
+    /// engine never observes that removal. Without a cleanup hook the
+    /// session's relay-counter entry leaks (bytes keep being attributed to an
+    /// id nobody can address). The hop dies, every rebuild fails, and the
+    /// terminal path must leave no counter entry behind.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watchdog_give_up_forgets_the_sessions_relay_counters() {
+        GIVEUP_BUILDS.store(0, Ordering::SeqCst);
+        let (root, dirs) = preconnect_dirs("giveup-counters");
+        dirs.ensure_dirs().expect("dirs");
+        let engine = Engine::new(EngineConfig {
+            dirs,
+            ..EngineConfig::default()
+        });
+        let specs = vec![ExpandedHop::Hop(HopSpec {
+            id: "gu-0".to_string(),
+            config: crate::config::HopConfig::Plugin(crate::config::hop::PluginHopConfig {
+                kind: "engine-giveup".to_string(),
+                family: "dual".to_string(),
+                fields: Default::default(),
+            }),
+        })];
+        let handle = engine.start(specs).await.expect("engine start");
+        assert!(
+            engine
+                .relay_counters
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&handle.id),
+            "start files the session's relay counters"
+        );
+        handle
+            .events
+            .send(HopEvent::Failed {
+                hop_id: "gu-0".into(),
+                cause: "injected death".into(),
+            })
+            .expect("session bus send");
+        // Production backoff (2 s + 5 s) before the third attempt concludes.
+        let mut give_up = (*handle.give_up).clone();
+        let terminal = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if *give_up.borrow_and_update() {
+                    return;
+                }
+                if give_up.changed().await.is_err() {
+                    return;
+                }
+            }
+        })
+        .await;
+        assert!(terminal.is_ok(), "watchdog reaches its terminal state");
+        assert!(
+            engine.lock_live().get(&handle.id).is_none(),
+            "give-up removes the live entry"
+        );
+        assert!(
+            !engine
+                .relay_counters
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&handle.id),
+            "give-up must forget the session's relay counters (no entry outlives its session)"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

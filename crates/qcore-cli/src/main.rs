@@ -87,8 +87,10 @@ fn check_globals(cli: &Cli) -> Result<GlobalOpts, i32> {
         }
     }
     let timeout_secs = cli.timeout.unwrap_or(30);
-    if timeout_secs < 1 {
-        eprintln!("qcore: --timeout must be at least 1 second (exit 6)");
+    // Same range the FFI clamps to (`qcore_engine_new`): an unrepresentable
+    // budget would overflow the engine's deadline arithmetic.
+    if !(1..=86_400).contains(&timeout_secs) {
+        eprintln!("qcore: --timeout {timeout_secs} outside 1..=86400 seconds (exit 6)");
         return Err(exit::USAGE);
     }
     Ok(GlobalOpts {
@@ -157,6 +159,31 @@ fn reject_already_running(json: bool, blocker: &str) -> i32 {
         );
     }
     exit::USAGE
+}
+
+/// One pre-start usage failure document (contracts/cli.md §1): with `--json`,
+/// stdout carries exactly ONE document even when no hop ever started —
+/// silence is a contract violation, not a rejection (the `ls --json`
+/// precedent). Shape follows [`finish_connect_failure`] plus the actionable
+/// `reason` the sibling usage paths emit; `cause`/`reason` pass the central
+/// redactor (a secret-shaped flag value must not ride out) and no hop
+/// started, so `hop_id` is empty. The caller keeps its stderr diagnostic and
+/// exit code unchanged.
+fn emit_prestart_usage_failure(json: bool, reason: &str) {
+    if !json {
+        return;
+    }
+    println!(
+        "{}",
+        serde_json::json!({
+            "ok": false,
+            "layer": qcore_transport_api::FailureLayer::Config.to_string(),
+            "hop_id": "",
+            "kind": "usage",
+            "reason": qcore_core::diag::masked_value("reason", reason),
+            "cause": qcore_core::diag::masked_value("cause", reason),
+        })
+    );
 }
 
 // The `Connect` variant is a clap arg container: built once at startup and
@@ -354,9 +381,56 @@ fn main() {
     // Force linkage of every enabled transport so inventory registration
     // reaches the engine registry (static archives only link used objects).
     let _ = qcore_transports::linked_kinds();
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => std::process::exit(clap_exit(&e)),
+    };
     let code = run(cli);
     std::process::exit(code);
+}
+
+/// Map a clap parse failure to the contracted shape (contracts/cli.md §2):
+/// `--help`/`--version` are results (stdout, exit 0); every other failure is
+/// a usage error, reported as ONE `qcore: <msg> (exit 6)` diagnostic rather
+/// than clap's multi-line block and its default exit 2.
+fn clap_exit(err: &clap::Error) -> i32 {
+    use clap::error::ErrorKind;
+    match err.kind() {
+        ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => {
+            let _ = err.print();
+            exit::SUCCESS
+        }
+        // Bare `qcore` (no subcommand): clap renders the full help into the
+        // error, but `err.print()` would put that help on STDERR (this kind's
+        // stream). Help is a result, so it goes to stdout here, and stderr
+        // carries the one usage diagnostic naming the miss.
+        ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => {
+            println!("{}", err.render());
+            exit::diag_exit(exit::USAGE, "no command given");
+            exit::USAGE
+        }
+        _ => {
+            exit::diag_exit(exit::USAGE, &collapsed_clap_message(err));
+            exit::USAGE
+        }
+    }
+}
+
+/// Usage diagnostics are one line per failure; clap renders its message as an
+/// error line, a usage block and a `--help` hint. Collapse the whitespace and
+/// keep only the core message: `diag_exit` supplies the `qcore: ` framing, so
+/// clap's own `error: ` prefix is redundant, and its usage block/help hint are
+/// a trailer that would turn the one-line diagnostic into a run-on.
+fn collapsed_clap_message(err: &clap::Error) -> String {
+    let collapsed = err
+        .to_string()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let msg = collapsed.strip_prefix("error: ").unwrap_or(&collapsed);
+    let msg = msg.split(" Usage: ").next().unwrap_or(msg);
+    let msg = msg.split(" For more information").next().unwrap_or(msg);
+    msg.trim().to_string()
 }
 
 /// Reset SIGPIPE to SIG_DFL (the Rust runtime starts with it ignored): a
@@ -572,7 +646,18 @@ async fn async_main(cli: Cli) -> i32 {
             profile,
             family,
             output,
-        } => cmd::scan::run(&transport, &profile, &family, &output, cli.json, &dirs).await,
+        } => {
+            cmd::scan::run(
+                &transport,
+                &profile,
+                &family,
+                &output,
+                cli.json,
+                globals.quiet,
+                &dirs,
+            )
+            .await
+        }
     }
 }
 
@@ -717,20 +802,16 @@ async fn run_shortcut(
     }
 }
 
-fn check_level(level: &str) -> Result<u8, i32> {
+fn check_level(level: &str) -> Result<u8, String> {
     match level {
         "error" => Ok(0),
         "warn" => Ok(1),
         "info" => Ok(2),
         "debug" => Ok(3),
         "trace" => Ok(4),
-        _ => {
-            exit::diag_exit(
-                exit::USAGE,
-                &format!("invalid --log-level `{level}` (expected error|warn|info|debug|trace)"),
-            );
-            Err(exit::USAGE)
-        }
+        _ => Err(format!(
+            "invalid --log-level `{level}` (expected error|warn|info|debug|trace)"
+        )),
     }
 }
 
@@ -758,23 +839,27 @@ async fn run_connect(o: ConnectOpts) -> i32 {
     };
     let _verbose = match check_level(&log_level) {
         Ok(v) => v,
-        Err(code) => return code,
+        Err(msg) => {
+            exit::diag_exit(exit::USAGE, &msg);
+            emit_prestart_usage_failure(o.json, &msg);
+            return exit::USAGE;
+        }
     };
     let dirs = o.globals_dirs.clone();
     // Fail fast on family/prefer before touching the network (exit 6:
     // unknown families are usage errors, matching `scan --family`).
     if let Err(e) = qcore_core::session::net::FamilyPolicy::parse(&o.family, &o.prefer) {
         eprintln!("qcore: {e} (exit 6)");
+        emit_prestart_usage_failure(o.json, &e);
         return exit::USAGE;
     }
     let bind_addr: Option<std::net::SocketAddr> = match o.bind {
         Some(ref b) => match b.parse() {
             Ok(a) => Some(a),
             Err(_) => {
-                exit::diag_exit(
-                    exit::USAGE,
-                    &format!("invalid --bind `{b}` (expected host:port)"),
-                );
+                let msg = format!("invalid --bind `{b}` (expected host:port)");
+                exit::diag_exit(exit::USAGE, &msg);
+                emit_prestart_usage_failure(o.json, &msg);
                 return exit::USAGE;
             }
         },
@@ -785,6 +870,7 @@ async fn run_connect(o: ConnectOpts) -> i32 {
     if let Some(addr) = bind_addr {
         if let Err(msg) = bind_policy(addr, o.expose_lan) {
             exit::diag_exit(exit::USAGE, msg);
+            emit_prestart_usage_failure(o.json, msg);
             return exit::USAGE;
         }
     }
@@ -798,10 +884,9 @@ async fn run_connect(o: ConnectOpts) -> i32 {
         Some(ref h) => match h.parse() {
             Ok(a) => Some(a),
             Err(_) => {
-                exit::diag_exit(
-                    exit::USAGE,
-                    &format!("invalid --http-proxy `{h}` (expected host:port)"),
-                );
+                let msg = format!("invalid --http-proxy `{h}` (expected host:port)");
+                exit::diag_exit(exit::USAGE, &msg);
+                emit_prestart_usage_failure(o.json, &msg);
                 return exit::USAGE;
             }
         },
@@ -809,10 +894,9 @@ async fn run_connect(o: ConnectOpts) -> i32 {
     };
     if let Some(addr) = http_proxy_addr {
         if bind_policy(addr, o.expose_lan).is_err() {
-            exit::diag_exit(
-                exit::USAGE,
-                "refusing non-loopback --http-proxy without --expose-lan",
-            );
+            let msg = "refusing non-loopback --http-proxy without --expose-lan";
+            exit::diag_exit(exit::USAGE, msg);
+            emit_prestart_usage_failure(o.json, msg);
             return exit::USAGE;
         }
     }
@@ -826,10 +910,9 @@ async fn run_connect(o: ConnectOpts) -> i32 {
         Some(raw) => match raw.parse::<std::net::IpAddr>() {
             Ok(ip) => Some(ip),
             Err(_) => {
-                exit::diag_exit(
-                    exit::USAGE,
-                    &format!("invalid --dns `{raw}` (expected an IP address)"),
-                );
+                let msg = format!("invalid --dns `{raw}` (expected an IP address)");
+                exit::diag_exit(exit::USAGE, &msg);
+                emit_prestart_usage_failure(o.json, &msg);
                 return exit::USAGE;
             }
         },
@@ -845,6 +928,7 @@ async fn run_connect(o: ConnectOpts) -> i32 {
             Ok(parsed) => parsed,
             Err(e) => {
                 exit::diag_exit(exit::USAGE, &e);
+                emit_prestart_usage_failure(o.json, &e);
                 return exit::USAGE;
             }
         },
@@ -866,7 +950,9 @@ async fn run_connect(o: ConnectOpts) -> i32 {
             match qcore_core::session::routing::Router::load(path) {
                 Ok(r) => (r, Some(path.to_path_buf())),
                 Err(e) => {
-                    exit::diag_exit(exit::USAGE, &format!("invalid routing rules: {e}"));
+                    let msg = format!("invalid routing rules: {e}");
+                    exit::diag_exit(exit::USAGE, &msg);
+                    emit_prestart_usage_failure(o.json, &msg);
                     return exit::USAGE;
                 }
             }
@@ -879,7 +965,9 @@ async fn run_connect(o: ConnectOpts) -> i32 {
                 Ok(r) if r.is_empty() => (r, None),
                 Ok(r) => (r, Some(path)),
                 Err(e) => {
-                    exit::diag_exit(exit::USAGE, &format!("invalid routing rules: {e}"));
+                    let msg = format!("invalid routing rules: {e}");
+                    exit::diag_exit(exit::USAGE, &msg);
+                    emit_prestart_usage_failure(o.json, &msg);
                     return exit::USAGE;
                 }
             }
@@ -912,6 +1000,7 @@ async fn run_connect(o: ConnectOpts) -> i32 {
         Ok(lock) => lock,
         Err(e) => {
             exit::diag_exit(exit::USAGE, &e);
+            emit_prestart_usage_failure(o.json, &e);
             return exit::USAGE;
         }
     };
@@ -946,10 +1035,51 @@ async fn run_connect(o: ConnectOpts) -> i32 {
                 ) {
                     Ok(i) => (i.specs, i.max_depth),
                     Err((code, msg)) => {
+                        // With --json, stdout carries exactly one failure
+                        // document even when no hop ever started (contracts
+                        // §1): the finish_connect_failure shape, with the
+                        // masked cause (a secret-shaped reason degrades to a
+                        // placeholder) and the reason for usage-class
+                        // conflicts. The diagnostic still goes to stderr.
+                        if o.json {
+                            let (layer, kind) = if code == exit::INVALID {
+                                (
+                                    qcore_transport_api::FailureLayer::Validation.to_string(),
+                                    "validation",
+                                )
+                            } else {
+                                // Usage-class siblings (reject_already_running)
+                                // report Config + "usage": no hop was built.
+                                (
+                                    qcore_transport_api::FailureLayer::Config.to_string(),
+                                    "usage",
+                                )
+                            };
+                            let cause = if code == exit::INVALID {
+                                qcore_core::diag::masked_value("cause", &msg)
+                            } else {
+                                msg.clone()
+                            };
+                            println!(
+                                "{}",
+                                serde_json::json!({
+                                    "ok": false,
+                                    "layer": layer,
+                                    "hop_id": "",
+                                    "kind": kind,
+                                    "reason": msg,
+                                    "cause": cause,
+                                })
+                            );
+                        }
                         if code == exit::INVALID {
-                            eprintln!("qcore: invalid chain (exit 2)\n  {msg}");
+                            // Same shape as the sibling invalid-chain sites
+                            // (shortcut dispatch, obfuscation refusal): the
+                            // `(exit N)` suffix rides the header line, the
+                            // reason is an indented detail line below it.
+                            eprintln!("qcore: invalid chain (exit {code})\n  {msg}");
                         } else {
-                            eprintln!("qcore: {msg}");
+                            exit::diag_exit(code, &msg);
                         }
                         return code;
                     }
@@ -1453,7 +1583,7 @@ fn finish_connect_failure(
             serde_json::json!({
                 "ok": false,
                 "layer": r.layer.to_string(),
-                "hop_id": r.hop_id,
+                "hop_id": qcore_core::diag::masked_value("hop_id", &r.hop_id),
                 "kind": r.kind,
                 "cause": qcore_core::diag::masked_value("cause", &r.cause),
             })
@@ -2121,6 +2251,34 @@ mod tests {
             false,
         );
         assert_eq!(async_main(cli).await, exit::USAGE);
+    }
+
+    #[test]
+    fn clap_usage_error_collapses_to_one_line() {
+        // contracts/cli.md §2: clap-level usage errors are exit 6 and the
+        // diagnostic is one line, never clap's multi-line block. The
+        // `diag_exit` prefix already frames the line, so clap's own
+        // `error: ` prefix and its usage/`--help` trailer are stripped: the
+        // remaining text is the core message, not a run-on sentence.
+        let err = match Cli::try_parse_from(["qcore", "--nope"]) {
+            Ok(_) => panic!("unknown flag must not parse"),
+            Err(e) => e,
+        };
+        let msg = collapsed_clap_message(&err);
+        assert!(!msg.contains('\n'), "one line only: {msg:?}");
+        assert!(
+            msg.starts_with("unexpected argument"),
+            "clap's `error: ` framing is stripped: {msg:?}"
+        );
+        assert!(
+            msg.contains("--nope"),
+            "names the offending argument: {msg:?}"
+        );
+        assert!(
+            !msg.contains("Usage:") && !msg.contains("For more information"),
+            "clap's usage block and help hint are dropped: {msg:?}"
+        );
+        assert_eq!(clap_exit(&err), exit::USAGE);
     }
 
     #[test]

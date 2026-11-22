@@ -18,7 +18,8 @@ pub fn profile_named(
 }
 
 /// Run one scan (002 FR-006/007/008/014): shared core pipeline so CLI and
-/// FFI populate/use the winner cache identically on same inputs.
+/// FFI populate/use the winner cache identically on same inputs. `quiet`
+/// mirrors the global flag: cache-skip warnings stay off stderr when set.
 pub async fn run_scan_request(
     dirs: &ProfileDirs,
     transport: &str,
@@ -34,6 +35,7 @@ pub async fn run(
     family: &str,
     output: &str,
     json: bool,
+    quiet: bool,
     dirs: &ProfileDirs,
 ) -> i32 {
     // Transport must name a linked registry kind: a typo (`warrp`) would
@@ -82,6 +84,14 @@ pub async fn run(
             return exit::HOP_FAILURE;
         }
     };
+    // Best-effort cache-IO skips surface as diagnostics (not failures): the
+    // core pipeline carries them on the report; `--quiet` suppresses them.
+    // No `(exit N)` suffix — these lines report no failure exit.
+    if !quiet {
+        for warning in &report.warnings {
+            eprintln!("qcore: {warning}");
+        }
+    }
     if report.ranked.is_empty() {
         if json || output == "json" {
             println!(
@@ -233,7 +243,7 @@ mod tests {
     async fn bogus_output_is_usage() {
         let d = test_dirs("bogus-output");
         assert_eq!(
-            run("warp", "balanced", "dual", "yaml", false, &d).await,
+            run("warp", "balanced", "dual", "yaml", false, false, &d).await,
             exit::USAGE
         );
         let _ = std::fs::remove_dir_all(&d.config_dir);
@@ -243,7 +253,7 @@ mod tests {
     async fn json_plus_ndjson_is_usage_single_document() {
         let d = test_dirs("json-ndjson");
         assert_eq!(
-            run("warp", "balanced", "dual", "ndjson", true, &d).await,
+            run("warp", "balanced", "dual", "ndjson", true, false, &d).await,
             exit::USAGE
         );
         let _ = std::fs::remove_dir_all(&d.config_dir);
@@ -253,7 +263,7 @@ mod tests {
     async fn bad_family_is_usage() {
         let d = test_dirs("bad-family");
         assert_eq!(
-            run("warp", "balanced", "bogus", "table", false, &d).await,
+            run("warp", "balanced", "bogus", "table", false, false, &d).await,
             exit::USAGE
         );
         let _ = std::fs::remove_dir_all(&d.config_dir);
@@ -287,9 +297,108 @@ mod tests {
     async fn typo_transport_is_usage() {
         let d = test_dirs("typo-transport");
         assert_eq!(
-            run("warrp", "balanced", "dual", "table", false, &d).await,
+            run("warrp", "balanced", "dual", "table", false, false, &d).await,
             exit::USAGE
         );
         let _ = std::fs::remove_dir_all(&d.config_dir);
+    }
+
+    /// Cache-IO skips surface as report warnings (never CLI-framed stderr
+    /// from core): a blocked config dir makes every cache write fail while
+    /// the scan itself succeeds, and the warning must ride the report. The
+    /// `qcore: {warning}` rendering + `--quiet` suppression are pinned
+    /// black-box in
+    /// `tests/cli_contract.rs::scan_cache_warning_rides_stderr_and_quiet_suppresses_it`
+    /// (binary-level streams).
+    #[tokio::test]
+    async fn cache_skip_ride_the_report_not_stderr() {
+        let base = std::env::temp_dir().join(format!("qcore-cli-scan-warn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let prof = base.join("prof");
+        std::fs::create_dir_all(&prof).expect("profile dir");
+        let d = ProfileDirs::resolve(Some(base.join("cfg")), Some(prof));
+        d.ensure_dirs().unwrap();
+        std::fs::write(
+            d.profile_dir.join("scan.toml"),
+            format!(
+                "{}\n[discovery.mock]\nseeds = [\"127.0.0.1:1\"]\n",
+                qcore_core::scan::SHIPPED_SCAN_TOML
+            ),
+        )
+        .unwrap();
+        // An `endpoints.json` directory: reads tolerate it (empty state), and
+        // the eviction's `remove_file` fails on it — the skip must ride the
+        // report, never core-written stderr.
+        std::fs::create_dir_all(d.endpoints_file()).expect("blocking dir");
+        let profile = qcore_core::scan::load_profile(&d, "turbo").unwrap();
+        let report = qcore_core::scan::run_scan_request(&d, "mock", profile, "ipv4")
+            .await
+            .expect("scan succeeds despite cache write failure");
+        assert!(report.ranked.is_empty(), "closed port passes nothing");
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("scan cache eviction skipped")),
+            "empty scan carries the eviction-skip warning: {:?}",
+            report.warnings
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The verified-scan path carries the persist-skip warning: the winner
+    /// write fails (blocked dir) but the verified report survives intact.
+    #[tokio::test]
+    async fn verified_scan_with_blocked_cache_carries_persist_warning() {
+        // A live echo endpoint is needed for a Verified candidate: use mock's
+        // TcpEcho contract against a local listener.
+        let _ = qcore_transports::linked_kinds();
+        let base =
+            std::env::temp_dir().join(format!("qcore-cli-scan-warn2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let prof = base.join("prof");
+        std::fs::create_dir_all(&prof).expect("profile dir");
+        let d = ProfileDirs::resolve(Some(base.join("cfg")), Some(prof));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let (mut r, mut w) = s.split();
+                    let _ = tokio::io::copy(&mut r, &mut w).await;
+                });
+            }
+        });
+        std::fs::write(
+            d.profile_dir.join("scan.toml"),
+            format!(
+                "{}\n[discovery.mock]\nseeds = [\"{addr}\"]\n",
+                qcore_core::scan::SHIPPED_SCAN_TOML
+            ),
+        )
+        .unwrap();
+        // A `data-plane` profile: the echo endpoint reaches Verified, so the
+        // persist path runs (handshake probes stop at Uncertain and never
+        // persist). The blocked config dir makes the winner/LKG writes fail
+        // while the scan itself succeeds.
+        std::fs::write(&d.config_dir, b"not a directory").expect("blocking file");
+        let profile = qcore_core::scan::load_profile(&d, "balanced").unwrap();
+        let report = qcore_core::scan::run_scan_request(&d, "mock", profile, "ipv4")
+            .await
+            .expect("scan succeeds despite cache write failure");
+        assert_eq!(report.ranked.len(), 1, "echo endpoint verified");
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("scan cache persist skipped")),
+            "verified scan carries the persist-skip warning: {:?}",
+            report.warnings
+        );
+        assert!(
+            !d.endpoints_file().exists(),
+            "blocked cache dir: no endpoints.json was written"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

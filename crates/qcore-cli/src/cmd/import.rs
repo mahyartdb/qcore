@@ -8,7 +8,7 @@
 //! diagnostics to stderr.
 
 use qcore_core::config::export::{export_redacted, from_stored};
-use qcore_core::config::import::{load_import, store_import, ConfigImport};
+use qcore_core::config::import::{load_import, store_import, ConfigImport, ImportLoadError};
 use qcore_core::config::profile_dir::ProfileDirs;
 
 use crate::exit;
@@ -76,8 +76,22 @@ pub fn run_export(import_ref: &str, json: bool, dirs: &ProfileDirs) -> i32 {
     let (stored, secrets) = match load_import(dirs, import_ref) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("qcore: {e}");
-            return exit::IMPORT_REJECTED;
+            let code = export_failure_code(&e);
+            exit::diag_exit(code, &e.to_string());
+            if json {
+                // One failure document on stdout, shaped like run_import's
+                // rejection (contracts/cli.md §1); an export has no field
+                // list, so the message rides in `reasons`.
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "ok": false,
+                        "ref": import_ref,
+                        "reasons": [e.to_string()],
+                    })
+                );
+            }
+            return code;
         }
     };
     let imp = from_stored(&stored, secrets, std::path::Path::new(import_ref));
@@ -101,9 +115,88 @@ pub fn run_export(import_ref: &str, json: bool, dirs: &ProfileDirs) -> i32 {
     exit::SUCCESS
 }
 
+/// `load_import` reports WHY it failed as a typed error; the contract splits
+/// the variants across exit codes: a missing/unreadable record or a
+/// malformed ref is usage (6); corrupt stored content or an unavailable
+/// secret is an import rejection (5) (contracts/cli.md §2 row 5). The
+/// mapping rides the variant, never the message text, so rewording a
+/// message cannot move a failure between exit codes.
+fn export_failure_code(e: &ImportLoadError) -> i32 {
+    match e {
+        ImportLoadError::UnknownRef(_) | ImportLoadError::InvalidRef(_) => exit::USAGE,
+        ImportLoadError::Corrupt(_) | ImportLoadError::SecretUnavailable(_) => {
+            exit::IMPORT_REJECTED
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn export_failure_codes_split_usage_from_rejection() {
+        // Classification rides the typed variant (contracts/cli.md §2 row 5:
+        // missing/unreadable record and bad ref = 6, content = 5).
+        assert_eq!(
+            export_failure_code(&ImportLoadError::UnknownRef(
+                "unknown import `x` (see `qcore import`)".into()
+            )),
+            exit::USAGE
+        );
+        assert_eq!(
+            export_failure_code(&ImportLoadError::InvalidRef(
+                "invalid import ref `../x`".into()
+            )),
+            exit::USAGE
+        );
+        assert_eq!(
+            export_failure_code(&ImportLoadError::Corrupt(
+                "import record: unknown field `garbage`".into()
+            )),
+            exit::IMPORT_REJECTED
+        );
+        assert_eq!(
+            export_failure_code(&ImportLoadError::SecretUnavailable(
+                "import `x` secret `interface.private_key` unavailable: keyring gone".into()
+            )),
+            exit::IMPORT_REJECTED
+        );
+    }
+
+    #[test]
+    fn export_failure_classification_is_reword_resistant() {
+        // The old classifier sniffed message prefixes (`starts_with`), so any
+        // rewording silently moved a failure between exit codes: a missing
+        // record reported as "no stored import ..." no longer matched
+        // "unknown import " and fell through to exit 5. Variants are immune
+        // to wording — assert the SAME message text misclassifies under the
+        // string rule but classifies correctly under the typed one.
+        let reworded_unknown = "no stored import `x`: nothing to export";
+        let reworded_corrupt = "unknown import `x`: field `garbage` is garbage";
+        let legacy_prefix_rule = |msg: &str| {
+            if msg.starts_with("unknown import ") || msg.starts_with("invalid import ref ") {
+                exit::USAGE
+            } else {
+                exit::IMPORT_REJECTED
+            }
+        };
+        // A reworded missing record: the old rule calls it a rejection (5),
+        // the typed rule keeps it usage (6).
+        assert_eq!(legacy_prefix_rule(reworded_unknown), exit::IMPORT_REJECTED);
+        assert_eq!(
+            export_failure_code(&ImportLoadError::UnknownRef(reworded_unknown.into())),
+            exit::USAGE
+        );
+        // A reworded corruption whose text happens to START with the unknown
+        // marker: the old rule calls it usage (6), the typed rule keeps it a
+        // rejection (5).
+        assert_eq!(legacy_prefix_rule(reworded_corrupt), exit::USAGE);
+        assert_eq!(
+            export_failure_code(&ImportLoadError::Corrupt(reworded_corrupt.into())),
+            exit::IMPORT_REJECTED
+        );
+    }
 
     #[test]
     fn text_mode_import_succeeds_even_when_quiet() {

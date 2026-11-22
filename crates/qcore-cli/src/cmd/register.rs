@@ -62,7 +62,10 @@ pub fn emit(report: &RegistrationReport, json: bool) -> i32 {
             report.cause
         );
     } else {
-        eprintln!("qcore: {} — {}", action_word(report.action), report.cause);
+        exit::diag_exit(
+            code,
+            &format!("{} — {}", action_word(report.action), report.cause),
+        );
     }
     code
 }

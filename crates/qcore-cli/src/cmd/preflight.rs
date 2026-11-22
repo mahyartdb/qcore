@@ -130,7 +130,7 @@ pub fn run(engine: &Engine, chain: &str, json: bool) -> i32 {
     let inputs = match resolve_inputs(engine, Some(chain), None, None, &[]) {
         Ok(i) => i,
         Err((code, msg)) => {
-            eprintln!("qcore: {msg}");
+            exit::diag_exit(code, &msg);
             return code;
         }
     };
@@ -151,24 +151,38 @@ pub fn run_resolved(engine: &Engine, inputs: &ResolvedInputs, json: bool, quiet:
             exit::SUCCESS
         }
         qcore_core::api::engine::Preflight::Rejected(e) => {
+            // `reason`/`fix` are free text that can echo authored input (an
+            // import ref, a label): both sinks render them through the
+            // central redactor, exactly like the hop id.
+            let reason = qcore_core::diag::masked_value("reason", &e.reason);
+            let fix = e
+                .fix
+                .as_deref()
+                .map(|f| qcore_core::diag::masked_value("fix", f));
             if json {
                 println!(
                     "{}",
                     serde_json::json!({
                         "ok": false,
                         "hop_index": e.hop_index,
-                        "hop_id": e.hop_id,
-                        "reason": e.reason,
-                        "fix": e.fix,
+                        "hop_id": e
+                            .hop_id
+                            .as_deref()
+                            .map(|id| qcore_core::diag::masked_value("hop_id", id)),
+                        "reason": reason,
+                        "fix": fix,
                     })
                 );
             } else {
                 eprintln!("qcore: invalid chain (exit 2)");
                 match (e.hop_index, &e.hop_id) {
-                    (Some(i), Some(id)) => eprintln!("  hop {i} `{id}`: {}", e.reason),
-                    _ => eprintln!("  {}", e.reason),
+                    (Some(i), Some(id)) => eprintln!(
+                        "  hop {i} `{}`: {reason}",
+                        qcore_core::diag::masked_value("hop_id", id)
+                    ),
+                    _ => eprintln!("  {reason}"),
                 }
-                if let Some(fix) = &e.fix {
+                if let Some(fix) = &fix {
                     eprintln!("  fix: {fix}");
                 }
             }
@@ -258,5 +272,50 @@ mod tests {
             e.preflight(inputs.specs),
             qcore_core::api::engine::Preflight::Ok { .. }
         ));
+    }
+
+    /// `run` has no dispatch path in `main.rs` (`preflight` resolves inputs and
+    /// calls `diag_exit` directly), so its stderr is only observable from a
+    /// process: the parent re-invokes this test binary with the child marker.
+    #[test]
+    #[ignore = "child helper for run_failure_carries_exit_suffix, never run directly"]
+    fn run_failure_child() {
+        assert!(
+            std::env::var_os("QCORE_PREFLIGHT_RUN_CHILD").is_some(),
+            "spawned by run_failure_carries_exit_suffix, not run directly"
+        );
+        std::process::exit(run(&engine(), "nope", false));
+    }
+
+    #[test]
+    fn run_failure_carries_exit_suffix() {
+        let out = std::process::Command::new(std::env::current_exe().expect("test binary path"))
+            .args([
+                "--exact",
+                "cmd::preflight::tests::run_failure_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("QCORE_PREFLIGHT_RUN_CHILD", "1")
+            .output()
+            .expect("test binary re-spawns");
+        assert_eq!(
+            out.status.code(),
+            Some(exit::INVALID),
+            "run returns the validation exit code"
+        );
+        let err = String::from_utf8_lossy(&out.stderr);
+        let line = err
+            .lines()
+            .find(|l| l.starts_with("qcore: "))
+            .unwrap_or_else(|| panic!("run emits a contracted diagnostic, got: {err:?}"));
+        assert!(
+            line.ends_with("(exit 2)"),
+            "run's failure line carries the exit suffix: {err:?}"
+        );
+        assert!(
+            line.contains("nope"),
+            "the diagnostic names the bad chain: {err:?}"
+        );
     }
 }

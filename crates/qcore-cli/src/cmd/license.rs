@@ -30,9 +30,9 @@ pub fn resolve(
     }
     if let Some(path) = license_file {
         let raw = std::fs::read_to_string(path).map_err(|e| {
-            eprintln!(
-                "qcore: cannot read --license-file `{}`: {e}",
-                path.display()
+            exit::diag_exit(
+                exit::USAGE,
+                &format!("cannot read --license-file `{}`: {e}", path.display()),
             );
             exit::USAGE
         })?;

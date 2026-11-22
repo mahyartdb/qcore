@@ -14,11 +14,14 @@
 //! live engine; every entry point acquires a clone of that reference under
 //! the registry lock (the lock is never held across the call) and runs on
 //! it. A freed engine is removed from the registry and its handle address
-//! is tombstoned (bounded ring) so a stale/forged pointer is recognized as
-//! freed — including the ABA case where a new engine's allocation reuses
-//! the address. In-flight calls on other threads finish on the last strong
-//! reference before the engine drops. Forged/double-free handles remain a
-//! usage error (6).
+//! is tombstoned (bounded ring) so a stale/forged pointer to it is
+//! recognized as freed. The tombstone holds until that address is
+//! re-tracked: when a new engine's allocation legitimately reuses a freed
+//! address, [`track_handle`] clears the marker for the new owner, and from
+//! then on a stale pointer to the old engine aliases the new one — the ABI
+//! carries no generation to tell them apart. In-flight calls on other
+//! threads finish on the last strong reference before the engine drops.
+//! Forged/double-free handles remain a usage error (6).
 //!
 //! Tombstone bound (`FREED_TOMBSTONE_CAP` = 1024): when the ring is full the
 //! oldest tombstones are cleared, so an ABA hit requires 1024 create/free
@@ -135,13 +138,16 @@ static LIVE_HANDLES: std::sync::OnceLock<std::sync::Mutex<FfiRegistry>> =
 
 /// Handle registry (R1.7 ABA defense): live engines by address, plus
 /// tombstones for freed ones. The ABI passes a raw pointer, so a caller
-/// cannot carry a generation — the tombstone set is the honest alternative:
-/// a freed handle's address is remembered, so a stale/forged pointer that
-/// aliases a NEW engine's reused allocation is recognized as freed (usage
-/// error 6) instead of being handed the new engine. Bounded: when the set
-/// passes [`FREED_TOMBSTONE_CAP`], the oldest tombstones are cleared (an
-/// ABA hit then requires 1024 free-then-alloc cycles at the SAME address —
-/// not a realistic embedder loop).
+/// cannot carry a generation — the tombstone set is the honest alternative,
+/// with a stated limit: a freed handle's address is remembered, so a
+/// stale/forged pointer to it fails closed (usage error 6) while the
+/// tombstone is present. Re-tracking that address (a legitimate allocation
+/// reuse) clears the marker for its new owner, after which a stale pointer
+/// silently aliases the new engine. Bounded: when the set passes
+/// [`FREED_TOMBSTONE_CAP`], the oldest tombstones are cleared — remembering
+/// a specific freed address that long requires `FREED_TOMBSTONE_CAP`
+/// free-then-track cycles at the same address, not a realistic embedder
+/// loop.
 struct FfiRegistry {
     live: std::collections::HashMap<usize, std::sync::Arc<QcoreEngine>>,
     /// Addresses of freed engines, insertion-ordered (bounded ring).
@@ -188,7 +194,9 @@ fn track_handle(engine: std::sync::Arc<QcoreEngine>) -> *mut QcoreEngine {
 /// and the lock is released before the caller uses the engine, so a
 /// concurrent free can never race the dereference: worst case the acquire
 /// sees the entry already removed and fails closed. A tombstoned (freed)
-/// address fails closed even when a later engine reused it (ABA).
+/// address fails closed until it is re-tracked; after a legitimate
+/// allocation reuse a stale pointer aliases the new engine (see
+/// [`FfiRegistry`]).
 pub(crate) fn acquire_engine(handle: *mut QcoreEngine) -> Option<std::sync::Arc<QcoreEngine>> {
     if handle.is_null() {
         return None;
@@ -203,8 +211,8 @@ pub(crate) fn acquire_engine(handle: *mut QcoreEngine) -> Option<std::sync::Arc<
 /// Removes from the live set and returns the registry's strong reference;
 /// `None` when the handle was not live (forged or already freed). The
 /// engine memory itself lives until the last in-flight reference drops, and
-/// the freed address is tombstoned so a stale handle to it (or to a future
-/// allocation reusing it) is recognized instead of aliasing the new engine.
+/// the freed address is tombstoned so a stale handle to it fails closed
+/// (the marker holds until a new engine is tracked at that address).
 fn untrack_handle(ptr: *mut QcoreEngine) -> Option<std::sync::Arc<QcoreEngine>> {
     let mut reg = lock_live_handles();
     let engine = reg.live.remove(&(ptr as usize))?;
@@ -339,14 +347,18 @@ pub unsafe extern "C" fn qcore_engine_new(
             .get("timeout_secs")
             .and_then(|x| x.as_u64())
             .filter(|t| *t >= 1)
+            // Cap at one day: an unrepresentable budget would overflow the
+            // engine's deadline arithmetic (0 keeps the default).
+            .map(|t| t.min(86_400))
             .unwrap_or(30);
         // FFI runtime sizing knob (#15): clamped, advisory, default 2.
         // #10 profiled `block_on` dispatch at ~67 ns/op — sizing is not the
         // binding constraint, so this buys embedder control, not speed.
         let worker_threads = ffi_worker_threads(&v);
         // Engine budget for teardown paths: free/stop never block longer
-        // than this (T5 bounded teardown).
-        let timeout = Duration::from_secs(timeout_secs.max(1));
+        // than this (T5 bounded teardown). `timeout_secs` is already
+        // clamped to 1..=86400 above.
+        let timeout = Duration::from_secs(timeout_secs);
         // Host links the transports it embeds (FR-003g scoping lives here).
         let _ = qcore_transports::linked_kinds();
         // Tunnel-side DNS resolver for SOCKS5 domain targets (optional
@@ -446,6 +458,12 @@ pub unsafe extern "C" fn qcore_engine_start(
     err_out: *mut *mut QcoreError,
 ) -> c_int {
     unwind_guard(|| {
+        // Out-param first: a null out is a usage error and must be rejected
+        // before the tunnel starts, or the call would leave a live session
+        // no caller can address.
+        if out_session_id.is_null() {
+            return fail(err_out, 6, "null out-param".to_string());
+        }
         let engine = match check_handle(handle, err_out) {
             Err(code) => return code,
             Ok(engine) => engine,
@@ -609,17 +627,20 @@ pub unsafe extern "C" fn qcore_import_config(
     err_out: *mut *mut QcoreError,
 ) -> c_int {
     unwind_guard(|| {
-        if let Err(code) = check_handle(handle, err_out) {
-            return code;
+        // Out-param first: storing the import (record + secrets) before
+        // rejecting a null out would leave an unrecoverable import no
+        // caller can name.
+        if out_json.is_null() {
+            return fail(err_out, 6, "null out-param".to_string());
         }
+        let e = match check_handle(handle, err_out) {
+            Err(code) => return code,
+            Ok(e) => e,
+        };
         // SAFETY: `path` validity is the caller's Safety contract for this entry point.
         let path = match unsafe { c_str(path) } {
             Err(e) => return fail(err_out, 6, e),
             Ok(s) => s,
-        };
-        let e = match check_handle(handle, err_out) {
-            Err(code) => return code,
-            Ok(e) => e,
         };
         let imp = match qcore_core::config::import::ConfigImport::parse(std::path::Path::new(&path))
         {
@@ -674,7 +695,7 @@ pub unsafe extern "C" fn qcore_export_config(
         };
         let dirs = e.engine.config_dirs();
         let (stored, secrets) = match qcore_core::config::import::load_import(&dirs, &import_ref) {
-            Err(msg) => return fail(err_out, 5, msg),
+            Err(msg) => return fail(err_out, 5, msg.to_string()),
             Ok(v) => v,
         };
         let imp = qcore_core::config::export::from_stored(
@@ -723,19 +744,25 @@ pub unsafe extern "C" fn qcore_error_free(err: *mut QcoreError) -> c_int {
     })
 }
 
-/// Thread-local last-error channel for JNI entry points that fail without a
-/// `QcoreError` out-param (e.g. `engineNew` returning handle 0). JNI has no
-/// `err_out` pointer, so named failures (interior NUL in a config, decode
-/// failures) park their message here; `qcore_take_last_error` drains it.
-/// The message is static-shaped (no secrets, never caller-supplied text).
-static LAST_ERROR: std::sync::Mutex<Option<CString>> = std::sync::Mutex::new(None);
+// Thread-local last-error channel for JNI entry points that fail without a
+// `QcoreError` out-param (e.g. `engineNew` returning handle 0). JNI has no
+// `err_out` pointer, so named failures (interior NUL in a config, decode
+// failures, a failed C-ABI call) park their message here;
+// `qcore_take_last_error` drains it. Thread-local by contract: one Java
+// thread's failure detail never surfaces on another's. Messages are masked
+// by the JNI layer before parking (same redaction as every other sink).
+thread_local! {
+    static LAST_ERROR: std::cell::RefCell<Option<CString>> =
+        const { std::cell::RefCell::new(None) };
+}
 
-/// Park a named failure message for the JNI layer (see [`LAST_ERROR`]).
-/// Best effort: a poisoned/contended channel never panics the caller.
+/// Park a named failure message for the JNI layer (see `LAST_ERROR`).
+/// Best effort: an interior NUL parks no message rather than panicking the
+/// caller.
 pub(crate) fn set_last_error_jni(msg: &str) {
-    if let Ok(mut slot) = LAST_ERROR.lock() {
-        *slot = CString::new(msg).ok();
-    }
+    LAST_ERROR.with(|slot| {
+        *slot.borrow_mut() = CString::new(msg).ok();
+    });
 }
 
 /// Drain the thread-local last-error message into `out`. Returns 0 with the
@@ -750,12 +777,8 @@ pub unsafe extern "C" fn qcore_take_last_error(out: *mut *mut c_char) -> c_int {
         if out.is_null() {
             return 6;
         }
-        let taken = LAST_ERROR
-            .lock()
-            .ok()
-            .and_then(|mut slot| slot.take())
-            .map(|c| c.into_raw());
-        match taken {
+        let taken = LAST_ERROR.with(|slot| slot.borrow_mut().take());
+        match taken.map(|c| c.into_raw()) {
             Some(s) => {
                 // SAFETY: `out` is non-null (checked above) and points to a
                 // writable caller pointer per the out-param contract.
@@ -802,7 +825,9 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(!msg.contains("xT4vN7qW"), "cause leaked to caller buffer");
-        assert!(msg.contains("cause=<redacted>"), "got: {msg}");
+        // The redactor masks secret-like tokens in place and keeps benign
+        // context, so the prose survives while the token does not.
+        assert!(msg.contains("cause=boom <redacted>"), "got: {msg}");
         assert_eq!(unsafe { qcore_error_free(err) }, 0);
         // Ordinary causes pass through with the code mapping intact.
         let r2 = qcore_transport_api::FailureReport::new(
@@ -1023,12 +1048,13 @@ mod tests {
     }
 
     #[test]
-    fn freed_handle_tombstone_survives_address_reuse_aba() {
-        // R1.7: after free, the address is tombstoned. A stale/forged
-        // pointer to it fails closed even while further engines are
-        // created and freed; only a legitimate re-track of that address
-        // (track_handle's tombstone clear — the new engine at a recycled
-        // allocation) makes it resolvable again. The ring is bounded.
+    fn freed_handle_tombstone_holds_until_the_address_is_retracked() {
+        // R1.7: after free, the address is tombstoned and a stale/forged
+        // pointer to it fails closed while the marker is present. A
+        // legitimate re-track of that address (track_handle clears the
+        // marker for the new owner) makes it resolvable again — and from
+        // then on the stale pointer aliases the new engine. The ring is
+        // bounded.
         let base = std::env::temp_dir().join(format!("qcore-ffi-tomb-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let cfg = serde_json::json!({
@@ -1054,7 +1080,7 @@ mod tests {
             "freed handle acquires nothing (tombstoned)"
         );
         // The tombstone survives further engine churn (create/free cycles):
-        // a stale pointer stays dead even as the allocator reuses slots.
+        // a stale pointer stays dead while the marker is present.
         for _ in 0..3 {
             let h = mk();
             assert!(acquire_engine(h).is_some());
@@ -1064,10 +1090,10 @@ mod tests {
             acquire_engine(h1).is_none(),
             "tombstone outlives unrelated free cycles"
         );
-        // ABA world at the registry level: a live entry placed at the
-        // tombstoned address (what an allocator-reused allocation would
-        // produce) is still shadowed by the tombstone — the stale pointer
-        // must not alias the new engine.
+        // Registry-level probe of the check order: a live entry placed at
+        // the tombstoned address (the state just before track_handle clears
+        // the marker) is still shadowed, because acquire_engine consults the
+        // tombstone set first.
         let engine_new = {
             let h = mk();
             let arc = acquire_engine(h).expect("fresh engine live");
@@ -1082,17 +1108,22 @@ mod tests {
         }
         assert!(
             acquire_engine(h1).is_none(),
-            "tombstone shadows a live entry at a recycled address (stale pointer never aliases it)"
+            "tombstone shadows a live entry at a recycled address while it is present"
         );
-        // Legitimate re-track clears the tombstone (track_handle contract):
-        // the new engine at that address becomes resolvable.
+        // The real ABA consequence: track_handle clears the tombstone when
+        // it re-tracks that address (modelled here by the same `retain` it
+        // performs), so a legitimate allocation reuse hands the new engine
+        // to the stale pointer. That aliasing is the documented limit — the
+        // ABI carries no generation to reject it without breaking the new
+        // owner.
         {
             let mut reg = lock_live_handles();
             reg.freed.retain(|&a| a != h1 as usize);
         }
+        let aliased = acquire_engine(h1).expect("re-tracked address belongs to its new owner");
         assert!(
-            acquire_engine(h1).is_some(),
-            "re-tracked address is live again for its new owner"
+            std::sync::Arc::ptr_eq(&aliased, &engine_new),
+            "the stale pointer now reaches the new engine (documented aliasing limit)"
         );
         {
             let mut reg = lock_live_handles();
@@ -1240,6 +1271,203 @@ mod tests {
         let weak = std::sync::Arc::downgrade(&inflight);
         drop(inflight);
         assert!(weak.upgrade().is_none(), "engine dropped with the last ref");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Fresh FFI engine on throwaway dirs. The caller frees the handle and
+    /// removes the returned base.
+    fn temp_engine(tag: &str) -> (*mut QcoreEngine, std::path::PathBuf) {
+        let base = std::env::temp_dir().join(format!("qcore-ffi-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let cfg = serde_json::json!({
+            "config_dir": base.join("config").to_str().unwrap(),
+            "profile_dir": base.join("profiles").to_str().unwrap(),
+        })
+        .to_string();
+        let cfg = CString::new(cfg).unwrap();
+        let mut handle: *mut QcoreEngine = std::ptr::null_mut();
+        let mut err: *mut QcoreError = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { qcore_engine_new(cfg.as_ptr(), &mut handle as *mut _, &mut err as *mut _) },
+            0,
+            "engine_new on temp dirs"
+        );
+        assert!(!handle.is_null());
+        (handle, base)
+    }
+
+    fn error_message(err: *mut QcoreError) -> String {
+        // SAFETY: `err` is an error record returned by this ABI (out-param
+        // contract) with an owned NUL-terminated message.
+        let msg = unsafe { CStr::from_ptr((*err).message) }
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(unsafe { qcore_error_free(err) }, 0);
+        msg
+    }
+
+    #[test]
+    fn engine_start_null_out_param_starts_nothing() {
+        // A null out-param is a usage error. Rejecting it AFTER the start
+        // would leave a live session whose id no caller ever received.
+        let (handle, base) = temp_engine("start-nullout");
+        let arc = acquire_engine(handle).expect("live handle");
+        // Bring-up publishes EndpointSelected on the engine bus before
+        // `start` returns, so an empty bus proves no session was created.
+        let mut events = arc.engine.subscribe();
+        let chain = CString::new("mock").unwrap();
+        let mut err: *mut QcoreError = std::ptr::null_mut();
+        let rc = unsafe {
+            qcore_engine_start(
+                handle,
+                chain.as_ptr(),
+                std::ptr::null_mut(),
+                &mut err as *mut _,
+            )
+        };
+        assert_eq!(rc, 6, "null out-param is a usage error");
+        assert!(!err.is_null());
+        assert!(
+            error_message(err).contains("null out-param"),
+            "names the rejected parameter"
+        );
+        match events.try_recv() {
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {}
+            other => panic!("start ran despite the rejected out-param: {other:?}"),
+        }
+        assert_eq!(unsafe { qcore_engine_free(handle) }, 0);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn import_null_out_param_stores_nothing() {
+        // Storing the import (record + secrets) before rejecting a null
+        // out-param would leave an import no caller can name.
+        let (handle, base) = temp_engine("import-nullout");
+        let wg = base.join("peer.conf");
+        // 32-byte key vectors; a valid WireGuard config parses Accepted.
+        std::fs::write(
+            &wg,
+            "[Interface]\nPrivateKey = BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=\n\
+             Address = 10.0.0.2/32\n\n[Peer]\n\
+             PublicKey = CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk=\n\
+             AllowedIPs = 0.0.0.0/0\nEndpoint = 203.0.113.10:51820\n",
+        )
+        .unwrap();
+        let path = CString::new(wg.to_str().unwrap()).unwrap();
+        let mut err: *mut QcoreError = std::ptr::null_mut();
+        let rc = unsafe {
+            qcore_import_config(
+                handle,
+                path.as_ptr(),
+                std::ptr::null_mut(),
+                &mut err as *mut _,
+            )
+        };
+        assert_eq!(rc, 6, "null out-param is a usage error");
+        assert!(!err.is_null());
+        assert!(error_message(err).contains("null out-param"));
+        let imports = base.join("config").join("imports");
+        assert!(
+            !imports.exists(),
+            "rejected call must not store an import: {:?}",
+            std::fs::read_dir(&imports).map(|d| d
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name())
+                .collect::<Vec<_>>())
+        );
+        assert_eq!(unsafe { qcore_engine_free(handle) }, 0);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn timeout_secs_is_clamped_to_a_representable_budget() {
+        // `timeout_secs` is caller-controlled JSON: u64::MAX seconds would
+        // panic the engine's deadline arithmetic, so the FFI clamps it.
+        let budget = |timeout: serde_json::Value| {
+            let base =
+                std::env::temp_dir().join(format!("qcore-ffi-timeout-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&base);
+            let cfg = serde_json::json!({
+                "config_dir": base.join("config").to_str().unwrap(),
+                "profile_dir": base.join("profiles").to_str().unwrap(),
+                "timeout_secs": timeout,
+            })
+            .to_string();
+            let cfg = CString::new(cfg).unwrap();
+            let mut handle: *mut QcoreEngine = std::ptr::null_mut();
+            let mut err: *mut QcoreError = std::ptr::null_mut();
+            assert_eq!(
+                unsafe {
+                    qcore_engine_new(cfg.as_ptr(), &mut handle as *mut _, &mut err as *mut _)
+                },
+                0
+            );
+            let timeout = acquire_engine(handle).expect("live handle").timeout;
+            assert_eq!(unsafe { qcore_engine_free(handle) }, 0);
+            let _ = std::fs::remove_dir_all(&base);
+            timeout
+        };
+        assert_eq!(
+            budget(serde_json::json!(u64::MAX)),
+            Duration::from_secs(86_400),
+            "unrepresentable budget capped at one day"
+        );
+        assert_eq!(
+            budget(serde_json::json!(0)),
+            Duration::from_secs(30),
+            "zero keeps the default"
+        );
+    }
+
+    #[test]
+    fn last_error_channel_is_thread_local() {
+        set_last_error_jni("thread-local probe");
+        let seen = std::thread::spawn(|| {
+            let mut out: *mut c_char = std::ptr::null_mut();
+            let rc = unsafe { qcore_take_last_error(&mut out) };
+            assert!(
+                out.is_null(),
+                "another thread must not see this thread's parked failure"
+            );
+            rc
+        })
+        .join()
+        .expect("probe thread");
+        assert_eq!(seen, 6, "the probe thread has nothing parked");
+        let mut out: *mut c_char = std::ptr::null_mut();
+        assert_eq!(unsafe { qcore_take_last_error(&mut out) }, 0);
+        assert!(!out.is_null(), "owning thread drains its message");
+        // SAFETY: string returned by this ABI (out-param contract).
+        let msg = unsafe { CStr::from_ptr(out).to_str().unwrap().to_string() };
+        assert_eq!(unsafe { qcore_string_free(out) }, 0);
+        assert_eq!(msg, "thread-local probe");
+    }
+
+    #[test]
+    fn unknown_session_is_the_exit_3_class() {
+        let (handle, base) = temp_engine("no-session");
+        let id = CString::new("missing-session").unwrap();
+        let mut out: *mut c_char = std::ptr::null_mut();
+        let mut err: *mut QcoreError = std::ptr::null_mut();
+        let rc = unsafe {
+            qcore_engine_status_json(handle, id.as_ptr(), &mut out as *mut _, &mut err as *mut _)
+        };
+        assert_eq!(rc, 3, "status for an unknown id is exit 3");
+        assert!(out.is_null());
+        assert!(!err.is_null());
+        // SAFETY: `err` is an error record returned by this ABI.
+        assert_eq!(unsafe { (*err).code }, 3, "record mirrors the code");
+        assert!(error_message(err).contains("no such live session"));
+        let mut err: *mut QcoreError = std::ptr::null_mut();
+        let rc = unsafe { qcore_engine_stop(handle, id.as_ptr(), &mut err as *mut _) };
+        assert_eq!(rc, 3, "stop of an unknown id is exit 3");
+        assert!(!err.is_null());
+        // SAFETY: `err` is an error record returned by this ABI.
+        assert_eq!(unsafe { (*err).code }, 3);
+        assert!(error_message(err).contains("no such live session"));
+        assert_eq!(unsafe { qcore_engine_free(handle) }, 0);
         let _ = std::fs::remove_dir_all(&base);
     }
 

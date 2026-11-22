@@ -22,9 +22,10 @@
 //! String sessionId)`, `int engineStop(long, String sessionId)`,
 //! `String scanJson(long, String transport, String profile, String family)`,
 //! `String importConfig(long, String path)`, `String exportConfig(long,
-//! String ref)`, `void engineFree(long)`, `int abiVersion()`. Null/negative
-//! returns are failures (OOM, internal, or unusable JVM input); error
-//! detail rides the C ABI.
+//! String ref)`, `void engineFree(long)`, `int abiVersion()`,
+//! `String takeLastError()`. Null/negative returns are failures (OOM,
+//! internal, or unusable JVM input); error detail is parked on the
+//! thread-local last-error channel (`takeLastError`) and drained there.
 
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 
@@ -228,6 +229,39 @@ fn take_error(ptr: *mut crate::QcoreError) {
     }
 }
 
+/// Mask a C-ABI error record's message onto the thread-local last-error
+/// channel, then free the record. The record was the only copy of the
+/// detail; freeing it without parking left a Java caller with a bare null.
+fn park_and_free_error(err: *mut crate::QcoreError) {
+    if err.is_null() {
+        return;
+    }
+    // SAFETY: non-null `err` (checked above) is an error record previously
+    // returned by the C ABI (out-param contract); its `message` is an owned
+    // NUL-terminated string that stays valid until `qcore_error_free` below.
+    let msg = unsafe { (*err).message };
+    if !msg.is_null() {
+        // SAFETY: the record owns a NUL-terminated message (ABI contract).
+        if let Ok(text) = unsafe { CStr::from_ptr(msg) }.to_str() {
+            // The detail crosses into Java diagnostics: same masking as
+            // every other sink (a provider echo can carry a secret).
+            crate::set_last_error_jni(&qcore_core::diag::masked_value("cause", text));
+        }
+    }
+    take_error(err);
+}
+
+/// Park a failed call's detail: the error record's masked message when the
+/// call produced one, else a code-shaped fallback so Java always has
+/// something to report.
+fn park_failure(err: *mut crate::QcoreError, code: c_int) {
+    if err.is_null() {
+        crate::set_last_error_jni(&format!("qcore call failed with code {code}"));
+    } else {
+        park_and_free_error(err);
+    }
+}
+
 /// Run one string-returning C ABI call from a JNI entry point and convert
 /// its out-string to Java. `args` convert in order; a `None` argument (null
 /// Java string, failed pin, non-UTF-8 content) or an interior NUL fails the
@@ -247,20 +281,29 @@ unsafe fn call_c_abi(
     for &arg in args {
         let s = match j_to_rust(env, arg) {
             Some(s) => s,
-            None => return std::ptr::null_mut(),
+            None => {
+                crate::set_last_error_jni("argument could not be decoded from the JVM string");
+                return std::ptr::null_mut();
+            }
         };
         match CString::new(s) {
             Ok(c) => owned.push(c),
-            Err(_) => return std::ptr::null_mut(),
+            Err(_) => {
+                crate::set_last_error_jni("argument contains an interior NUL byte; input rejected");
+                return std::ptr::null_mut();
+            }
         }
     }
     let ptrs: Vec<*const c_char> = owned.iter().map(|c| c.as_ptr()).collect();
     let (code, out, err) = call(&ptrs);
-    take_error(err);
     let s = take_string(out);
     if code == 0 || (code == 4 && !s.is_empty()) {
+        take_error(err);
         rust_to_j(env, &s)
     } else {
+        // Park the masked detail before the record is freed: Java reads it
+        // with `takeLastError()`.
+        park_failure(err, code);
         std::ptr::null_mut()
     }
 }
@@ -297,7 +340,10 @@ pub unsafe extern "system" fn Java_com_qcore_Qcore_engineNew(
             // to default config (same contract as `call_c_abi`).
             match j_to_rust(env, config_json) {
                 Some(s) => Some(s),
-                None => return 0,
+                None => {
+                    crate::set_last_error_jni("config could not be decoded from the JVM string");
+                    return 0;
+                }
             }
         };
         // Fail closed on interior NULs: the old rewrite
@@ -324,10 +370,13 @@ pub unsafe extern "system" fn Java_com_qcore_Qcore_engineNew(
             &mut out,
             &mut err,
         );
-        take_error(err);
         if code == 0 {
+            take_error(err);
             out as i64
         } else {
+            // Park the masked detail before the record is freed: Java reads
+            // it with `takeLastError()`.
+            park_failure(err, code);
             0
         }
     });
@@ -400,11 +449,19 @@ pub unsafe extern "system" fn Java_com_qcore_Qcore_engineStop(
         // never becomes empty input, and interior NULs never rewrite.
         let id = match j_to_rust(env, session_id) {
             Some(s) => s,
-            None => return -1,
+            None => {
+                crate::set_last_error_jni("session id could not be decoded from the JVM string");
+                return -1;
+            }
         };
         let id_c = match CString::new(id) {
             Ok(c) => c,
-            Err(_) => return -1,
+            Err(_) => {
+                crate::set_last_error_jni(
+                    "session id contains an interior NUL byte; input rejected",
+                );
+                return -1;
+            }
         };
         let mut err: *mut crate::QcoreError = std::ptr::null_mut();
         let code = match with_engine(handle, |e| {
@@ -412,11 +469,17 @@ pub unsafe extern "system" fn Java_com_qcore_Qcore_engineStop(
         }) {
             Some(c) => c,
             None => {
-                take_error(err);
+                // No C-ABI call ran (handle not live), so no QcoreError
+                // exists: park the named handle failure directly.
+                crate::set_last_error_jni("invalid or freed engine handle");
                 return -1;
             }
         };
-        take_error(err);
+        if code == 0 {
+            take_error(err);
+        } else {
+            park_failure(err, code);
+        }
         code
     });
     result.unwrap_or(-1)
@@ -519,6 +582,37 @@ pub unsafe extern "system" fn Java_com_qcore_Qcore_exportConfig(
     result.unwrap_or(std::ptr::null_mut())
 }
 
+/// `Qcore.takeLastError()` → the calling thread's parked failure message,
+/// or null when nothing is parked.
+///
+/// # Safety
+/// Called by the JVM with a valid `JNIEnv`; never from any other caller.
+#[no_mangle]
+pub unsafe extern "system" fn Java_com_qcore_Qcore_takeLastError(
+    env: JniEnv,
+    _class: *mut c_void,
+) -> JString {
+    let result = std::panic::catch_unwind(|| {
+        let mut out: *mut c_char = std::ptr::null_mut();
+        // SAFETY: `out` is a local writable pointer; the drain touches only
+        // this thread's channel and hands back an ABI-owned string.
+        let rc = unsafe { crate::qcore_take_last_error(&mut out) };
+        if rc != 0 {
+            return std::ptr::null_mut();
+        }
+        let msg = take_string(out);
+        if msg.is_empty() {
+            // Nothing was parked: Java sees null, not an empty string (the
+            // documented "no failure detail" shape).
+            return std::ptr::null_mut();
+        }
+        // SAFETY: `env` is the JVM-provided table pointer for this entry
+        // point (caller contract), the same validity argument as `rust_to_j`.
+        unsafe { rust_to_j(env, &msg) }
+    });
+    result.unwrap_or(std::ptr::null_mut())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -562,6 +656,15 @@ mod tests {
             handle, 0,
             "undecodable config must fail closed, not default"
         );
+        // The bare 0 would otherwise carry no detail: the named failure is
+        // parked on the thread-local channel Java reads.
+        let mut out: *mut c_char = std::ptr::null_mut();
+        assert_eq!(unsafe { crate::qcore_take_last_error(&mut out) }, 0);
+        assert!(!out.is_null(), "failure detail parked for Java");
+        // SAFETY: string returned by this ABI (out-param contract).
+        let msg = unsafe { CStr::from_ptr(out).to_str().unwrap().to_string() };
+        assert_eq!(unsafe { crate::qcore_string_free(out) }, 0);
+        assert!(msg.contains("decoded"), "named detail: {msg}");
     }
 
     #[test]
@@ -582,6 +685,15 @@ mod tests {
         let bogus: JString = std::ptr::dangling_mut::<c_void>();
         let rc = unsafe { Java_com_qcore_Qcore_engineStop(env, std::ptr::null_mut(), 1, bogus) };
         assert_eq!(rc, -1, "undecodable session must fail closed");
+        // The named failure rides the thread-local channel (no QcoreError
+        // out-param exists on the JNI surface).
+        let mut out: *mut c_char = std::ptr::null_mut();
+        assert_eq!(unsafe { crate::qcore_take_last_error(&mut out) }, 0);
+        assert!(!out.is_null(), "failure detail parked for Java");
+        // SAFETY: string returned by this ABI (out-param contract).
+        let msg = unsafe { CStr::from_ptr(out).to_str().unwrap().to_string() };
+        assert_eq!(unsafe { crate::qcore_string_free(out) }, 0);
+        assert!(msg.contains("decoded"), "named detail: {msg}");
         // Non-positive handle also fails closed without touching the engine.
         let rc2 = unsafe { Java_com_qcore_Qcore_engineStop(env, std::ptr::null_mut(), 0, bogus) };
         assert_eq!(rc2, -1, "non-positive handle must fail closed");
@@ -807,7 +919,7 @@ mod tests {
     fn last_error_channel_round_trips_interior_nul_message() {
         // The interior-NUL failure parks a named message (never empty, never
         // the input) on the C ABI's last-error channel. Set + drain within
-        // this test (the channel is process-global and nextest is parallel).
+        // this test (the channel is thread-local; each test owns its slot).
         crate::set_last_error_jni("config contains an interior NUL byte; input rejected");
         let mut out: *mut c_char = std::ptr::null_mut();
         let rc = unsafe { crate::qcore_take_last_error(&mut out) };
@@ -824,10 +936,8 @@ mod tests {
         // A Java config string containing an interior NUL (pinned as the
         // modified-UTF-8 `C0 80`) used to be rewritten to the empty string
         // (default-config engine!). It must fail closed with handle 0. The
-        // last-error channel is process-global (parallel tests drain it),
-        // so this test only asserts the fail-closed handle, not the parked
-        // message — `last_error_channel_round_trips_interior_nul_message`
-        // owns the message shape.
+        // last-error channel is thread-local, so this test also owns the
+        // parked message without racing parallel tests.
         let (env, _slot) = recording_env();
         PINNED.lock().unwrap().clear();
         PINNED.lock().unwrap().push(
@@ -843,5 +953,78 @@ mod tests {
         // SAFETY: `acquire_engine` only probes the tracked-handle set; it
         // never dereferences the (null) probe.
         assert!(crate::acquire_engine(handle as *mut crate::QcoreEngine).is_none());
+        let mut out: *mut c_char = std::ptr::null_mut();
+        assert_eq!(unsafe { crate::qcore_take_last_error(&mut out) }, 0);
+        assert!(!out.is_null(), "failure detail parked for Java");
+        // SAFETY: string returned by this ABI (out-param contract).
+        let msg = unsafe { CStr::from_ptr(out).to_str().unwrap().to_string() };
+        assert_eq!(unsafe { crate::qcore_string_free(out) }, 0);
+        assert!(msg.contains("interior NUL"), "named detail: {msg}");
+    }
+
+    #[test]
+    fn engine_stop_invalid_handle_parks_last_error() {
+        // A dead handle fails before any C-ABI call, so no QcoreError exists
+        // to free — the named failure must still reach Java.
+        let (env, _slot) = recording_env();
+        set_pinned("session");
+        let bogus: JString = std::ptr::dangling_mut::<c_void>();
+        let rc = unsafe { Java_com_qcore_Qcore_engineStop(env, std::ptr::null_mut(), 0, bogus) };
+        assert_eq!(rc, -1);
+        let mut out: *mut c_char = std::ptr::null_mut();
+        assert_eq!(unsafe { crate::qcore_take_last_error(&mut out) }, 0);
+        assert!(!out.is_null(), "failure detail parked for Java");
+        // SAFETY: string returned by this ABI (out-param contract).
+        let msg = unsafe { CStr::from_ptr(out).to_str().unwrap().to_string() };
+        assert_eq!(unsafe { crate::qcore_string_free(out) }, 0);
+        assert!(msg.contains("invalid or freed engine handle"), "got: {msg}");
+    }
+
+    #[test]
+    fn park_failure_masks_and_frees_the_record() {
+        // The C-ABI record is the only copy of the detail; parking it must
+        // preserve (masked) text for Java and free the record.
+        let mut err: *mut crate::QcoreError = std::ptr::null_mut();
+        let code = crate::fail(
+            &mut err as *mut _,
+            3,
+            "cause=boom xT4vN7qW2zR5uY8iO1pA3sD6fG9hJ0kL2mN4bV6cX8dE0gH2==".to_string(),
+        );
+        assert_eq!(code, 3);
+        assert!(!err.is_null());
+        park_failure(err, code);
+        let mut out: *mut c_char = std::ptr::null_mut();
+        assert_eq!(unsafe { crate::qcore_take_last_error(&mut out) }, 0);
+        assert!(!out.is_null());
+        // SAFETY: string returned by this ABI (out-param contract).
+        let msg = unsafe { CStr::from_ptr(out).to_str().unwrap().to_string() };
+        assert_eq!(unsafe { crate::qcore_string_free(out) }, 0);
+        assert!(!msg.contains("xT4vN7qW"), "secret leaked to Java: {msg}");
+        assert!(msg.contains("<redacted>"), "masked: {msg}");
+        // A failure with no record still parks something reportable.
+        park_failure(std::ptr::null_mut(), 10);
+        let mut out: *mut c_char = std::ptr::null_mut();
+        assert_eq!(unsafe { crate::qcore_take_last_error(&mut out) }, 0);
+        // SAFETY: string returned by this ABI (out-param contract).
+        let msg = unsafe { CStr::from_ptr(out).to_str().unwrap().to_string() };
+        assert_eq!(unsafe { crate::qcore_string_free(out) }, 0);
+        assert!(msg.contains("code 10"), "code-shaped fallback: {msg}");
+    }
+
+    #[test]
+    fn take_last_error_entry_point_returns_parked_message() {
+        let (env, _slot) = recording_env();
+        crate::set_last_error_jni("parked for java");
+        let j = unsafe { Java_com_qcore_Qcore_takeLastError(env, std::ptr::null_mut()) };
+        assert!(!j.is_null(), "message returned to Java");
+        let got = RETURNED
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("NewStringUTF called");
+        assert_eq!(String::from_utf8_lossy(&got), "parked for java");
+        // Nothing parked: null, not an empty string.
+        let j = unsafe { Java_com_qcore_Qcore_takeLastError(env, std::ptr::null_mut()) };
+        assert!(j.is_null(), "empty channel returns null");
     }
 }

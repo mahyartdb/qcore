@@ -2,9 +2,11 @@
 name = "qcore-core"
 # Independent versioning (constitution): 0.2.0 for the StartedHop shape
 # change (crate-internal keepalive handle); 0.3.0 for the HopReport.dropped
-# congestion-accounting field (#12 queue decision, #15 perf batch).
+# congestion-accounting field (#12 queue decision, #15 perf batch); 0.4.0
+# for the R2 API breaks (parse_toml_strict removed, WatchdogConfig::new
+# arity, MasqueConfig new pub fields).
 # Pre-publish 0.x: minor carries it.
-version = "0.3.0"
+version = "0.4.0"
 edition.workspace = true
 license.workspace = true
 

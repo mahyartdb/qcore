@@ -19,8 +19,12 @@ fn cfg_for(alpn: &str, endpoint: std::net::SocketAddr) -> HopConfig {
         .insert("hop_id".into(), format!("masque-{alpn}-0"));
     cfg.fields.insert("alpn".into(), alpn.into());
     cfg.fields.insert("endpoint".into(), endpoint.to_string());
-    cfg.fields
-        .insert("insecure_skip_verify".into(), "true".into());
+    // h2 has no TLS layer: the verify flag is h3-only and the factory
+    // fail-closes on it for alpn=h2.
+    if alpn == "h3" {
+        cfg.fields
+            .insert("insecure_skip_verify".into(), "true".into());
+    }
     cfg
 }
 

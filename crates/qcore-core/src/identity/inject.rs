@@ -296,6 +296,8 @@ mod tests {
                 obfuscation: None,
                 family: "dual".to_string(),
                 endpoint: None,
+                server_name: None,
+                insecure_skip_verify: None,
             }),
         };
         let (_, msg) = resolve_err(&d, &[masque]);
@@ -314,6 +316,8 @@ mod tests {
                 obfuscation: None,
                 family: "dual".to_string(),
                 endpoint: None,
+                server_name: None,
+                insecure_skip_verify: None,
             }),
         };
         let map = resolve(&d, &[masque]);

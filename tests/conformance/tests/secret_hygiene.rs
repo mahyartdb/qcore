@@ -301,5 +301,6 @@ fn text_failure_path_masks_secret_like_cause() {
         !text.contains("xT4vN7qW"),
         "text path leaked secret-like cause"
     );
-    assert!(text.contains("cause=<redacted>"));
+    // Secret-like tokens are masked in place; benign context survives.
+    assert!(text.contains("cause=boom <redacted>"));
 }

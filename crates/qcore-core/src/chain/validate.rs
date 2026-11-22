@@ -12,6 +12,7 @@
 
 use crate::chain::ChainError;
 use crate::config::HopSpec;
+use crate::diag::masked_value;
 use qcore_transport_api::TransportDescriptor;
 use std::collections::{BTreeMap, HashSet};
 
@@ -71,7 +72,7 @@ pub fn validate(
             return Err(ChainError::new(
                 Some(i),
                 Some(hop.id.clone()),
-                format!("duplicate hop id `{}`", hop.id),
+                format!("duplicate hop id `{}`", masked_value("hop_id", &hop.id)),
                 Some("give each hop a unique id".to_string()),
             ));
         }
@@ -110,7 +111,7 @@ pub fn validate(
                 Some(hop.id.clone()),
                 format!(
                     "hop `{}` (transport `{}`) requires `sidecar_path=<executable path>`",
-                    hop.id,
+                    masked_value("hop_id", &hop.id),
                     hop.config.kind()
                 ),
                 Some(format!(
@@ -158,7 +159,8 @@ pub fn validate(
                 Some(next.id.clone()),
                 format!(
                     "hop `{}` requires a UDP carrier but carrier `{}` is TCP-only",
-                    next.id, carrier.id
+                    masked_value("hop_id", &next.id),
+                    masked_value("hop_id", &carrier.id)
                 ),
                 Some(format!("insert `relay` after `{}`", carrier.config.kind())),
             ));
@@ -176,7 +178,10 @@ pub fn validate(
                 return Err(ChainError::new(
                     Some(i),
                     Some(hop.id.clone()),
-                    format!("hop `{}` targets its own listener", hop.id),
+                    format!(
+                        "hop `{}` targets its own listener",
+                        masked_value("hop_id", &hop.id)
+                    ),
                     None,
                 ));
             }
@@ -427,7 +432,32 @@ pub(crate) mod tests {
     #[test]
     fn duplicate_id_rejected() {
         let err = validate(&[wg("a"), wg("a")], 3, &TestDescriptors::standard()).unwrap_err();
-        assert!(err.reason.contains("duplicate hop id"));
+        assert!(
+            err.reason.contains("duplicate hop id `a`"),
+            "benign id stays readable: {}",
+            err.reason
+        );
+    }
+
+    #[test]
+    fn secret_shaped_duplicate_id_masked_in_reason() {
+        // `reason` is emitted unmasked by the CLI text and JSON sinks, so a
+        // provider echo that put a secret in a hop id must not survive inside
+        // the message itself.
+        let secret = "deadbeefdeadbeefdeadbeefdeadbeef";
+        let err = validate(&[wg(secret), wg(secret)], 3, &TestDescriptors::standard()).unwrap_err();
+        assert_eq!(err.hop_index, Some(1));
+        assert!(
+            !err.reason.contains(secret),
+            "secret-shaped id leaked through reason: {}",
+            err.reason
+        );
+        assert!(
+            err.reason.contains("<redacted>"),
+            "masked id still named: {}",
+            err.reason
+        );
+        assert!(err.reason.contains("duplicate hop id"), "{}", err.reason);
     }
 
     #[test]

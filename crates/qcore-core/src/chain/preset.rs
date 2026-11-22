@@ -40,6 +40,8 @@ fn masque_h3(id: &str) -> HopSpec {
             obfuscation: None,
             family: "dual".into(),
             endpoint: None,
+            server_name: None,
+            insecure_skip_verify: None,
         }),
     }
 }
@@ -235,6 +237,21 @@ fn preset_field(
     }
 }
 
+fn preset_bool_field(
+    hop: &toml::Value,
+    preset: &str,
+    id: &str,
+    key: &str,
+) -> Result<Option<bool>, String> {
+    match hop.get(key) {
+        None => Ok(None),
+        Some(toml::Value::Boolean(b)) => Ok(Some(*b)),
+        Some(_) => Err(format!(
+            "preset `{preset}` hop `{id}`: `{key}` must be a boolean"
+        )),
+    }
+}
+
 fn parse_preset_hop(preset: &str, hop: &toml::Value) -> Result<HopSpec, String> {
     let t = hop
         .as_table()
@@ -288,6 +305,17 @@ fn parse_preset_hop(preset: &str, hop: &toml::Value) -> Result<HopSpec, String> 
             return Err(format!("preset `{preset}` hop `{id}`: unknown field `{k}`"));
         }
     }
+    crate::chain::validate_family(&family)
+        .map_err(|e| format!("preset `{preset}` hop `{id}`: {e}"))?;
+    // Explicit endpoints validate at the parse gate (same rules as the
+    // grammar and chain-file gates): a malformed preset endpoint fails
+    // preflight (exit 2), not mid-connect inside the transport (exit 3).
+    if matches!(kind, "wireguard" | "masque") {
+        if let Some(ep) = preset_field(hop, preset, &id, "endpoint")? {
+            crate::config::import::validate_explicit_endpoint(&ep)
+                .map_err(|e| format!("preset `{preset}` hop `{id}`: invalid endpoint: {e}"))?;
+        }
+    }
     let config = match kind {
         "wireguard" => HopConfig::Wireguard(WireguardConfig {
             peer: preset_field(hop, preset, &id, "peer")?.unwrap_or_else(|| "warp".into()),
@@ -302,12 +330,21 @@ fn parse_preset_hop(preset: &str, hop: &toml::Value) -> Result<HopSpec, String> 
             family,
             endpoint: preset_field(hop, preset, &id, "endpoint")?,
         }),
-        "masque" => HopConfig::Masque(MasqueConfig {
-            alpn: preset_field(hop, preset, &id, "alpn")?.unwrap_or_else(|| "h3".into()),
-            obfuscation: preset_field(hop, preset, &id, "obfuscation")?,
-            family,
-            endpoint: preset_field(hop, preset, &id, "endpoint")?,
-        }),
+        "masque" => {
+            let server_name = preset_field(hop, preset, &id, "server_name")?;
+            if let Some(sn) = &server_name {
+                crate::config::hop::validate_server_name(sn)
+                    .map_err(|e| format!("preset `{preset}` hop `{id}`: {e}"))?;
+            }
+            HopConfig::Masque(MasqueConfig {
+                alpn: preset_field(hop, preset, &id, "alpn")?.unwrap_or_else(|| "h3".into()),
+                obfuscation: preset_field(hop, preset, &id, "obfuscation")?,
+                family,
+                endpoint: preset_field(hop, preset, &id, "endpoint")?,
+                server_name,
+                insecure_skip_verify: preset_bool_field(hop, preset, &id, "insecure_skip_verify")?,
+            })
+        }
         "tor" => HopConfig::Tor(TorConfig { family }),
         "psiphon" => HopConfig::Psiphon(PsiphonConfig {
             sidecar_path: preset_field(hop, preset, &id, "sidecar_path")?.unwrap_or_default(),
@@ -502,6 +539,83 @@ import = "home"
             HopConfig::Wireguard(c) => assert_eq!(c.import_ref.as_deref(), Some("home")),
             other => panic!("expected wireguard, got {}", other.kind()),
         }
+    }
+
+    /// F7: a preset can carry masque `server_name` / `insecure_skip_verify`
+    /// once the field table allows them; the hop builder must map them into
+    /// the typed config (an allowed-but-unmapped key is dropped silently).
+    #[test]
+    fn masque_server_name_maps_through_compositions_toml() {
+        let toml = r#"
+[[preset]]
+name = "sni"
+[[preset.hop]]
+id = "m-0"
+kind = "masque"
+endpoint = "127.0.0.1:443"
+server_name = "masque.test"
+insecure_skip_verify = true
+"#;
+        let parsed = parse_compositions_toml(toml).expect("masque server_name parses");
+        let HopConfig::Masque(cfg) = &parsed[0].hops[0].config else {
+            panic!("expected masque, got {}", parsed[0].hops[0].config.kind());
+        };
+        assert_eq!(cfg.server_name.as_deref(), Some("masque.test"));
+        assert_eq!(cfg.insecure_skip_verify, Some(true));
+        let factory = parsed[0].hops[0].config.to_factory_config();
+        assert_eq!(factory.get("server_name"), Some("masque.test"));
+        assert_eq!(factory.get("insecure_skip_verify"), Some("true"));
+
+        let bad = "[[preset]]\nname = \"x\"\n[[preset.hop]]\nid = \"x-0\"\nkind = \"masque\"\ninsecure_skip_verify = \"true\"\n";
+        let err = parse_compositions_toml(bad).expect_err("non-boolean rejected");
+        assert!(
+            err.contains("insecure_skip_verify"),
+            "names the field: {err}"
+        );
+    }
+
+    /// F1: an unknown preset `family` must fail closed naming the field
+    /// instead of widening to `dual` inside the transport.
+    #[test]
+    fn unknown_family_rejected_naming_field() {
+        let bad = r#"
+[[preset]]
+name = "x"
+[[preset.hop]]
+id = "x-0"
+kind = "mock"
+family = "ip4"
+"#;
+        let err = parse_compositions_toml(bad).expect_err("unknown family rejected");
+        assert!(
+            err.contains("family") && err.contains("ip4"),
+            "names the field: {err}"
+        );
+    }
+
+    /// F2: a preset-defined explicit endpoint goes through the same
+    /// `validate_explicit_endpoint` gate as the grammar, chain-file and
+    /// import parsers — a malformed value dies at parse (exit 2), never
+    /// mid-connect (exit 3).
+    #[test]
+    fn malformed_preset_endpoint_rejected_at_parse() {
+        for kind in ["wireguard", "masque"] {
+            let bad = format!(
+                "[[preset]]\nname = \"x\"\n[[preset.hop]]\nid = \"x-0\"\nkind = \"{kind}\"\nendpoint = \"999.999.999.999:notaport\"\n"
+            );
+            let err = parse_compositions_toml(&bad).expect_err("malformed endpoint rejected");
+            assert!(err.contains("endpoint"), "{kind} names the field: {err}");
+        }
+        // A well-formed explicit endpoint still parses.
+        let ok = r#"
+[[preset]]
+name = "x"
+[[preset.hop]]
+id = "x-0"
+kind = "wireguard"
+endpoint = "10.0.0.1:51820"
+"#;
+        parse_compositions_toml(ok).expect("valid endpoint parses");
     }
 
     #[test]

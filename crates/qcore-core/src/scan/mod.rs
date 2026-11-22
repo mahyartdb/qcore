@@ -281,6 +281,10 @@ pub struct ScanRequest {
 /// family the scan was scoped to (never `"dual"` after validation): cache
 /// eviction decisions are family-aware because a family-scoped empty scan
 /// must not destroy sibling-family winners it never probed.
+///
+/// `warnings` carries best-effort cache-IO skip notices (persist/evict
+/// failures that never fail the scan). Core never writes CLI-framed stderr;
+/// the CLI renders each as `qcore: {warning}` on stderr unless `--quiet`.
 #[derive(Debug, Clone)]
 pub struct ScanReport {
     pub transport: String,
@@ -289,6 +293,30 @@ pub struct ScanReport {
     pub ranked: Vec<EndpointCandidate>,
     pub failed: usize,
     pub elapsed_ms: u64,
+    pub warnings: Vec<String>,
+}
+
+impl ScanReport {
+    /// A report with `warnings` empty: every construction site starts clean
+    /// and pushes only on an observed cache-IO skip.
+    pub fn new(
+        transport: String,
+        profile: String,
+        family: String,
+        ranked: Vec<EndpointCandidate>,
+        failed: usize,
+        elapsed_ms: u64,
+    ) -> Self {
+        ScanReport {
+            transport,
+            profile,
+            family,
+            ranked,
+            failed,
+            elapsed_ms,
+            warnings: Vec::new(),
+        }
+    }
 }
 
 /// Scan failure: empty means nothing reachable (exit 4, never silent reuse).
@@ -359,8 +387,9 @@ impl Scanner {
                 .unwrap_or(usize::MAX)
         });
         // F4: cap candidates — 10k inputs must not become 10k spawns.
-        // Reuses the seeded-scan bound (512) as the scan-wide ceiling.
-        cands.truncate(seeds::MAX_SEEDED_CANDIDATES);
+        // Reuses the seeded-scan bound (512) as the scan-wide ceiling,
+        // family-aware so a v4-heavy list cannot crowd IPv6 out entirely.
+        let cands = cap_candidates(cands, seeds::MAX_SEEDED_CANDIDATES);
         // F4: clamp defensively — ScanProfile fields are pub and directly
         // constructible, bypassing the TOML gate (u32::MAX permits would
         // otherwise mean unbounded in-flight sockets; 0 permits would hang).
@@ -428,14 +457,14 @@ impl Scanner {
             }
         }
         let ranked = rank(passed);
-        Ok(ScanReport {
-            transport: req.transport,
-            profile: req.profile.name,
-            family: req.family,
+        Ok(ScanReport::new(
+            req.transport,
+            req.profile.name,
+            req.family,
             ranked,
             failed,
-            elapsed_ms: t0.elapsed().as_millis() as u64,
-        })
+            t0.elapsed().as_millis() as u64,
+        ))
     }
 }
 
@@ -473,6 +502,44 @@ fn family_matches(family: &str, addr: SocketAddr) -> bool {
         // silently scan "everything" for a typo'd family.
         _ => false,
     }
+}
+
+/// Cap `candidates` at `cap` while keeping both address families
+/// represented. `SocketAddr` orders every V4 before every V6, so a plain
+/// sort+truncate lets a v4-heavy source starve a dual scan's IPv6 half to
+/// zero. The IPv6 side is reserved up to half the cap; IPv4 fills the
+/// remainder, and an IPv4 shortfall returns to IPv6. Input order is
+/// preserved, so probe order and seed-before-range priority survive.
+pub(crate) fn cap_candidates(candidates: Vec<SocketAddr>, cap: usize) -> Vec<SocketAddr> {
+    if candidates.len() <= cap {
+        return candidates;
+    }
+    let v4_len = candidates.iter().filter(|a| a.is_ipv4()).count();
+    let v6_len = candidates.len() - v4_len;
+    if v4_len == 0 || v6_len == 0 {
+        return candidates.into_iter().take(cap).collect();
+    }
+    let v6_keep = v6_len.min(cap / 2);
+    let v4_keep = v4_len.min(cap - v6_keep);
+    let v6_keep = v6_len.min(cap - v4_keep);
+    let (mut kept_v4, mut kept_v6) = (0usize, 0usize);
+    candidates
+        .into_iter()
+        .filter(|a| {
+            if a.is_ipv4() {
+                if kept_v4 == v4_keep {
+                    return false;
+                }
+                kept_v4 += 1;
+            } else {
+                if kept_v6 == v6_keep {
+                    return false;
+                }
+                kept_v6 += 1;
+            }
+            true
+        })
+        .collect()
 }
 
 async fn probe(
@@ -598,11 +665,11 @@ pub async fn run_scan_request(
         // Fast path: the recorded winner still answers. It was
         // traffic-verified when recorded; the re-verify confirms continued
         // reachability, so the Verified verdict stands without a rescan.
-        return Ok(ScanReport {
-            transport: transport.to_string(),
-            profile: profile.name.clone(),
-            family: family.to_string(),
-            ranked: vec![EndpointCandidate {
+        return Ok(ScanReport::new(
+            transport.to_string(),
+            profile.name.clone(),
+            family.to_string(),
+            vec![EndpointCandidate {
                 address: addr,
                 family: if addr.is_ipv4() {
                     "ipv4".to_string()
@@ -614,9 +681,9 @@ pub async fn run_scan_request(
                 confidence: Confidence::Verified,
                 last_known_good: true,
             }],
-            failed: 0,
-            elapsed_ms: latency_ms,
-        });
+            0,
+            latency_ms,
+        ));
     }
     let mut candidates = Vec::new();
     if let Some(lkg) = crate::session::reconnect::last_known_good(dirs) {
@@ -641,7 +708,17 @@ pub async fn run_scan_request(
     candidates.dedup();
     // F4: scan-wide ceiling (reuses the seeded bound) — the scanner truncates
     // again defensively, this keeps the pre-scan sort/dedup bounded too.
-    candidates.truncate(seeds::MAX_SEEDED_CANDIDATES);
+    // The family filter runs BEFORE the cap: capping the merged dual list
+    // family-blind would spend half the 512 budget on the unrequested family
+    // (a `family=ipv4` scan over >512 dual candidates would probe at most
+    // 256 v4 endpoints). Seeded candidates are already family-filtered at
+    // their sources; re-filtering the merged list is idempotent and keeps
+    // the seed-first priority (input order preserved by `cap_candidates`).
+    let candidates: Vec<SocketAddr> = candidates
+        .into_iter()
+        .filter(|a| family_matches(family, *a))
+        .collect();
+    let candidates = cap_candidates(candidates, seeds::MAX_SEEDED_CANDIDATES);
     // No declared endpoint contract (review wave C1): the sieve has no
     // protocol it may speak to those endpoints, so nothing here may be
     // Verified and no socket may be opened. The honest outcome is the
@@ -666,16 +743,16 @@ pub async fn run_scan_request(
                 last_known_good: false,
             })
             .collect();
-        return Ok(ScanReport {
-            transport: transport.to_string(),
-            profile: profile.name,
-            family: family.to_string(),
+        return Ok(ScanReport::new(
+            transport.to_string(),
+            profile.name,
+            family.to_string(),
             ranked,
-            failed: 0,
-            elapsed_ms: t0.elapsed().as_millis() as u64,
-        });
+            0,
+            t0.elapsed().as_millis() as u64,
+        ));
     }
-    let report = Scanner::scan(ScanRequest {
+    let mut report = Scanner::scan(ScanRequest {
         transport: transport.to_string(),
         profile,
         family: family.to_string(),
@@ -684,10 +761,21 @@ pub async fn run_scan_request(
     .await?;
     if report.ranked.is_empty() {
         // F1: per-transport eviction — a dead transport must not wipe
-        // siblings' winners.
-        evict_stale_lkg_async(dirs, transport, &report).await?;
+        // siblings' winners. Cache IO stays best-effort (the sibling
+        // `record_winner_async` below is too): the honest empty verdict is
+        // the scan's result, and a read-only/full cache dir must not turn
+        // exit 4 into a hard failure.
+        if let Err(e) = evict_stale_lkg_async(dirs, transport, &report).await {
+            report
+                .warnings
+                .push(format!("scan cache eviction skipped: {e}"));
+        }
     } else {
-        persist_verified_async(dirs, &report).await?;
+        if let Err(e) = persist_verified_async(dirs, &report).await {
+            report
+                .warnings
+                .push(format!("scan cache persist skipped: {e}"));
+        }
         if let Some(top) = report.ranked.iter().find(|c| {
             c.confidence == Confidence::Verified && c.reachability == Reachability::Passed
         }) {
@@ -893,14 +981,14 @@ mod tests {
     }
 
     fn empty_report_family(transport: &str, family: &str) -> ScanReport {
-        ScanReport {
-            transport: transport.to_string(),
-            profile: "balanced".to_string(),
-            family: family.to_string(),
-            ranked: Vec::new(),
-            failed: 1,
-            elapsed_ms: 0,
-        }
+        ScanReport::new(
+            transport.to_string(),
+            "balanced".to_string(),
+            family.to_string(),
+            Vec::new(),
+            1,
+            0,
+        )
     }
 
     /// F1: an empty warp scan evicts only warp — masque survives, and the
@@ -1317,6 +1405,100 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d.config_dir);
     }
 
+    /// F3: a cache write failure must not discard an honest verified report
+    /// (the CLI would map the `Err` to a failed exit, throwing the ranked
+    /// list away). A file where the config dir belongs makes every cache
+    /// write fail while the scan itself is healthy.
+    #[tokio::test]
+    async fn cache_write_failure_keeps_verified_report() {
+        let base = std::env::temp_dir().join(format!("qcore-cache-write-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let prof = base.join("prof");
+        std::fs::create_dir_all(&prof).expect("profile dir");
+        let d =
+            crate::config::profile_dir::ProfileDirs::resolve(Some(base.join("cfg")), Some(prof));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind echo");
+        let echo = listener.local_addr().expect("echo addr");
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let (mut r, mut w) = s.split();
+                    let _ = tokio::io::copy(&mut r, &mut w).await;
+                });
+            }
+        });
+        std::fs::write(
+            d.profile_dir.join("scan.toml"),
+            format!(
+                "{}\n[discovery.echo-test]\nseeds = [\"{echo}\"]\n",
+                SHIPPED_SCAN_TOML
+            ),
+        )
+        .expect("scan.toml");
+        // A file where the config dir belongs: `ensure_dirs` fails, so the
+        // winner/LKG write fails after an otherwise successful scan.
+        std::fs::write(base.join("cfg"), b"not a directory").expect("blocking file");
+        let profile = load_profile(&d, "balanced").expect("profile loads");
+        let report = run_scan_request(&d, "echo-test", profile, "ipv4")
+            .await
+            .expect("cache write failure must not discard the report");
+        assert_eq!(report.ranked.len(), 1, "verified candidate kept");
+        assert_eq!(report.ranked[0].address, echo);
+        assert_eq!(report.ranked[0].confidence, Confidence::Verified);
+        // Observability: the skip was attempted and actually failed — the
+        // report carries the warning and no cache file was written.
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("scan cache persist skipped")),
+            "persist skip is reported on the report: {:?}",
+            report.warnings
+        );
+        assert!(
+            !d.endpoints_file().exists(),
+            "blocked cache dir: the write was attempted and failed, no endpoints.json exists"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// F3: a failed cache eviction must not discard the honest empty verdict
+    /// (exit 4) either. An `endpoints.json` directory makes `remove_file`
+    /// fail; the scan still returns its (empty) report.
+    #[tokio::test]
+    async fn cache_eviction_failure_keeps_empty_verdict() {
+        let d = evict_dirs("evict-write-fail");
+        std::fs::create_dir_all(d.endpoints_file()).expect("blocking dir");
+        std::fs::write(
+            d.profile_dir.join("scan.toml"),
+            format!(
+                "{}\n[discovery.echo-test]\nseeds = [\"127.0.0.1:1\"]\n",
+                SHIPPED_SCAN_TOML
+            ),
+        )
+        .expect("scan.toml");
+        let profile = load_profile(&d, "balanced").expect("profile loads");
+        let report = run_scan_request(&d, "echo-test", profile, "ipv4")
+            .await
+            .expect("cache eviction failure must not discard the empty verdict");
+        assert!(report.ranked.is_empty(), "nothing reachable");
+        assert_eq!(
+            report.failed, 1,
+            "the closed candidate was probed and failed"
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("scan cache eviction skipped")),
+            "eviction skip is reported on the report: {:?}",
+            report.warnings
+        );
+        let _ = std::fs::remove_dir_all(&d.config_dir);
+    }
+
     /// FIX 3: a corrupt warp.toml override fails the scan closed (naming
     /// warp.toml) instead of silently disabling warp seeding — the old
     /// `if let Ok(warp)` swallow turned a broken source into "empty data".
@@ -1463,5 +1645,68 @@ mod tests {
             t0.elapsed().as_millis() < 20_000,
             "100-candidate stealth scan completes well under deadline"
         );
+    }
+
+    /// The 512 budget must be spent inside the requested family: the merged
+    /// candidate list is capped by `run_scan_request` BEFORE `Scanner::scan`
+    /// applies the family filter, so with >512 dual candidates and
+    /// `family=ipv4` the family-blind cap spends half the budget on the
+    /// unrequested family — at most 256 of the 512 probed candidates are
+    /// IPv4. The fix applies the filter to the merged list before capping;
+    /// the observable is the unverified tier's `ranked` list (the capped
+    /// merged list is reported verbatim for a non-probeable transport).
+    #[tokio::test]
+    async fn family_scoped_scan_spends_full_cap_inside_the_requested_family() {
+        // `warp` declares no endpoint contract in the qcore-core test binary,
+        // so the pipeline takes the honest unverified tier: `ranked` IS the
+        // capped merged candidate list, address-level observable, zero probes.
+        let d = evict_dirs("cap-after-filter");
+        // warp.toml: 300 distinct IPv4 seeds x 2 ports = 600 v4 candidates.
+        let mut warp_toml = String::from("[warp]\nports = [2408, 500]\nseeds = [");
+        for i in 1..=300u32 {
+            let ip = std::net::Ipv4Addr::new(198, 51, ((i >> 8) & 0xff) as u8, (i & 0xff) as u8);
+            warp_toml.push_str(&format!("\"{ip}\", "));
+        }
+        warp_toml.push_str("]\nranges = []\nv6_ranges = []\nv6_seeds = []\n");
+        warp_toml.push_str("[masque]\nports = [443]\nseeds = []\nranges = []\nv6_ranges = []\nv6_seeds = []\n[defaults]\nscan_profile = \"balanced\"\n");
+        std::fs::write(d.profile_dir.join("warp.toml"), warp_toml).unwrap();
+        // scan.toml [discovery.warp]: 512 distinct IPv6 entries (at the
+        // discovery gate's own 512 take) — merged list is ~1112 dual.
+        let mut scan_toml = format!("{}\n[discovery.warp]\nseeds = [", SHIPPED_SCAN_TOML);
+        for i in 1..=512u32 {
+            scan_toml.push_str(&format!("\"[2001:db8::{i:x}]:443\", "));
+        }
+        scan_toml.push_str("]\n");
+        std::fs::write(d.profile_dir.join("scan.toml"), scan_toml).unwrap();
+        let profile = load_profile(&d, "balanced").expect("profile loads");
+        let report = run_scan_request(&d, "warp", profile, "ipv4")
+            .await
+            .expect("scan runs");
+        // Post-fix: the family filter runs before the cap, so the full 512
+        // budget is spent on IPv4 candidates (600 available v4 seeds).
+        let v4 = report.ranked.iter().filter(|c| c.family == "ipv4").count();
+        let v6 = report.ranked.iter().filter(|c| c.family == "ipv6").count();
+        assert_eq!(
+            v4, 512,
+            "the full 512 budget is spent on IPv4 (600 available), got {v4}"
+        );
+        assert_eq!(
+            v6, 0,
+            "no unrequested-family candidate consumes the ipv4 scan's budget"
+        );
+        // Seed-first priority: the first v4 seed (198.51.0.1 on both ports)
+        // must survive the cap.
+        assert!(
+            report
+                .ranked
+                .iter()
+                .any(|c| c.address.to_string() == "198.51.0.1:2408")
+                && report
+                    .ranked
+                    .iter()
+                    .any(|c| c.address.to_string() == "198.51.0.1:500"),
+            "seed candidates are tried in full within the requested family"
+        );
+        let _ = std::fs::remove_dir_all(&d.config_dir);
     }
 }

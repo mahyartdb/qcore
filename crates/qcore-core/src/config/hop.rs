@@ -64,7 +64,17 @@ const ALLOWED_FIELDS: &[(&str, &[&str])] = &[
             "endpoint",
         ],
     ),
-    ("masque", &["alpn", "obfuscation", "family", "endpoint"]),
+    (
+        "masque",
+        &[
+            "alpn",
+            "obfuscation",
+            "family",
+            "endpoint",
+            "server_name",
+            "insecure_skip_verify",
+        ],
+    ),
     ("tor", &["family"]),
     ("psiphon", &["sidecar_path", "family"]),
     ("relay", &["family"]),
@@ -90,49 +100,27 @@ pub fn resolve_import_ref(
     }
 }
 
-/// Strict TOML parse: unknown fields are deserialization errors naming the
-/// field (Principle IV). The explicit key check below is the enforcement
-/// point for builtin kinds. A *registered* non-builtin kind parses opaquely
-/// into [`HopConfig::Plugin`] (scalar fields only — tables/arrays are
-/// rejected naming the field); unregistered kinds are rejected naming the
-/// kind. All file-loaded hop config MUST go through here.
-pub fn parse_toml_strict(s: &str) -> Result<HopConfig, String> {
-    let v: toml::Value = toml::from_str(s).map_err(|e| e.to_string())?;
-    let table = v
-        .as_table()
-        .ok_or_else(|| "hop config must be a TOML table".to_string())?;
-    let kind = table
-        .get("kind")
-        .and_then(|k| k.as_str())
-        .ok_or_else(|| "hop config is missing `kind`".to_string())?;
-    let Some(allowed) = allowed_fields(kind) else {
-        // Plugin kind (SC-002c): registry decides, schema stays untouched.
-        if crate::registry::TransportRegistry::global()
-            .get(kind)
-            .is_none()
-        {
-            return Err(format!("unknown transport kind `{kind}`"));
-        }
-        let mut pairs = BTreeMap::new();
-        for (k, val) in table {
-            if k == "kind" || k == "id" {
-                continue;
-            }
-            let s = val
-                .as_str()
-                .ok_or_else(|| format!("non-string field `{k}` for transport `{kind}`"))?;
-            pairs.insert(k.clone(), s.to_string());
-        }
-        return Ok(HopConfig::plugin(kind, &pairs));
-    };
-    for key in table.keys() {
-        if key != "kind" && !allowed.contains(&key.as_str()) {
-            return Err(format!("unknown field `{key}` for transport `{kind}`"));
-        }
+/// Strict string boolean shared by the string-form parse gates (chain
+/// expression and single hop). Only `true`/`false` are booleans, so a typo
+/// fails closed naming the field instead of silently reading as false at
+/// connect time — the factory compares against the canonical `"true"`.
+pub(crate) fn parse_bool_field(raw: &str, key: &str) -> Result<bool, String> {
+    match raw {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        other => Err(format!(
+            "field `{key}` must be `true` or `false` (got `{other}`)"
+        )),
     }
-    toml::Value::Table(table.clone())
-        .try_into()
-        .map_err(|e: toml::de::Error| e.to_string())
+}
+
+/// Gate for `server_name` shared by the parse gates: a malformed TLS name
+/// must die at preflight naming the field, not inside the TLS handshake. The
+/// transport re-validates at its own boundary.
+pub(crate) fn validate_server_name(raw: &str) -> Result<(), String> {
+    rustls::pki_types::ServerName::try_from(raw)
+        .map(|_| ())
+        .map_err(|e| format!("invalid `server_name` `{raw}`: {e}"))
 }
 
 impl HopConfig {
@@ -205,6 +193,12 @@ impl HopConfig {
                 }
                 if let Some(o) = &c.obfuscation {
                     put("obfuscation", o);
+                }
+                if let Some(sn) = &c.server_name {
+                    put("server_name", sn);
+                }
+                if let Some(skip) = c.insecure_skip_verify {
+                    put("insecure_skip_verify", if skip { "true" } else { "false" });
                 }
             }
             HopConfig::Tor(c) => {
@@ -323,10 +317,48 @@ impl<'de> Deserialize<'de> for HopConfig {
             Ok(t)
         };
         Ok(match kind.as_str() {
-            "wireguard" => HopConfig::Wireguard(
-                serde_json::from_value(builtin(value, fields("wireguard")?)?)
-                    .map_err(D::Error::custom)?,
-            ),
+            "wireguard" => {
+                let mut t = builtin(value, fields("wireguard")?)?;
+                // `import` is an accepted spelling (the chain grammar and the
+                // import store resolve the alias), but `WireguardConfig` has
+                // only `import_ref`: without this rewrite serde silently drops
+                // `import`, so a stored hop lost its import reference.
+                if let Some(obj) = t.as_object_mut() {
+                    let import = match obj.remove("import") {
+                        Some(v) => Some(
+                            v.as_str()
+                                .ok_or_else(|| {
+                                    D::Error::custom(
+                                        "non-string field `import` for transport `wireguard`",
+                                    )
+                                })?
+                                .to_string(),
+                        ),
+                        None => None,
+                    };
+                    let import_ref = match obj.get("import_ref") {
+                        Some(v) => Some(
+                            v.as_str()
+                                .ok_or_else(|| {
+                                    D::Error::custom(
+                                        "non-string field `import_ref` for transport `wireguard`",
+                                    )
+                                })?
+                                .to_string(),
+                        ),
+                        None => None,
+                    };
+                    if let Some(resolved) = resolve_import_ref(import, import_ref, "wireguard hop")
+                        .map_err(D::Error::custom)?
+                    {
+                        obj.insert(
+                            "import_ref".to_string(),
+                            serde_json::Value::String(resolved),
+                        );
+                    }
+                }
+                HopConfig::Wireguard(serde_json::from_value(t).map_err(D::Error::custom)?)
+            }
             "masque" => HopConfig::Masque(
                 serde_json::from_value(builtin(value, fields("masque")?)?)
                     .map_err(D::Error::custom)?,
@@ -397,6 +429,26 @@ pub struct MasqueConfig {
     pub obfuscation: Option<String>,
     pub family: String,
     pub endpoint: Option<String>,
+    /// TLS server name for `alpn=h3`; the endpoint host when omitted.
+    pub server_name: Option<String>,
+    /// `alpn=h3` only: accept any server certificate (self-signed edges).
+    pub insecure_skip_verify: Option<bool>,
+}
+
+impl Default for MasqueConfig {
+    /// Every field an embedder can omit: `alpn` defaults to the transport's
+    /// own (`h3`), `family` to the repo-wide `dual`, and the two new fields
+    /// to their absent (endpoint-host / verify) behavior.
+    fn default() -> Self {
+        MasqueConfig {
+            alpn: "h3".to_string(),
+            obfuscation: None,
+            family: "dual".to_string(),
+            endpoint: None,
+            server_name: None,
+            insecure_skip_verify: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -427,13 +479,115 @@ mod tests {
 
     #[test]
     fn unknown_fields_are_deserialization_errors() {
-        let toml = r#"
-kind = "tor"
-family = "dual"
-bogus_key = "nope"
-"#;
-        let err = super::parse_toml_strict(toml).unwrap_err();
-        assert!(err.contains("bogus_key"), "got: {err}");
+        let err = serde_json::from_str::<HopSpec>(
+            r#"{"id":"tor0","kind":"tor","family":"dual","bogus_key":"nope"}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("bogus_key"), "got: {err}");
+    }
+
+    /// Finding 8: `import` is an allowed spelling for wireguard, but the
+    /// typed struct only has `import_ref`; the deserializer used to drop
+    /// `import` silently, losing the reference the operator wrote.
+    #[test]
+    fn wireguard_import_alias_is_not_silently_dropped() {
+        let spec: HopSpec = serde_json::from_str(
+            r#"{"id":"wg0","kind":"wireguard","peer":"imported","family":"dual","import":"home"}"#,
+        )
+        .expect("import is an allowed spelling");
+        let HopConfig::Wireguard(cfg) = spec.config else {
+            panic!("kind=wireguard must deserialize to the wireguard variant");
+        };
+        assert_eq!(cfg.import_ref.as_deref(), Some("home"));
+        // Both spellings with the same value agree; conflicting values fail
+        // closed naming both keys instead of silently picking one.
+        let same: HopSpec = serde_json::from_str(
+            r#"{"id":"wg0","kind":"wireguard","peer":"imported","family":"dual","import":"home","import_ref":"home"}"#,
+        )
+        .expect("matching spellings agree");
+        let HopConfig::Wireguard(cfg) = same.config else {
+            panic!("kind=wireguard must deserialize to the wireguard variant");
+        };
+        assert_eq!(cfg.import_ref.as_deref(), Some("home"));
+        let err = serde_json::from_str::<HopSpec>(
+            r#"{"id":"wg0","kind":"wireguard","peer":"imported","family":"dual","import":"a","import_ref":"b"}"#,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("`import`") && err.to_string().contains("`import_ref`"),
+            "names both keys: {err}"
+        );
+    }
+
+    /// F7: `server_name` was readable by the masque factory but absent from
+    /// the typed config, so no chain could set it. An allowed key the typed
+    /// struct does not declare is silently dropped by `serde_json::from_value`
+    /// (the same bug class as `import` above), so this pins the mapping into
+    /// the struct and from there into the factory view.
+    #[test]
+    fn masque_server_name_is_mapped_not_dropped() {
+        let spec: HopSpec = serde_json::from_str(
+            r#"{"id":"m-0","kind":"masque","alpn":"h3","family":"dual","endpoint":"127.0.0.1:443","server_name":"masque.test","insecure_skip_verify":true}"#,
+        )
+        .expect("server_name is masque config surface");
+        let HopConfig::Masque(cfg) = spec.config else {
+            panic!("kind=masque must deserialize to the masque variant");
+        };
+        assert_eq!(cfg.server_name.as_deref(), Some("masque.test"));
+        assert_eq!(cfg.insecure_skip_verify, Some(true));
+        let factory = HopConfig::Masque(cfg.clone()).to_factory_config();
+        assert_eq!(factory.get("server_name"), Some("masque.test"));
+        assert_eq!(factory.get("insecure_skip_verify"), Some("true"));
+        // Report/session JSON round-trips both values.
+        let json = serde_json::to_string(&HopSpec {
+            id: "m-0".into(),
+            config: HopConfig::Masque(cfg),
+        })
+        .expect("serializes");
+        let back: HopSpec = serde_json::from_str(&json).expect("round-trips");
+        let HopConfig::Masque(cfg) = back.config else {
+            panic!("kind=masque must deserialize to the masque variant");
+        };
+        assert_eq!(cfg.server_name.as_deref(), Some("masque.test"));
+        assert_eq!(cfg.insecure_skip_verify, Some(true));
+
+        // Omitted: absent from the factory view, so the transport keeps its
+        // endpoint-host default instead of receiving an empty override.
+        let spec: HopSpec = serde_json::from_str(
+            r#"{"id":"m-1","kind":"masque","alpn":"h3","family":"dual","endpoint":"127.0.0.1:443"}"#,
+        )
+        .expect("defaults apply");
+        let HopConfig::Masque(cfg) = spec.config else {
+            panic!("kind=masque must deserialize to the masque variant");
+        };
+        assert_eq!(cfg.server_name, None);
+        assert_eq!(cfg.insecure_skip_verify, None);
+        let factory = HopConfig::Masque(cfg).to_factory_config();
+        assert_eq!(factory.get("server_name"), None);
+        assert_eq!(factory.get("insecure_skip_verify"), None);
+
+        // Explicit false stays explicit (and false) in the factory view.
+        let spec: HopSpec = serde_json::from_str(
+            r#"{"id":"m-2","kind":"masque","alpn":"h3","family":"dual","insecure_skip_verify":false}"#,
+        )
+        .expect("explicit false parses");
+        let HopConfig::Masque(cfg) = spec.config else {
+            panic!("kind=masque must deserialize to the masque variant");
+        };
+        assert_eq!(cfg.insecure_skip_verify, Some(false));
+        assert_eq!(
+            HopConfig::Masque(cfg)
+                .to_factory_config()
+                .get("insecure_skip_verify"),
+            Some("false")
+        );
+
+        // A typo stays a typed error naming the field.
+        let err = serde_json::from_str::<HopSpec>(
+            r#"{"id":"m-3","kind":"masque","alpn":"h3","family":"dual","server_nam":"masque.test"}"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("server_nam"), "names field: {err}");
     }
 
     #[test]

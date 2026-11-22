@@ -266,8 +266,11 @@ fn parse_hop(
             return Err(err(format!("bad option `{tok}` (expected key=value)")));
         }
         if !quoted && v.chars().any(|c| c == '=' || c == '"' || c == '\'') {
+            // Backticks here push the whole-value entropy over the redaction
+            // gate (`masked_value("reason", …)` would fail-closed the entire
+            // message): keep the symbol mix low so the reason survives.
             return Err(err(format!(
-                "value for `{k}` must be quoted (contains `=`, quote or space)"
+                "value for {k} must be quoted (contains =, quote or space)"
             )));
         }
         // Duplicate keys never last-win: fail closed naming the field.
@@ -336,6 +339,7 @@ fn build_hop(
         }
     }
     let family = get(pairs, "family", "dual");
+    crate::chain::validate_family(&family).map_err(|e| err(format!("transport `{kind}`: {e}")))?;
     // Explicit endpoints validate at the parse gate: a malformed
     // `endpoint=` (bad host, non-numeric port) must die here naming the
     // field, not mid-connect inside the transport. Same rules as the
@@ -358,12 +362,26 @@ fn build_hop(
             family,
             endpoint: pairs.get("endpoint").cloned(),
         }),
-        "masque" => HopConfig::Masque(MasqueConfig {
-            alpn: get(pairs, "alpn", "h3"),
-            obfuscation: pairs.get("obfuscation").cloned(),
-            family,
-            endpoint: pairs.get("endpoint").cloned(),
-        }),
+        "masque" => {
+            let server_name = pairs.get("server_name").cloned();
+            if let Some(sn) = &server_name {
+                crate::config::hop::validate_server_name(sn)
+                    .map_err(|e| err(format!("transport `{kind}`: {e}")))?;
+            }
+            let insecure_skip_verify = pairs
+                .get("insecure_skip_verify")
+                .map(|raw| crate::config::hop::parse_bool_field(raw, "insecure_skip_verify"))
+                .transpose()
+                .map_err(|e| err(format!("transport `{kind}`: {e}")))?;
+            HopConfig::Masque(MasqueConfig {
+                alpn: get(pairs, "alpn", "h3"),
+                obfuscation: pairs.get("obfuscation").cloned(),
+                family,
+                endpoint: pairs.get("endpoint").cloned(),
+                server_name,
+                insecure_skip_verify,
+            })
+        }
         "tor" => HopConfig::Tor(TorConfig { family }),
         "psiphon" => HopConfig::Psiphon(PsiphonConfig {
             sidecar_path: get(pairs, "sidecar_path", ""),
@@ -468,6 +486,20 @@ mod tests {
         );
     }
 
+    /// F1: the grammar gate rejects an unknown `family` naming the field —
+    /// an unknown value used to reach WireGuard, which treats it as `dual`.
+    #[test]
+    fn build_hop_rejects_unknown_family_naming_field() {
+        let reg = crate::registry::TransportRegistry::global();
+        let pairs = std::collections::BTreeMap::from([("family".to_string(), "ip4".to_string())]);
+        let err = build_hop("mock", &pairs, 0, &reg).expect_err("unknown family rejected");
+        assert!(
+            err.reason.contains("family") && err.reason.contains("ip4"),
+            "names the field: {}",
+            err.reason
+        );
+    }
+
     #[test]
     fn invalid_explicit_endpoint_rejected_at_parse() {
         // `999.999.999.999` parses as a hostname-shaped token but the
@@ -501,5 +533,62 @@ mod tests {
         // Well-formed explicit endpoints still build (bracketed IPv6 too).
         build_hop("wireguard", &pairs("10.0.0.1:51820"), 0, &reg).expect("valid endpoint builds");
         build_hop("masque", &pairs("[2001:db8::1]:443"), 0, &reg).expect("bracketed IPv6 builds");
+    }
+
+    /// F7: `server_name` / `insecure_skip_verify` must reach the typed masque
+    /// config through the grammar gate; before the fix they were rejected as
+    /// unknown options, so the h3 SNI override was unreachable from a chain.
+    #[test]
+    fn masque_server_name_reaches_the_typed_config() {
+        let reg = crate::registry::TransportRegistry::global();
+        let pairs = std::collections::BTreeMap::from([
+            ("endpoint".to_string(), "127.0.0.1:443".to_string()),
+            ("server_name".to_string(), "masque.test".to_string()),
+            ("insecure_skip_verify".to_string(), "true".to_string()),
+        ]);
+        let spec = build_hop("masque", &pairs, 0, &reg).expect("server_name is a masque option");
+        let HopConfig::Masque(cfg) = &spec.config else {
+            panic!("kind=masque must parse to the masque variant");
+        };
+        assert_eq!(cfg.server_name.as_deref(), Some("masque.test"));
+        assert_eq!(cfg.insecure_skip_verify, Some(true));
+        let factory = spec.config.to_factory_config();
+        assert_eq!(factory.get("server_name"), Some("masque.test"));
+        assert_eq!(factory.get("insecure_skip_verify"), Some("true"));
+
+        // Omitted: no override key, so the transport keeps the endpoint host.
+        let spec = build_hop("masque", &std::collections::BTreeMap::new(), 0, &reg)
+            .expect("bare masque builds");
+        let HopConfig::Masque(cfg) = &spec.config else {
+            panic!("kind=masque must parse to the masque variant");
+        };
+        assert_eq!(cfg.server_name, None);
+        assert_eq!(cfg.insecure_skip_verify, None);
+        assert_eq!(spec.config.to_factory_config().get("server_name"), None);
+    }
+
+    #[test]
+    fn masque_bad_server_name_and_non_bool_insecure_fail_closed_naming_the_field() {
+        let reg = crate::registry::TransportRegistry::global();
+        let bad = std::collections::BTreeMap::from([(
+            "server_name".to_string(),
+            "not a name".to_string(),
+        )]);
+        let err = build_hop("masque", &bad, 0, &reg).unwrap_err();
+        assert!(
+            err.reason.contains("server_name"),
+            "names field: {}",
+            err.reason
+        );
+        let bad = std::collections::BTreeMap::from([(
+            "insecure_skip_verify".to_string(),
+            "yes".to_string(),
+        )]);
+        let err = build_hop("masque", &bad, 0, &reg).unwrap_err();
+        assert!(
+            err.reason.contains("insecure_skip_verify"),
+            "names field: {}",
+            err.reason
+        );
     }
 }

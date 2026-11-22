@@ -11,6 +11,7 @@
 //! metadata only is written.
 
 use std::collections::BTreeMap;
+use std::ops::Range;
 
 /// Keys always treated as secret (case-insensitive substring match).
 pub const SECRET_KEYS: &[&str] = &[
@@ -135,8 +136,100 @@ fn is_hex_token(s: &str) -> bool {
     s.len() >= MIN_HEX_LEN && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// Group lengths of a UUID: 8-4-4-4-12 hex digits.
+const UUID_GROUP_LENS: [usize; 5] = [8, 4, 4, 4, 12];
+
+/// UUID-shaped tokens (device IDs). The separators break the all-hex rule
+/// and their share of the characters drags entropy under the random bar, so
+/// a hyphenated UUID would otherwise pass every sink raw. The shape is
+/// anchored to 8-4-4-4-12 groups so separator-rich non-secrets (a full-form
+/// IPv6 endpoint, say) stay actionable triage text.
+fn is_uuid_token(s: &str) -> bool {
+    let groups: Vec<&str> = s.split(['-', '_', ':']).collect();
+    groups.len() == UUID_GROUP_LENS.len()
+        && groups
+            .iter()
+            .zip(UUID_GROUP_LENS)
+            .all(|(g, n)| g.len() == n && g.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// Byte ranges of device-id-shaped substrings inside one whitespace-delimited
+/// token. The whole-token checks above miss an id carrying decorations
+/// (`…:443`, `id=…,`, quotes): the glue changes the token's group count.
+/// Runs are bounded by characters that are neither hex nor one of the
+/// [`is_uuid_token`] separators, and two shapes anchor detection: a bare run
+/// of [`MIN_HEX_LEN`]+ hex digits (an unseparated id glued to `id=`), and
+/// five consecutive groups with the 8-4-4-4-12 lengths. The shape anchors
+/// are what keep separator-rich non-secrets (a full-form IPv6 endpoint, MAC
+/// chains, `0000-…` padding) unflagged.
+fn uuid_subranges(s: &str) -> Vec<Range<usize>> {
+    fn is_sep(b: u8) -> bool {
+        matches!(b, b'-' | b'_' | b':')
+    }
+    let bytes = s.as_bytes();
+    let mut ranges = Vec::new();
+    let mut run_start = 0;
+    while run_start < bytes.len() {
+        if !(bytes[run_start].is_ascii_hexdigit() || is_sep(bytes[run_start])) {
+            run_start += 1;
+            continue;
+        }
+        let mut run_end = run_start;
+        while run_end < bytes.len()
+            && (bytes[run_end].is_ascii_hexdigit() || is_sep(bytes[run_end]))
+        {
+            run_end += 1;
+        }
+        // Split the run on separators: each group is a maximal hex run. A
+        // group of MIN_HEX_LEN+ digits is a bare device id; any five
+        // consecutive groups with the 8-4-4-4-12 lengths are a decorated
+        // UUID. Extra groups around either shape (a leading `-`, a suffix)
+        // leave the window anchored to the id.
+        let mut groups = Vec::new();
+        let mut group_start = run_start;
+        for (offset, &b) in bytes[run_start..run_end].iter().enumerate() {
+            if is_sep(b) {
+                groups.push(group_start..run_start + offset);
+                group_start = run_start + offset + 1;
+            }
+        }
+        groups.push(group_start..run_end);
+        for g in &groups {
+            if g.end - g.start >= MIN_HEX_LEN {
+                ranges.push(g.clone());
+            }
+        }
+        for window in groups.windows(UUID_GROUP_LENS.len()) {
+            let shaped = window.iter().zip(UUID_GROUP_LENS).all(|(g, n)| {
+                g.end - g.start == n && bytes[g.start..g.end].iter().all(|b| b.is_ascii_hexdigit())
+            });
+            if shaped {
+                let last = window.len() - 1;
+                ranges.push(window[0].start..window[last].end);
+            }
+        }
+        run_start = run_end;
+    }
+    // A run can yield a bare group and a shape window out of order (and two
+    // shape windows can overlap when a group sequence matches at both
+    // offsets); callers walk the ranges left to right.
+    ranges.sort_by_key(|r| r.start);
+    let mut merged: Vec<Range<usize>> = Vec::with_capacity(ranges.len());
+    for r in ranges {
+        match merged.last_mut() {
+            Some(last) if r.start < last.end => last.end = last.end.max(r.end),
+            _ => merged.push(r),
+        }
+    }
+    merged
+}
+
 fn looks_secret(s: &str) -> bool {
-    looks_random(s) || is_hex_token(s)
+    looks_random(s) || is_hex_token(s) || is_uuid_token(s)
+}
+
+fn token_is_secret(s: &str) -> bool {
+    looks_secret(s) || !uuid_subranges(s).is_empty()
 }
 
 /// Record-drop predicate shared by [`redact_record`] and the NDJSON event
@@ -189,10 +282,15 @@ pub fn prefixed_cause(prefix: &str, detail: &str) -> String {
 }
 /// Classify one key/value pair.
 ///
-/// Whole-value checks first (typed keys, denylist, whole-value entropy),
-/// then a token scan: a secret embedded in longer low-entropy prose dilutes
-/// whole-value entropy below threshold, so secret-like whitespace-delimited
-/// tokens are masked in place and the sentence is kept with context intact.
+/// Whole-value checks first (typed keys, denylist, single-token shapes and
+/// entropy), then a token scan: secret-like whitespace-delimited tokens are
+/// masked in place and the sentence is kept with context intact. Whole-value
+/// entropy is deliberately NOT applied to multi-word values — prose entropy
+/// is a property of the sentence, not a secrecy proof, and a diagnostic
+/// sentence that happens to clear the bar (an FR-021 rejection message, say)
+/// must not be redacted wholesale. The record-level fail-closed path
+/// ([`drops_record`]) still treats any long secret-like value as
+/// unclassifiable.
 /// Scope: only random-looking blobs of [`MIN_RANDOM_LEN`]+ chars are
 /// detected. Short or human-readable credentials under innocuous keys are
 /// NOT caught by this heuristic — those need a typed secret key or a
@@ -201,12 +299,15 @@ pub fn redact_value(key: &str, value: &str) -> Redaction {
     if key_is_secret(key) || value_matches_denylist(value) {
         return Redaction::Redacted;
     }
-    // Free-form high-entropy values are treated as secret (fail closed at the
-    // value level); see redact_record for the record-level fail-closed path.
-    if looks_secret(value) {
+    // Hex/UUID whole-value shapes are single-token rules; a separator-bearing
+    // shape or a lone blob cannot contain whitespace.
+    if is_hex_token(value) || is_uuid_token(value) {
         return Redaction::Redacted;
     }
-    if value.split(char::is_whitespace).any(looks_secret) {
+    if !value.contains(char::is_whitespace) && looks_random(value) {
+        return Redaction::Redacted;
+    }
+    if value.split(char::is_whitespace).any(token_is_secret) {
         return Redaction::Keep(mask_secret_tokens(value));
     }
     Redaction::Keep(value.to_string())
@@ -214,7 +315,9 @@ pub fn redact_value(key: &str, value: &str) -> Redaction {
 
 /// Replace secret-like whitespace-delimited tokens with `<redacted>`,
 /// preserving every other byte (including separator runs) exactly, so a
-/// value with no secret-like token round-trips byte-identical.
+/// value with no secret-like token round-trips byte-identical. A token that
+/// only carries a UUID substring keeps its decoration (`id=`, `:443`, quotes,
+/// commas) and loses just the UUID body.
 fn mask_secret_tokens(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for span in value.split_inclusive(char::is_whitespace) {
@@ -222,14 +325,24 @@ fn mask_secret_tokens(value: &str) -> String {
         // is one token. (Separator matching is the same char::is_whitespace
         // predicate as the split, so word + sep == span.)
         let (word, sep) = span.split_at(span.trim_end_matches(char::is_whitespace).len());
-        out.push_str(if looks_secret(word) {
-            "<redacted>"
+        if looks_secret(word) {
+            out.push_str("<redacted>");
         } else {
-            word
-        });
+            push_masked_uuids(&mut out, word);
+        }
         out.push_str(sep);
     }
     out
+}
+
+fn push_masked_uuids(out: &mut String, word: &str) {
+    let mut last = 0;
+    for range in uuid_subranges(word) {
+        out.push_str(&word[last..range.start]);
+        out.push_str("<redacted>");
+        last = range.end;
+    }
+    out.push_str(&word[last..]);
 }
 
 /// Redact a whole record. Returns the redacted map, or a [`DroppedRecord`]
@@ -322,12 +435,14 @@ mod tests {
             masked_value("cause", "connection refused"),
             "connection refused"
         );
+        // Multi-word prose keeps its non-secret words and masks only the
+        // secret-like token.
         assert_eq!(
             masked_value(
                 "cause",
                 "boom xT4vN7qW2zR5uY8iO1pA3sD6fG9hJ0kL2mN4bV6cX8dE0gH2=="
             ),
-            "<redacted>"
+            "boom <redacted>"
         );
         assert_eq!(
             prefixed_cause("provider refused: ", "quota gone"),
@@ -338,7 +453,7 @@ mod tests {
                 "provider refused: ",
                 "quota gone xT4vN7qW2zR5uY8iO1pA3sD6fG9hJ0kL2mN4bV6cX8dE0gH2=="
             ),
-            "provider refused: <redacted>"
+            "provider refused: quota gone <redacted>"
         );
     }
 
@@ -357,7 +472,7 @@ mod tests {
         assert!(!line.contains(ECHO_44), "leaked: {line}");
         assert_eq!(
             line,
-            "layer=transport hop=wg-0 kind=transport cause=<redacted>"
+            "layer=transport hop=wg-0 kind=transport cause=boom <redacted>"
         );
     }
 
@@ -448,6 +563,82 @@ mod tests {
     }
 
     #[test]
+    fn hyphenated_uuid_tokens_are_secret() {
+        // Cloudflare device IDs are hyphenated UUIDs: the separators break
+        // the all-hex rule and the dashes drag entropy under the random
+        // bar, so a 36-char UUID used to pass every sink raw.
+        const UUID: &str = "550e8400-e29b-41d4-a716-446655440000";
+        assert_eq!(redact_value("mystery", UUID), Redaction::Redacted);
+        let prose = format!("device {UUID} refused");
+        let masked = masked_value("cause", &prose);
+        assert!(!masked.contains(UUID), "uuid leaked: {masked}");
+        assert!(masked.contains("<redacted>"), "nothing masked: {masked}");
+        assert!(masked.contains("refused"), "context lost: {masked}");
+        // The failure sink is the one the leak was reported through.
+        use qcore_transport_api::{FailureLayer, FailureReport};
+        let f = FailureReport::new(
+            FailureLayer::Transport,
+            "wg-0",
+            format!("boom device {UUID}"),
+            "transport",
+        );
+        let line = masked_failure_line(&f);
+        assert!(!line.contains(UUID), "uuid leaked through the sink: {line}");
+        // The rule is UUID-shaped, not "anything with separators": a
+        // full-form IPv6 endpoint stays actionable triage text.
+        const V6: &str = "2001:0db8:85a3:0000:0000:8a2e:0370:7334";
+        assert_eq!(
+            redact_value("endpoint", V6),
+            Redaction::Keep(V6.to_string())
+        );
+    }
+
+    #[test]
+    fn uuid_with_port_suffix_is_masked_in_place() {
+        // A port glued to a UUID changes the token's group count, so the
+        // whole-token shape check misses it. The UUID body must still be
+        // masked, with the port and surrounding prose kept for triage.
+        const UUID: &str = "550e8400-e29b-41d4-a716-446655440000";
+        let detail = format!("device {UUID}:443 refused");
+        let masked = masked_value("cause", &detail);
+        assert!(!masked.contains(UUID), "uuid leaked: {masked}");
+        assert_eq!(masked, "device <redacted>:443 refused");
+    }
+
+    #[test]
+    fn uuid_glued_to_prefix_and_suffix_is_masked_in_place() {
+        // `id=` and the comma glue to the UUID, so the token is not exactly
+        // UUID-shaped. Only the UUID body may disappear; the decoration is
+        // actionable context.
+        const UUID: &str = "550e8400-e29b-41d4-a716-446655440000";
+        let detail = format!("id={UUID}, retry 2");
+        let masked = masked_value("cause", &detail);
+        assert!(!masked.contains(UUID), "uuid leaked: {masked}");
+        assert_eq!(masked, "id=<redacted>, retry 2");
+        // Quotes are another non-hex boundary: the UUID body goes, the
+        // quotes and the surrounding prose stay.
+        let quoted = format!("\"{UUID}\" refused");
+        assert_eq!(masked_value("cause", &quoted), "\"<redacted>\" refused");
+    }
+
+    #[test]
+    fn uuid_shape_anchor_ignores_hyphenated_non_uuids() {
+        // The 8-4-4-4-12 shape is the precision anchor: MAC chains, padding
+        // runs and near-miss group counts stay actionable triage text.
+        for value in [
+            "00-11-22-33-44-55",
+            "0000-0000-0000-0000-0000-0000",
+            "01234567-89ab-cdef-0123-456789ab",
+        ] {
+            assert_eq!(
+                redact_value("endpoint", value),
+                Redaction::Keep(value.to_string()),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
     fn long_hex_tokens_are_secret_despite_low_entropy() {
         // Hex tops out at 4 bits/char, below the entropy bar: a 32-char hex
         // token (device ID, license key) must still redact under an innocuous
@@ -462,5 +653,50 @@ mod tests {
         let masked = masked_value("cause", &prose);
         assert!(!masked.contains(HEX_32), "hex leaked: {masked}");
         assert!(masked.contains("<redacted>"), "nothing masked: {masked}");
+    }
+
+    #[test]
+    fn multi_word_prose_is_not_whole_value_entropy_redacted() {
+        // FR-021 rejection text is multi-word diagnostic prose whose aggregate
+        // entropy can clear the random-looking bar. Whole-value entropy must
+        // not turn a shipped profile name into a redacted sentence: the
+        // tokens carry no secret, and the operator needs the field/mode.
+        let msg = "obfuscation profile awg-balanced excludes mode wireguard peer=warp (FR-021)";
+        assert_eq!(redact_value("cause", msg), Redaction::Keep(msg.into()));
+        assert_eq!(masked_value("cause", msg), msg);
+        // The family variant names the family and the hop kind.
+        let family =
+            "obfuscation profile awg-balanced (family awg) does not apply to a masque hop (FR-021)";
+        assert_eq!(masked_value("cause", family), family);
+    }
+
+    #[test]
+    fn prose_with_embedded_hex_masks_token_keeps_sentence() {
+        // Multi-word prose is diagnostic text: the token scan masks the
+        // secret-like token in place and the surrounding sentence survives.
+        const HEX_32: &str = "0123456789abcdef0123456789abcdef";
+        let prose = format!("device {HEX_32} refused");
+        assert_eq!(
+            redact_value("cause", &prose),
+            Redaction::Keep("device <redacted> refused".into())
+        );
+        // A single-token high-entropy blob still redacts whole: the
+        // fail-closed path for a lone secret is unchanged.
+        assert_eq!(redact_value("cause", ECHO_44), Redaction::Redacted);
+    }
+
+    #[test]
+    fn decorated_non_hyphenated_ids_are_masked_in_place() {
+        // A bare 32-hex device id glued to a prefix: the whole token is not
+        // all-hex, so only a subrange scan can catch it.
+        let glued = "id=deadbeefdeadbeefdeadbeefdeadbeef refused";
+        assert_eq!(masked_value("cause", glued), "id=<redacted> refused");
+        // UUID shape split on `_`, the other separator `is_uuid_token`
+        // accepts.
+        let underscored = "id=550e8400_e29b_41d4_a716_446655440000 refused";
+        assert_eq!(masked_value("cause", underscored), "id=<redacted> refused");
+        // Colon-separated shape is the same rule.
+        let colon = "id=550e8400:e29b:41d4:a716:446655440000 refused";
+        assert_eq!(masked_value("cause", colon), "id=<redacted> refused");
     }
 }

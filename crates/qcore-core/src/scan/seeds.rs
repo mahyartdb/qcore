@@ -6,11 +6,14 @@
 //! scan choice: replaceable data, validated shape, never content provenance
 //! (FR-028).
 //!
-//! Bounds (documented, deterministic — constitution V): seeds expand over
-//! every listed port; range samples ride the primary port only; IPv4 CIDRs
-//! sample evenly up to [`MAX_HOSTS_PER_RANGE`]; totals cap at
-//! [`MAX_SEEDED_CANDIDATES`]. Same file, same family → same candidates.
+//! Bounds (documented, deterministic — constitution V): seed candidates
+//! expand over every listed port and outrank range samples; range samples
+//! ride the primary port only; IPv4 CIDRs sample evenly up to
+//! [`MAX_HOSTS_PER_RANGE`]; totals cap at [`MAX_SEEDED_CANDIDATES`], split
+//! across families so a dual scan never loses IPv6 to a v4-heavy list.
+//! Same file, same family → same candidates.
 
+use super::cap_candidates;
 use crate::config::profile_dir::ProfileDirs;
 use std::collections::BTreeSet;
 use std::net::{IpAddr, SocketAddr};
@@ -151,21 +154,24 @@ pub fn candidates_for(profiles: &WarpProfiles, transport: &str, family: &str) ->
         "masque" => &profiles.masque,
         _ => return Vec::new(),
     };
-    let mut out = BTreeSet::new();
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut push = |addr: SocketAddr| {
+        if seen.insert(addr) {
+            out.push(addr);
+        }
+    };
     let want_v4 = family != "ipv6";
     let want_v6 = family != "ipv4";
     let primary_port = section.ports[0];
+    // Seed candidates first, over every listed port (warp.toml: "seeds are
+    // always tried in full"): range samples only fill what the cap leaves.
     if want_v4 {
         for seed in &section.seeds {
             if let Ok(IpAddr::V4(ip)) = seed.parse() {
                 for port in &section.ports {
-                    out.insert(SocketAddr::new(IpAddr::V4(ip), *port));
+                    push(SocketAddr::new(IpAddr::V4(ip), *port));
                 }
-            }
-        }
-        for range in &section.ranges {
-            for host in sample_cidr_v4(range) {
-                out.insert(SocketAddr::new(IpAddr::V4(host), primary_port));
             }
         }
     }
@@ -173,17 +179,26 @@ pub fn candidates_for(profiles: &WarpProfiles, transport: &str, family: &str) ->
         for seed in &section.v6_seeds {
             if let Ok(IpAddr::V6(ip)) = seed.parse() {
                 for port in &section.ports {
-                    out.insert(SocketAddr::new(IpAddr::V6(ip), *port));
+                    push(SocketAddr::new(IpAddr::V6(ip), *port));
                 }
             }
         }
-        for range in &section.v6_ranges {
-            if let Some(host) = first_host_v6(range) {
-                out.insert(SocketAddr::new(IpAddr::V6(host), primary_port));
+    }
+    if want_v4 {
+        for range in &section.ranges {
+            for host in sample_cidr_v4(range) {
+                push(SocketAddr::new(IpAddr::V4(host), primary_port));
             }
         }
     }
-    out.into_iter().take(MAX_SEEDED_CANDIDATES).collect()
+    if want_v6 {
+        for range in &section.v6_ranges {
+            if let Some(host) = first_host_v6(range) {
+                push(SocketAddr::new(IpAddr::V6(host), primary_port));
+            }
+        }
+    }
+    cap_candidates(out, MAX_SEEDED_CANDIDATES)
 }
 
 /// Even, deterministic sample of an IPv4 CIDR (`a.b.c.d/n`): skip network +
@@ -238,14 +253,28 @@ fn parse_cidr_v4(cidr: &str) -> Option<(std::net::Ipv4Addr, u32)> {
     Some((std::net::Ipv4Addr::from(u32::from(base) & mask), prefix))
 }
 
-/// First usable host of an IPv6 range (`base/prefix` → base+1). Full-range
-/// enumeration is infeasible; seeds carry v6 discovery.
+/// First host of an IPv6 range (`base/prefix`): the address is masked to
+/// the network first, then stepped one host in; a /128 is its own only
+/// host. Full-range enumeration is infeasible; seeds carry v6 discovery.
+/// A missing/invalid/oversized prefix selects nothing — never probe an
+/// address the range does not contain.
 fn first_host_v6(cidr: &str) -> Option<std::net::Ipv6Addr> {
-    let (ip, _) = cidr.split_once('/')?;
+    let (ip, prefix) = cidr.split_once('/')?;
     let base: std::net::Ipv6Addr = ip.parse().ok()?;
-    let mut segments = base.segments();
-    segments[7] = segments[7].wrapping_add(1);
-    Some(std::net::Ipv6Addr::from(segments))
+    let prefix: u32 = prefix.parse().ok()?;
+    if prefix > 128 {
+        return None;
+    }
+    let mask = if prefix == 0 {
+        0u128
+    } else {
+        u128::MAX << (128 - prefix)
+    };
+    let network = u128::from(base) & mask;
+    if prefix == 128 {
+        return Some(std::net::Ipv6Addr::from(network));
+    }
+    Some(std::net::Ipv6Addr::from(network + 1))
 }
 
 /// Zero-config default scan profile name (FR-014): warp.toml's choice, or
@@ -294,6 +323,70 @@ mod tests {
             let n = u32::from(*h);
             n > base && n <= base + 65534
         }));
+    }
+
+    /// F5: `first_host_v6` is prefix-aware — it masks to the network and
+    /// never steps outside the CIDR (a /128 is its own only host) and
+    /// rejects a missing/invalid prefix instead of probing blind.
+    #[test]
+    fn first_host_v6_respects_prefix() {
+        let v6 = |s: &str| s.parse::<std::net::Ipv6Addr>().expect("v6 literal");
+        // /128 is a single address: never +1.
+        assert_eq!(first_host_v6("2001:db8::1/128"), Some(v6("2001:db8::1")));
+        // End-of-block base masks to the network, then steps one host in
+        // (the old segment[7] wrapping_add landed back at :0 of the block).
+        assert_eq!(
+            first_host_v6("2001:db8::ffff:ffff:ffff:ffff/64"),
+            Some(v6("2001:db8::1"))
+        );
+        // A non-network base is masked first: ::3/127's first host is ::3.
+        assert_eq!(first_host_v6("2001:db8::3/127"), Some(v6("2001:db8::3")));
+        assert_eq!(first_host_v6("2001:db8::2/127"), Some(v6("2001:db8::3")));
+        // Missing/invalid/oversized prefixes probe nothing.
+        assert_eq!(first_host_v6("2001:db8::1"), None);
+        assert_eq!(first_host_v6("2001:db8::1/bogus"), None);
+        assert_eq!(first_host_v6("2001:db8::1/129"), None);
+        assert_eq!(first_host_v6("not-an-ip/64"), None);
+    }
+
+    /// F4: the 512 cap is family-aware and seed-first. 300 IPv4 seeds on
+    /// two ports (600 candidates) plus a range sample and two IPv6 seeds:
+    /// a plain `BTreeSet::take(512)` keeps 512 IPv4 addresses (range
+    /// samples included) and drops every IPv6 candidate.
+    #[test]
+    fn candidate_cap_keeps_ipv6_and_seeds_when_ipv4_overflows() {
+        let seeds: Vec<String> = (0..300)
+            .map(|i| format!("198.51.{}.{}", 100 + i / 254, i % 254 + 1))
+            .collect();
+        let warp = WarpProfiles {
+            warp: TransportCandidates {
+                ranges: vec!["10.0.0.0/24".to_string()],
+                seeds,
+                ports: vec![2408, 500],
+                v6_ranges: Vec::new(),
+                v6_seeds: vec!["2606:4700:d0::1".to_string(), "2606:4700:d1::1".to_string()],
+            },
+            masque: TransportCandidates {
+                ranges: Vec::new(),
+                seeds: Vec::new(),
+                ports: vec![443],
+                v6_ranges: Vec::new(),
+                v6_seeds: Vec::new(),
+            },
+            default_scan_profile: "balanced".to_string(),
+        };
+        let out = candidates_for(&warp, "warp", "dual");
+        assert_eq!(out.len(), MAX_SEEDED_CANDIDATES);
+        let v6 = out.iter().filter(|a| a.is_ipv6()).count();
+        assert_eq!(v6, 4, "both v6 seeds on both ports survive truncation");
+        let range_samples = out
+            .iter()
+            .filter(|a| match a.ip() {
+                std::net::IpAddr::V4(ip) => ip.octets()[0] == 10,
+                std::net::IpAddr::V6(_) => false,
+            })
+            .count();
+        assert_eq!(range_samples, 0, "seed candidates outrank range samples");
     }
 
     #[test]

@@ -133,6 +133,24 @@ fn field(hop: &toml::Value, i: usize, id: &str, key: &str) -> Result<Option<Stri
     }
 }
 
+fn bool_field(
+    hop: &toml::Value,
+    i: usize,
+    id: &str,
+    key: &str,
+) -> Result<Option<bool>, ChainError> {
+    match hop.get(key) {
+        None => Ok(None),
+        Some(toml::Value::Boolean(b)) => Ok(Some(*b)),
+        Some(_) => Err(ChainError::new(
+            Some(i),
+            Some(id.to_string()),
+            format!("chain file: hop `{id}` field `{key}` must be a boolean"),
+            None,
+        )),
+    }
+}
+
 fn parse_file_hop(
     i: usize,
     hop: &toml::Value,
@@ -189,6 +207,9 @@ fn parse_file_hop(
         }
     }
     let family = field(hop, i, &id, "family")?.unwrap_or_else(|| "dual".into());
+    if let Err(e) = crate::chain::validate_family(&family) {
+        return Err(err(format!("chain file: hop `{id}`: {e}")));
+    }
     // Explicit endpoints validate at the parse gate (same rules as the
     // import parser's Endpoint check): a malformed `endpoint=` dies here
     // naming the field, not mid-connect inside the transport.
@@ -210,12 +231,21 @@ fn parse_file_hop(
             family,
             endpoint: field(hop, i, &id, "endpoint")?,
         }),
-        "masque" => HopConfig::Masque(MasqueConfig {
-            alpn: field(hop, i, &id, "alpn")?.unwrap_or_else(|| "h3".into()),
-            obfuscation: field(hop, i, &id, "obfuscation")?,
-            family,
-            endpoint: field(hop, i, &id, "endpoint")?,
-        }),
+        "masque" => {
+            let server_name = field(hop, i, &id, "server_name")?;
+            if let Some(sn) = &server_name {
+                crate::config::hop::validate_server_name(sn)
+                    .map_err(|e| err(format!("chain file: hop `{id}` {e}")))?;
+            }
+            HopConfig::Masque(MasqueConfig {
+                alpn: field(hop, i, &id, "alpn")?.unwrap_or_else(|| "h3".into()),
+                obfuscation: field(hop, i, &id, "obfuscation")?,
+                family,
+                endpoint: field(hop, i, &id, "endpoint")?,
+                server_name,
+                insecure_skip_verify: bool_field(hop, i, &id, "insecure_skip_verify")?,
+            })
+        }
         "tor" => HopConfig::Tor(TorConfig { family }),
         "psiphon" => HopConfig::Psiphon(PsiphonConfig {
             sidecar_path: field(hop, i, &id, "sidecar_path")?.unwrap_or_default(),
@@ -280,6 +310,73 @@ family = "dual"
         assert_eq!(f.hops.len(), 3);
     }
 
+    /// F7: masque `server_name` / `insecure_skip_verify` must survive the TOML
+    /// gate into the typed config and the factory view — an allowed key with
+    /// no mapping is silently dropped (the `import` bug class).
+    #[test]
+    fn masque_server_name_and_insecure_survive_the_file_gate() {
+        let f = parse_chain_file_str(
+            r#"
+[chain]
+[[chain.hop]]
+kind = "masque"
+id = "m-0"
+alpn = "h3"
+endpoint = "127.0.0.1:443"
+server_name = "masque.test"
+insecure_skip_verify = true
+"#,
+        )
+        .expect("masque server_name is a chain-file field");
+        let ExpandedHop::Hop(spec) = &f.hops[0] else {
+            panic!("chain files author hops, never preset references");
+        };
+        let HopConfig::Masque(cfg) = &spec.config else {
+            panic!("kind=masque must parse to the masque variant");
+        };
+        assert_eq!(cfg.server_name.as_deref(), Some("masque.test"));
+        assert_eq!(cfg.insecure_skip_verify, Some(true));
+        let factory = spec.config.to_factory_config();
+        assert_eq!(factory.get("server_name"), Some("masque.test"));
+        assert_eq!(factory.get("insecure_skip_verify"), Some("true"));
+
+        // Omitted: no override key, so the h3 default (endpoint host) stays.
+        let f = parse_chain_file_str(
+            "[chain]\n[[chain.hop]]\nkind = \"masque\"\nendpoint = \"127.0.0.1:443\"\n",
+        )
+        .expect("defaults apply");
+        let ExpandedHop::Hop(spec) = &f.hops[0] else {
+            panic!("chain files author hops, never preset references");
+        };
+        let HopConfig::Masque(cfg) = &spec.config else {
+            panic!("kind=masque must parse to the masque variant");
+        };
+        assert_eq!(cfg.server_name, None);
+        assert_eq!(cfg.insecure_skip_verify, None);
+        assert_eq!(spec.config.to_factory_config().get("server_name"), None);
+    }
+
+    #[test]
+    fn masque_bad_server_name_and_non_bool_insecure_fail_closed_naming_the_field() {
+        let with = |extra: &str| {
+            format!(
+                "[chain]\n[[chain.hop]]\nkind = \"masque\"\nendpoint = \"127.0.0.1:443\"\n{extra}\n"
+            )
+        };
+        let err = parse_chain_file_str(&with("server_name = \"not a name\"")).unwrap_err();
+        assert!(
+            err.reason.contains("server_name"),
+            "names field: {}",
+            err.reason
+        );
+        let err = parse_chain_file_str(&with("insecure_skip_verify = \"true\"")).unwrap_err();
+        assert!(
+            err.reason.contains("insecure_skip_verify"),
+            "names field: {}",
+            err.reason
+        );
+    }
+
     #[test]
     fn unknown_field_names_field() {
         let err = parse_chain_file_str(
@@ -332,6 +429,26 @@ kind = "mock"
         let err = parse_chain_file_str("max_deph = 3\n[chain]\n[[chain.hop]]\nkind = \"mock\"\n")
             .unwrap_err();
         assert!(err.reason.contains("max_deph"), "names field: {err}");
+    }
+
+    /// F1: an unknown `family` in a chain file must fail closed naming the
+    /// field instead of silently widening an unknown value to `dual`.
+    #[test]
+    fn unknown_family_rejected_naming_field() {
+        let err = parse_chain_file_str(
+            r#"
+[chain]
+[[chain.hop]]
+kind = "mock"
+family = "ip4"
+"#,
+        )
+        .expect_err("unknown family rejected");
+        assert!(
+            err.reason.contains("family") && err.reason.contains("ip4"),
+            "names the field: {}",
+            err.reason
+        );
     }
 
     #[test]

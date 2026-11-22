@@ -1028,15 +1028,52 @@ fn toml_escape(v: &str) -> String {
     out
 }
 
+/// Why `load_import` failed. The contract splits these across exit codes
+/// (contracts/cli.md §2): a missing record or malformed ref is usage (6);
+/// corrupt stored content or an unavailable secret is an import rejection
+/// (5). Classification rides the VARIANT, never the message text, so a
+/// wording change cannot silently move a failure between exit codes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImportLoadError {
+    /// No stored record under that ref (`<config_dir>/imports/<ref>.toml`
+    /// absent or unreadable).
+    UnknownRef(String),
+    /// The ref is malformed (empty, path escape, reserved device name).
+    InvalidRef(String),
+    /// The stored record exists but its content fails to parse.
+    Corrupt(String),
+    /// The record parses but its secret-store entry is gone (restored
+    /// config dir, cleared keyring).
+    SecretUnavailable(String),
+}
+
+impl std::fmt::Display for ImportLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ImportLoadError::UnknownRef(msg) | ImportLoadError::InvalidRef(msg) => {
+                write!(f, "{msg}")
+            }
+            ImportLoadError::Corrupt(msg) | ImportLoadError::SecretUnavailable(msg) => {
+                write!(f, "{msg}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ImportLoadError {}
+
 /// Load a stored import plus its secrets (in memory only).
 pub fn load_import(
     dirs: &ProfileDirs,
     import_ref: &str,
-) -> Result<(StoredImport, BTreeMap<String, SecretString>), String> {
-    let path = import_path(dirs, import_ref)?;
-    let text = std::fs::read_to_string(&path)
-        .map_err(|_| format!("unknown import `{import_ref}` (see `qcore import`)"))?;
-    let stored = StoredImport::from_toml(&text)?;
+) -> Result<(StoredImport, BTreeMap<String, SecretString>), ImportLoadError> {
+    let path = import_path(dirs, import_ref).map_err(ImportLoadError::InvalidRef)?;
+    let text = std::fs::read_to_string(&path).map_err(|_| {
+        ImportLoadError::UnknownRef(format!(
+            "unknown import `{import_ref}` (see `qcore import`)"
+        ))
+    })?;
+    let stored = StoredImport::from_toml(&text).map_err(ImportLoadError::Corrupt)?;
     let store = secret_store(dirs);
     let legacy = legacy_secret_store(dirs);
     let mut secrets = BTreeMap::new();
@@ -1046,9 +1083,9 @@ pub fn load_import(
             secrets.insert("interface.private_key".to_string(), s);
         }
         Err(e) => {
-            return Err(format!(
+            return Err(ImportLoadError::SecretUnavailable(format!(
                 "import `{import_ref}` secret `interface.private_key` unavailable: {e}"
-            ))
+            )))
         }
     }
     // PresharedKey presence is known only via the secret store: probe per peer.
@@ -1111,7 +1148,7 @@ pub fn check_refs(dirs: &ProfileDirs, hops: &[crate::config::HopSpec]) -> Result
                     return Err(ChainError::new(
                         None,
                         Some(hop.id.clone()),
-                        e,
+                        e.to_string(),
                         Some(
                             "import the .conf first (or re-import to restore its secrets)"
                                 .to_string(),
@@ -1163,7 +1200,7 @@ pub fn materialize(
             ChainError::new(
                 None,
                 Some(hop.id.clone()),
-                e,
+                e.to_string(),
                 Some("import the .conf first".to_string()),
             )
         })?;

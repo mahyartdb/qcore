@@ -275,6 +275,30 @@ fn mode_matches(entry: &ModeMatch, kind: &str, peer: &str, alpn: &str) -> bool {
     true
 }
 
+/// FR-021 rejection text names the profile, the family and the hop kind: the
+/// operator needs the mismatch, not a redacted sentence. Multi-word prose
+/// survives the diagnostic redaction gate (whole-value entropy applies to
+/// single tokens only).
+fn family_mismatch_message(name: &str, family: ObfFamily, kind: &str) -> String {
+    format!(
+        "obfuscation profile {name} (family {}) does not apply to a {kind} hop (FR-021)",
+        family.as_str()
+    )
+}
+
+/// FR-021 rejection text names the profile and the hop mode it excludes
+/// (`wireguard peer=warp`, `masque alpn=h2`).
+fn mode_mismatch_message(name: &str, kind: &str, peer: &str, alpn: &str) -> String {
+    let mut mode = kind.to_string();
+    if !peer.is_empty() {
+        mode.push_str(&format!(" peer={peer}"));
+    }
+    if !alpn.is_empty() {
+        mode.push_str(&format!(" alpn={alpn}"));
+    }
+    format!("obfuscation profile {name} excludes mode {mode} (FR-021)")
+}
+
 /// Resolve obfuscation for every hop that selects a profile (FR-021 gate).
 /// Returns per-hop-id applications; hops without `obfuscation=` are absent.
 pub fn resolve_for_chain(
@@ -296,7 +320,7 @@ pub fn resolve_for_chain(
         let err = |reason: String| ChainError::new(None, Some(hop.id.clone()), reason, None);
         let profile = profiles
             .get(&name)
-            .ok_or_else(|| err(format!("unknown obfuscation profile `{name}`")))?;
+            .ok_or_else(|| err(format!("unknown obfuscation profile {name}")))?;
         let (kind, peer, alpn) = hop_mode(hop);
         // Family must be in the transport descriptor (source of truth).
         // Matched on variants via the `From` bridge, not Debug strings: a
@@ -308,26 +332,14 @@ pub fn resolve_for_chain(
             .map(|f| f.descriptor().obfuscation_families.contains(&want))
             .unwrap_or(false);
         if !descriptor_ok {
-            return Err(err(format!(
-                "obfuscation profile `{name}` (family {}) incompatible with transport `{kind}`",
-                profile.family.as_str()
-            )));
+            return Err(err(family_mismatch_message(&name, profile.family, &kind)));
         }
         if !profile
             .compatible_modes
             .iter()
             .any(|m| mode_matches(m, &kind, &peer, &alpn))
         {
-            return Err(err(format!(
-                "obfuscation profile `{name}` excludes mode `{}` (FR-021)",
-                if peer.is_empty() && alpn.is_empty() {
-                    kind.clone()
-                } else if !peer.is_empty() {
-                    format!("{kind} peer={peer}")
-                } else {
-                    format!("{kind} alpn={alpn}")
-                }
-            )));
+            return Err(err(mode_mismatch_message(&name, &kind, &peer, &alpn)));
         }
         out.insert(
             hop.id.clone(),
@@ -421,6 +433,29 @@ mod tests {
         }
         assert_eq!(ObfFamily::parse("nope"), None);
         assert_eq!(qcore_transport_api::ObfuscationFamily::parse("nope"), None);
+    }
+
+    #[test]
+    fn fr021_rejection_messages_name_profile_mode_and_survive_redaction() {
+        let mode = mode_mismatch_message("awg-balanced", "wireguard", "warp", "");
+        assert_eq!(
+            mode,
+            "obfuscation profile awg-balanced excludes mode wireguard peer=warp (FR-021)"
+        );
+        assert_eq!(
+            mode_mismatch_message("masque-balanced", "masque", "", "h2"),
+            "obfuscation profile masque-balanced excludes mode masque alpn=h2 (FR-021)"
+        );
+        let family = family_mismatch_message("awg-balanced", ObfFamily::Awg, "masque");
+        assert_eq!(
+            family,
+            "obfuscation profile awg-balanced (family awg) does not apply to a masque hop (FR-021)"
+        );
+        // The reason reaches sinks through `ChainError::Display`, which masks
+        // it; the FR-021 detail must survive that gate intact.
+        for msg in [mode, family] {
+            assert_eq!(crate::diag::masked_value("reason", &msg), msg);
+        }
     }
 
     #[test]

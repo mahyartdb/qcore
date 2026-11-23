@@ -1062,6 +1062,10 @@ pub struct SessionLock {
 
 const SESSION_LOCK_STALE: std::time::Duration = std::time::Duration::from_secs(600);
 
+const SESSION_LOCK_HELD: &str =
+    "session lock is held: another session is starting or running; wait for it to come up or run \
+     `qcore stop`";
+
 impl std::fmt::Debug for SessionLock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SessionLock")
@@ -1127,11 +1131,17 @@ impl SessionLock {
                     let _ = std::fs::remove_file(&path);
                     return SessionLock::acquire(dirs);
                 }
-                Err("another session is starting or running (session.lock is held); wait for it to \
-                     come up or run `qcore stop`"
-                    .to_string())
+                Err(SESSION_LOCK_HELD.to_string())
             }
-            Err(e) => Err(format!("session lock failed: {e}")),
+            // A create that fails while the path exists is a held lock: Windows
+            // reports a held or directory lock as PermissionDenied, not AlreadyExists.
+            Err(e) => {
+                if path.exists() {
+                    Err(SESSION_LOCK_HELD.to_string())
+                } else {
+                    Err(format!("session lock failed: {e}"))
+                }
+            }
         }
     }
 
@@ -1701,7 +1711,10 @@ mod tests {
         lock.attach_session_id("s-live-1").expect("record the id");
 
         let second = SessionLock::acquire(&dirs).expect_err("second acquire must fail");
-        assert!(second.contains("session.lock"), "names the lock: {second}");
+        assert!(
+            second.contains("session lock is held"),
+            "names the held lock in the contract wording: {second}"
+        );
         let blocker = SessionStatus::assert_startable(&dirs).expect_err("lock blocks the gate");
         assert!(
             blocker.reason.contains("s-live-1"),
@@ -1718,6 +1731,26 @@ mod tests {
             SessionStatus::assert_startable(&dirs).is_ok(),
             "a released lock unblocks the next start"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A `session.lock` that exists but cannot be opened as a file (here a
+    /// directory) is still held: the acquire error must use the contract
+    /// wording `session lock is held`, not leak the path spelling. Linux
+    /// fails the exclusive create with AlreadyExists here while Windows fails
+    /// with a different kind, so both arms must agree on the wording.
+    #[test]
+    fn unopenable_session_lock_reports_the_contract_wording() {
+        let (root, dirs) = fresh_dirs("lock-unopenable");
+        dirs.ensure_dirs().expect("dirs");
+        std::fs::create_dir_all(session_lock_path(&dirs)).expect("blocking session.lock directory");
+
+        let err = SessionLock::acquire(&dirs).expect_err("a directory at the lock path is held");
+        assert!(
+            err.contains("session lock is held"),
+            "names the held lock in the contract wording: {err}"
+        );
+
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -14,7 +14,7 @@ permissions:
 
 jobs:
   # Tier B (nightly + main): stub-peer smoke. One target only
-  # (x86_64-unknown-linux-gnu on ubuntu-22.04) — this is the linux-gnu
+  # (x86_64-unknown-linux-gnu on ubuntu-24.04) — this is the linux-gnu
   # nightly leg, not a cross-build matrix; the tag-time release matrix owns
   # per-target coverage (all nine contract targets on a tag push or a
   # workflow_dispatch dry run).
@@ -25,15 +25,27 @@ jobs:
   # Real-network egress (WARP/MASQUE/Tor/Psiphon) is supplementary,
   # non-blocking.
   linux-gnu-native:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # rust-cache below owns caching, and the toolchain action's default
+      # build-warnings=deny would turn a deprecation warning into a red
+      # nightly that nobody gates on.
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
+        with:
+          cache: false
+          build-warnings: ''
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: v3-nightly
       - run: cargo xtask build --target native
       - run: cargo xtask smoke --target native
   live-egress:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
     continue-on-error: true
     env:
       # The ignored-only lane includes tests that panic without this guard
@@ -43,12 +55,23 @@ jobs:
       # that the core regressed.
       QCORE_LIVE: "1"
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          tool: nextest@0.9.145
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
+        with:
+          cache: false
+          build-warnings: ''
+      # Separate key: the ignored-only lane builds a different feature/test set
+      # and must not evict the blocking leg's tree.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: v3-nightly-live
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
+        with:
+          # 0.9.152 carries the fix for GHSA-vc25-qg58-w57c (rerun arbitrary
+          # code execution); .config/nextest.toml fails closed below 0.9.150.
+          tool: nextest@0.9.152
       - run: echo "live-network egress checks (non-blocking)"
       # Ignored-mode through nextest (not the bare test runner) so retries,
       # config, and per-test timeouts apply uniformly (T7 story 17).

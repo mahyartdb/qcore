@@ -8,6 +8,13 @@
 # gets at most ~120s before it is killed and counted as failed. This is the
 # assumed ceiling for the live-network nightly legs: any ignored test that
 # legitimately needs longer must split or shrink, not outgrow this cap.
+
+# Fail closed on the vulnerable 0.9.125-0.9.149 line (GHSA-vc25-qg58-w57c:
+# arbitrary code execution when rerunning tests from a portable recording).
+# Fixed in 0.9.150, so anything older refuses to run rather than trusting CI
+# to pin the version.
+nextest-version = "0.9.150"
+
 [profile.default]
 slow-timeout = { period = "60s", terminate-after = 2 }
 

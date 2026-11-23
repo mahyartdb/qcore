@@ -2,42 +2,76 @@ name: ci
 on:
   pull_request:
   push:
-    branches: [master]
+    branches: [main]
+  # Merge queue entry point: without this trigger a queued PR waits on checks
+  # that never start for the merge_group ref, so the queue stalls until it
+  # times out.
+  merge_group:
 
 # Cancel superseded runs on re-push; only the latest commit per ref matters.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Keeps filename/line backtraces while dropping the debug-info blobs that
+# dominate link time and cache size. Debug profile only; release legs are
+# unaffected.
+env:
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+
+# Branch protection requires these check names: supply, clippy, test,
+# conformance (1/2), conformance (2/2), semver, gate-windows, go-consumer.
+# Renaming a job or reshaping the conformance matrix silently drops a required
+# check, so the ruleset moves in the same commit.
+
 jobs:
-  # Tier A (every PR): native host unit/contract, lint, secret scan, native stub-peer smoke.
-  gate:
-    runs-on: ubuntu-22.04
-    timeout-minutes: 90
-    # Least privilege for the gate job's token.
+  # Tier A (every PR) runs as parallel jobs: a red clippy no longer hides a red
+  # conformance run behind it, each gate carries its own timeout, and every job
+  # starts on a fresh ~14GB runner disk (the old single job had to `cargo clean`
+  # mid-run to make room for the semver baseline builds).
+  #
+  # Supply gates get their own job because they need no compiled tree: a
+  # deny/notices/ABI failure signals in ~30 s instead of after the 20-minute
+  # build.
+  supply:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    # Least privilege: the secret scan reads history and PR metadata only.
     permissions:
       contents: read
       pull-requests: read
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # Full history: both scanners walk it, and abi-diff fails closed
+          # without git.
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+          persist-credentials: false
+      # rust-cache below owns caching; the toolchain action's default
+      # build-warnings=deny would fail the xtask build here on a warning that
+      # clippy owns.
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         with:
-          # Prefix orphans the pre-prune cache, whose restores crashed the
-          # conformance link with ld SIGBUS (corrupt member in the restored
-          # set). A red run never re-saves, so a poisoned entry sticks until
-          # the prefix is bumped — bump again if a restore ever poisons a run.
-          key: v2-pruned
-      - uses: taiki-e/install-action@v2
+          cache: false
+          build-warnings: ''
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          tool: nextest@0.9.145,cargo-deny@0.20.2,cargo-semver-checks@0.50.0
+          # Shared with clippy/test/conformance/semver so the Linux tree is
+          # restored once instead of per job. The v3 prefix orphans the
+          # pre-prune cache, whose restores crashed the conformance link with
+          # ld SIGBUS (corrupt member in the restored set). A red run never
+          # re-saves, so a poisoned entry sticks until the key is bumped — bump
+          # again if a restore ever poisons a run.
+          shared-key: v3-linux-ci
+          # Only main seeds the cache: a PR branch would save a tree keyed
+          # to a commit nobody reuses.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: false
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
+        with:
+          tool: cargo-deny@0.22.0
       - name: fmt
         run: cargo fmt --check
-      # Supply gates first: they need no compiled tree, so a deny/notices
-      # failure signals in ~30 s instead of after the 20-minute build. The
-      # order within the gate is otherwise preserved.
       - name: supply chain (cargo-deny)
         run: cargo deny --config denylist.toml check
       # Denylist policy sync: proves every `skip` entry still matches a
@@ -47,61 +81,46 @@ jobs:
         run: cargo run -q -p xtask -- deny-sync
       - name: third-party notices
         run: cargo run -q -p xtask -- notices --check
-      - name: clippy
-        # --workspace: default-members is only qcore/cli/ffi; without it the
-        # qcore-core/transports/examples/xtask suites never run (#17).
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      - name: unit + contract tests
-        # --workspace for the same reason; conformance excluded here (separate
-        # line below), chains rides this run.
-        run: cargo nextest run --workspace --all-features --exclude tests-conformance
-      - name: conformance matrix
-        run: cargo nextest run -p tests-conformance
       - name: C ABI diff
         run: cargo xtask abi-diff
-      # Runner disk is ~14GB: clippy+nextest+conformance target/ plus the
-      # dual baseline/current rustdoc builds below exceed it (ENOSPC kill).
-      # Everything before this point is done; wipe build artifacts and the
-      # registry cache so semver (then smoke) rebuild only what they need.
-      - name: free disk before semver baseline builds
-        run: |
-          cargo clean
-          rm -rf ~/.cargo/registry/cache
-      # Unpublished crate: no crates.io baseline exists, so compare the PR
-      # delta against its base instead (merge-base semantics for push events).
-      # Test suites are not versioned API surfaces (FR-003f), so they are
-      # excluded from the check.
-      - name: semver-checks (git baseline)
-        run: |
-          BASE="${{ github.event.pull_request.base.sha }}"
-          [ -z "$BASE" ] && BASE="$(git merge-base HEAD HEAD~1 2>/dev/null || echo HEAD~1)"
-          cargo semver-checks --baseline-rev "$BASE" --exclude tests-conformance --exclude tests-chains
-      # Semver scratch trees are single-use multi-GB baseline copies. Prune
-      # now that their only consumer ran: leaving them trips the post-run
-      # cache save with ENOENT annotations and wastes cache quota.
-      - name: prune semver scratch trees
-        run: rm -rf target/semver-checks
       # T087 secret-scan gate: gitleaks (rule match + .gitleaksignore
-      # fingerprints) and trufflehog --only-verified over git history, plus
-      # the secret_hygiene conformance suite. Any of them failing blocks the
-      # gate (SC-006). Both scanners run as pinned CLIs, not wrapper actions:
-      # the actions fail opaquely (exit 1, no finding attached) while direct
-      # repros are clean, so the scan stays transparent in the gate log.
+      # fingerprints) and trufflehog --only-verified over git history; the
+      # secret_hygiene conformance suite rides the conformance job. Any of them
+      # failing blocks the gate (SC-006). Both scanners run as pinned CLIs, not
+      # wrapper actions: the actions fail opaquely (exit 1, no finding
+      # attached) while direct repros are clean, so the scan stays transparent
+      # in the gate log. Findings stay redacted: this log is public.
       - name: gitleaks (pinned CLI)
         run: |
-          curl -sSL -o /tmp/gitleaks.tar.gz https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
-          tar xzf /tmp/gitleaks.tar.gz -C /tmp && sudo install -m755 /tmp/gitleaks /usr/local/bin/
+          dl=/tmp/gitleaks-8.30.1
+          mkdir -p "$dl"
+          url=https://github.com/gitleaks/gitleaks/releases/download/v8.30.1
+          curl -sSfL -o "$dl/gitleaks_8.30.1_linux_x64.tar.gz" "$url/gitleaks_8.30.1_linux_x64.tar.gz"
+          curl -sSfL -o "$dl/gitleaks_8.30.1_checksums.txt" "$url/gitleaks_8.30.1_checksums.txt"
+          # Verify before install: the checksum file ships in the same release,
+          # so a swapped or truncated archive fails the step instead of
+          # running. --ignore-missing skips the other platforms' archives that
+          # the same file lists.
+          (cd "$dl" && sha256sum --check --ignore-missing gitleaks_8.30.1_checksums.txt)
+          tar xzf "$dl/gitleaks_8.30.1_linux_x64.tar.gz" -C "$dl"
+          sudo install -m755 "$dl/gitleaks" /usr/local/bin/
           BASE="${{ github.event.pull_request.base.sha }}"
           HEAD="${{ github.event.pull_request.head.sha }}"
           if [ -n "$BASE" ] && [ -n "$HEAD" ]; then
-            gitleaks detect --source . -v --exit-code=2 --log-opts="--no-merges --first-parent $BASE..$HEAD"
+            gitleaks detect --source . -v --redact --exit-code=2 --log-opts="--no-merges --first-parent $BASE..$HEAD"
           else
-            gitleaks detect --source . -v --exit-code=2
+            gitleaks detect --source . -v --redact --exit-code=2
           fi
       - name: secret scan (trufflehog git history)
         run: |
-          curl -sSL -o /tmp/trufflehog.tar.gz https://github.com/trufflesecurity/trufflehog/releases/download/v3.88.4/trufflehog_3.88.4_linux_amd64.tar.gz
-          tar xzf /tmp/trufflehog.tar.gz -C /tmp && sudo install -m755 /tmp/trufflehog /usr/local/bin/
+          dl=/tmp/trufflehog-3.100.0
+          mkdir -p "$dl"
+          url=https://github.com/trufflesecurity/trufflehog/releases/download/v3.100.0
+          curl -sSfL -o "$dl/trufflehog_3.100.0_linux_amd64.tar.gz" "$url/trufflehog_3.100.0_linux_amd64.tar.gz"
+          curl -sSfL -o "$dl/trufflehog_3.100.0_checksums.txt" "$url/trufflehog_3.100.0_checksums.txt"
+          (cd "$dl" && sha256sum --check --ignore-missing trufflehog_3.100.0_checksums.txt)
+          tar xzf "$dl/trufflehog_3.100.0_linux_amd64.tar.gz" -C "$dl"
+          sudo install -m755 "$dl/trufflehog" /usr/local/bin/
           BASE="${{ github.event.pull_request.base.sha }}"
           HEAD="${{ github.event.pull_request.head.sha }}"
           if [ -n "$BASE" ] && [ -n "$HEAD" ]; then
@@ -109,8 +128,126 @@ jobs:
           else
             trufflehog git "file://$(pwd)" --fail --no-update --only-verified
           fi
+
+  clippy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
+        with:
+          cache: false
+          build-warnings: ''
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: v3-linux-ci
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: false
+      - name: clippy
+        # --workspace: default-members is only qcore/cli/ffi; without it the
+        # qcore-core/transports/examples/xtask suites never run (#17).
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
+        with:
+          cache: false
+          build-warnings: ''
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: v3-linux-ci
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: false
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
+        with:
+          # 0.9.152 carries the fix for GHSA-vc25-qg58-w57c (arbitrary code
+          # execution when rerunning tests from a portable recording);
+          # .config/nextest.toml fails closed below 0.9.150.
+          tool: nextest@0.9.152
+      - name: unit + contract tests
+        # --workspace for the same reason; conformance excluded here (its own
+        # sharded job), chains rides this run.
+        run: cargo nextest run --workspace --all-features --exclude tests-conformance
       - name: native smoke
         run: cargo xtask smoke --target native
+
+  # The conformance run split across two shards: it is the longest leg, and
+  # hash partitioning is a pure function of the test id, so a rerun maps the
+  # same test to the same shard. Branch protection requires both names.
+  conformance:
+    name: conformance (${{ matrix.shard }}/2)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      # Both shards must report their own result: fail-fast would cancel the
+      # sibling and hide which half of the suite actually failed.
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
+        with:
+          cache: false
+          build-warnings: ''
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: v3-linux-ci
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: false
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
+        with:
+          tool: nextest@0.9.152
+      - name: conformance shard ${{ matrix.shard }}/2
+        run: cargo nextest run -p tests-conformance --partition hash:${{ matrix.shard }}/2
+
+  # Unpublished crate: no crates.io baseline exists, so compare the PR delta
+  # against its base instead (merge-base semantics for push and merge_group).
+  # Test suites are not versioned API surfaces (FR-003f), so they are excluded
+  # from the check.
+  semver:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
+        with:
+          cache: false
+          build-warnings: ''
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: v3-linux-ci
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: false
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
+        with:
+          tool: cargo-semver-checks@0.51.0
+      - name: semver-checks (git baseline)
+        run: |
+          BASE="${{ github.event.pull_request.base.sha }}"
+          [ -z "$BASE" ] && BASE="$(git merge-base HEAD HEAD~1 2>/dev/null || echo HEAD~1)"
+          cargo semver-checks --baseline-rev "$BASE" --exclude tests-conformance --exclude tests-chains
 
   # T7 story 16: Windows gate leg running the native subset, so
   # Windows-only linkage/permission/keyring failures surface on PRs instead
@@ -122,14 +259,20 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          key: v2-pruned-windows
-      - uses: taiki-e/install-action@v2
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         with:
-          tool: nextest@0.9.145
+          cache: false
+          build-warnings: ''
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: v3-windows
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
+        with:
+          tool: nextest@0.9.152
       - name: clippy (windows)
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: unit + contract tests (windows)
@@ -141,16 +284,27 @@ jobs:
   # it cannot silently rot. Windows MSVC/MinGW link paths in
   # examples/c-abi-consumer/main.go are documented but not CI-gated.
   go-consumer:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
+        with:
+          cache: false
+          build-warnings: ''
+      # Cached so the release-profile FFI lib is not rebuilt from scratch on
+      # every PR that touches the sample.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: v3-go
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: build FFI release libs
         run: cargo build -p qcore-ffi --release
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: examples/c-abi-consumer/go.mod
       - name: run Go C-ABI consumer (mock transport, offline)

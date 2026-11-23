@@ -48,26 +48,34 @@ jobs:
           - target: aarch64-pc-windows-msvc
             runner: windows-11-arm
           - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-22.04
+            runner: ubuntu-24.04
           - target: i686-unknown-linux-gnu
-            runner: ubuntu-22.04
+            runner: ubuntu-24.04
           - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-22.04
+            runner: ubuntu-24.04
           - target: armv7-unknown-linux-gnueabihf
-            runner: ubuntu-22.04
+            runner: ubuntu-24.04
           - target: aarch64-linux-android
-            runner: ubuntu-22.04
+            runner: ubuntu-24.04
           - target: armv7-linux-androideabi
-            runner: ubuntu-22.04
+            runner: ubuntu-24.04
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # `cache: false`: Swatinem/rust-cache below owns the cache. `build-warnings:
+      # ''` clears the action's default CARGO_BUILD_WARNINGS=deny, which would
+      # fail a release leg on a warning that the gates job's clippy owns.
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
+        with:
+          cache: false
+          build-warnings: ''
       # Per-leg cache key: cargo artifacts under target/<triple> are
       # target-specific, so nine legs sharing one cache would thrash it and
       # restore foreign triples.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: release-${{ matrix.target }}
       # cross-rs is the linux-gnu backend. Docker is preinstalled on GitHub
@@ -76,35 +84,28 @@ jobs:
       - name: cache cross-rs
         if: contains(matrix.target, '-linux-gnu')
         id: cross-bin
-        uses: actions/cache@v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: "~/.cargo/bin/cross*"
           key: cross-${{ runner.os }}-${{ runner.arch }}-0.2.5
       - name: install cross-rs 0.2.5
         if: contains(matrix.target, '-linux-gnu') && steps.cross-bin.outputs.cache-hit != 'true'
         run: cargo install cross --version 0.2.5 --locked
-      # cargo-ndk is the android backend: NDK r23+ plus the target std on the
-      # rust-toolchain.toml channel (dtolnay/rust-toolchain's `targets:` would
-      # add it to `stable`, not to the pinned 1.97.1 channel).
-      # No android-actions/setup-android: it force-upgrades the preinstalled
-      # cmdline-tools and that sdkmanager download is flaky (the first dry
-      # run died there, exit 1, on both android legs). The ubuntu-22.04
-      # image ships a working sdkmanager (cmdline-tools 9.0) at
-      # $ANDROID_HOME/cmdline-tools/latest/bin — good enough for one NDK
-      # install; licensing is accepted non-interactively below.
-      - name: install Android NDK r27
+      # cargo-ndk is the android backend. No android-actions/setup-android and
+      # no sdkmanager install: the ubuntu-24.04 image ships cmdline-tools 12.0
+      # and NDK 27.3.13750724 under $ANDROID_HOME/ndk.
+      - name: pin Android NDK
         if: contains(matrix.target, 'android')
         run: |
-          # The image's sdkmanager lives under cmdline-tools/latest/bin and is
-          # not on PATH for raw run steps (android-actions/setup-android used
-          # to add it; we dropped that action for its flaky self-upgrade).
-          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
-          "$SDKM" --install "ndk;27.0.12077973" > /dev/null
-          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.0.12077973" >> "$GITHUB_ENV"
+          # cargo-ndk auto-detects the NEWEST NDK under $ANDROID_HOME/ndk when
+          # ANDROID_NDK_HOME is unset, so a future image adding NDK 29/30 would
+          # silently move the release to a different compiler. Pin the version
+          # this image ships.
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.3.13750724" >> "$GITHUB_ENV"
       - name: cache cargo-ndk
         if: contains(matrix.target, 'android')
         id: ndk-bin
-        uses: actions/cache@v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: "~/.cargo/bin/cargo-ndk*"
           key: cargo-ndk-${{ runner.os }}-${{ runner.arch }}-3.2.0
@@ -117,9 +118,8 @@ jobs:
       # (i686/aarch64 windows included, not just android). Installing from the
       # repo dir targets the pinned channel because the rust-toolchain.toml
       # directory override wins over the image's `rustup default`; on the host
-      # triple the command is a no-op. `dtolnay/rust-toolchain`'s `targets:`
-      # input would add std to `stable` instead of the pinned channel — do not
-      # move this back into that action.
+      # triple the command is a no-op. Keep the std install as its own step so
+      # it lands on the channel rust-toolchain.toml pins.
       - name: add target std (pinned toolchain)
         run: rustup target add ${{ matrix.target }}
       - name: build
@@ -134,39 +134,47 @@ jobs:
       # The archive is the only publish input from this leg: correct
       # provenance (built + packaged on the runner that proved the target),
       # not a linux-side native package standing in for another platform.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: qcore-${{ matrix.target }}
           path: |
             target/dist/qcore-*.zip
             target/dist/qcore-*.tar.gz
           if-no-files-found: error
+          # Artifacts are immutable: a re-run of this leg would otherwise 409
+          # on the artifact name it already uploaded.
+          overwrite: true
 
-  # CI gate for the tagged tree (tag AND dry-run). The matrix below proves
+  # CI gate for the tagged tree (tag AND dry-run). The matrix above proves
   # per-target artifacts; this job proves the source they were built from:
   # a v* tag must never publish from a commit that flunks the CI essentials.
-  # Same commands as ci.yml's gate minus `smoke` (each matrix leg runs the
-  # target smoke itself) — and INCLUDING cargo-deny, semver-checks,
-  # gitleaks and trufflehog: ci.yml triggers only on PRs and pushes to
-  # master, so a tag cut from another commit would otherwise publish code
-  # that never saw the supply dimension. Cache key matches ci.yml's gate so
-  # a tag push restores the PR run's artifacts instead of rebuilding.
+  # The checks mirror ci.yml's parallel jobs in aggregate (supply, clippy,
+  # test, conformance, semver), minus `smoke` — each release matrix leg runs
+  # its own target smoke. The full supply dimension (deny, semver, both secret
+  # scanners) runs here because tags and dispatches do not trigger ci.yml, so
+  # a tag cut from another commit would otherwise publish code that never saw
+  # it. The v2-pruned cache key belongs to this job alone: a tag run builds
+  # its own tree rather than restoring a PR run's artifacts.
   gates:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0 # abi-diff's committed-header check shells git
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
+        with:
+          cache: false
+          build-warnings: ''
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: v2-pruned
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
-          tool: nextest@0.9.145,cargo-deny@0.20.2,cargo-semver-checks@0.50.0
+          tool: nextest@0.9.152,cargo-deny@0.22.0,cargo-semver-checks@0.51.0
       - name: fmt
         run: cargo fmt --check
       # Supply gates first (no compiled tree needed): deny/notices fail in
@@ -185,12 +193,10 @@ jobs:
         run: cargo nextest run -p tests-conformance
       - name: C ABI diff
         run: cargo xtask abi-diff
-      # Tags and dispatches do not trigger ci.yml, so the full supply
-      # dimension runs here: deny, semver, and both secret scanners over the
-      # full tree/history.
-      # Same free-disk wipe as ci.yml's `free disk before semver baseline
-      # builds` step: the fmt/clippy/nextest/conformance target/ plus the
-      # dual baseline/current rustdoc builds exceed the ~14 GB runner limit.
+      # This single job still runs clippy + nextest + conformance before semver
+      # on ONE runner, so the wipe stays: after those builds, the dual
+      # baseline/current rustdoc builds would exceed the ~14 GB runner disk.
+      # CI's split jobs each start on a fresh disk and no longer need it.
       - name: free disk before semver baseline builds
         run: |
           cargo clean
@@ -204,35 +210,60 @@ jobs:
         run: rm -rf target/semver-checks
       - name: gitleaks (pinned CLI)
         run: |
-          curl -sSL -o /tmp/gitleaks.tar.gz https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
-          tar xzf /tmp/gitleaks.tar.gz -C /tmp && sudo install -m755 /tmp/gitleaks /usr/local/bin/
-          gitleaks detect --source . -v --exit-code=2
+          dl=/tmp/gitleaks-8.30.1
+          mkdir -p "$dl"
+          url=https://github.com/gitleaks/gitleaks/releases/download/v8.30.1
+          curl -sSfL -o "$dl/gitleaks_8.30.1_linux_x64.tar.gz" "$url/gitleaks_8.30.1_linux_x64.tar.gz"
+          curl -sSfL -o "$dl/gitleaks_8.30.1_checksums.txt" "$url/gitleaks_8.30.1_checksums.txt"
+          # Verify before install: the checksum file ships in the same release,
+          # so a swapped or truncated archive fails the step instead of
+          # running. --ignore-missing skips the other platforms' archives that
+          # the same file lists.
+          (cd "$dl" && sha256sum --check --ignore-missing gitleaks_8.30.1_checksums.txt)
+          tar xzf "$dl/gitleaks_8.30.1_linux_x64.tar.gz" -C "$dl"
+          sudo install -m755 "$dl/gitleaks" /usr/local/bin/
+          gitleaks detect --source . -v --redact --exit-code=2
       - name: secret scan (trufflehog git history)
         run: |
-          curl -sSL -o /tmp/trufflehog.tar.gz https://github.com/trufflesecurity/trufflehog/releases/download/v3.88.4/trufflehog_3.88.4_linux_amd64.tar.gz
-          tar xzf /tmp/trufflehog.tar.gz -C /tmp && sudo install -m755 /tmp/trufflehog /usr/local/bin/
+          dl=/tmp/trufflehog-3.100.0
+          mkdir -p "$dl"
+          url=https://github.com/trufflesecurity/trufflehog/releases/download/v3.100.0
+          curl -sSfL -o "$dl/trufflehog_3.100.0_linux_amd64.tar.gz" "$url/trufflehog_3.100.0_linux_amd64.tar.gz"
+          curl -sSfL -o "$dl/trufflehog_3.100.0_checksums.txt" "$url/trufflehog_3.100.0_checksums.txt"
+          (cd "$dl" && sha256sum --check --ignore-missing trufflehog_3.100.0_checksums.txt)
+          tar xzf "$dl/trufflehog_3.100.0_linux_amd64.tar.gz" -C "$dl"
+          sudo install -m755 "$dl/trufflehog" /usr/local/bin/
           trufflehog git "file://$(pwd)" --fail --no-update --only-verified
 
   # Finalize (tag AND dry-run): stage the nine per-target archives, write the
-  # full-graph SBOM + SHA256SUMS, cosign-sign keylessly. A dry run that skipped
-  # this would not prove the publish path, so it runs in both modes; it never
-  # touches a GitHub Release.
+  # full-graph SBOM + SHA256SUMS, cosign-sign keylessly and attest the result.
+  # A dry run that skipped this would not prove the publish path, so it runs
+  # in both modes; it never touches a GitHub Release.
   finalize:
     needs: [matrix, gates]
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
       contents: read
-      id-token: write # cosign keyless signing
+      id-token: write # cosign keyless signing + attestation provenance
+      attestations: write # actions/attest stores the build attestation
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # full tag history, like the gates checkout
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
+        with:
+          cache: false
+          build-warnings: ''
       # Cosign FIRST: finalize treats a missing cosign as a hard error and
-      # would fail the job before the signing step existed.
-      - uses: sigstore/cosign-installer@v3
+      # would fail the job before the signing step existed. v4 ships cosign
+      # v3, whose sign-blob emits a Sigstore bundle (`--bundle`); the
+      # installer version and xtask's command must stay in step.
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
       # Download every matrix leg's archive into one staging dir; the wildcard
       # keeps this step correct as the matrix grows.
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: staged-artifacts
           pattern: qcore-*
@@ -244,13 +275,24 @@ jobs:
         run: >-
           cargo xtask release
           --staged-artifacts staged-artifacts
-      # Hand the finalized set (archives + SBOM + SHA256SUMS + .sig) to the
-      # publish job, and keep it inspectable on a dry run.
-      - uses: actions/upload-artifact@v4
+      # GitHub-native SLSA Build L2 provenance over the same dist set. This
+      # complements the cosign keyless bundle (SHA256SUMS.sigstore.json):
+      # cosign proves who signed the checksums, while the attestation binds
+      # every artifact to this workflow run and commit in the repository's
+      # attestation store (`gh attestation verify`).
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: 'target/dist/*'
+      # Hand the finalized set (archives + SBOM + SHA256SUMS +
+      # SHA256SUMS.sigstore.json) to the publish job, and keep it inspectable
+      # on a dry run.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: qcore-finalized
           path: target/dist/*
           if-no-files-found: error
+          # Immutable artifacts: a re-run of finalize must replace, not 409.
+          overwrite: true
 
   # Publish (tag only): create the Release if the tag push did not, then upload
   # the finalized dist set. contents: write lives only here, so a dry run never
@@ -258,15 +300,20 @@ jobs:
   publish:
     needs: [finalize, gates]
     if: startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
+    # Repo admins must create this environment (Settings → Environments) and
+    # add required reviewers there: the tag job then waits for human approval
+    # before it can use the contents:write token below.
+    environment: release
     permissions:
       contents: write # GitHub release artifacts
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - uses: actions/download-artifact@v4
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: qcore-finalized
           path: target/dist

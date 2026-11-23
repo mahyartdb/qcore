@@ -5,7 +5,8 @@
 //! `qcore.h` + `abi-version.txt`), `SHA256SUMS`, `sbom-<ver>.cdx.json`
 //! (CycloneDX 1.5 over the FULL `cargo metadata` package graph — first-party
 //! plus every transitive crate, name+version, sorted deterministically; no
-//! extra tool needed), cosign keyless signatures (`.sig`).
+//! extra tool needed), cosign keyless signature bundles
+//! (`SHA256SUMS.sigstore.json`).
 //! The container format comes from the target's `delivery` field in
 //! `targets.toml` (`cli-zip` → zip, `cli-targz`/`termux-cli` → tar.gz); a
 //! package without the built CLI binary or the cdylib fails closed instead
@@ -849,7 +850,7 @@ pub fn package(args: Vec<String>) -> super::anyhow::Result<()> {
     // Keyless signatures when cosign is present; otherwise a loud stop.
     if shell_ok("cosign version") {
         if !shell_ok(&format!(
-            "cosign sign-blob --yes {}/SHA256SUMS --output-signature {}/SHA256SUMS.sig",
+            "cosign sign-blob --yes {}/SHA256SUMS --bundle {}/SHA256SUMS.sigstore.json",
             dist.display(),
             dist.display()
         )) {
@@ -1050,7 +1051,7 @@ fn sign_sums(dist: &Path, probe: &mut dyn FnMut(&str) -> bool) -> Result<(), Str
         );
     }
     if !probe(&format!(
-        "cosign sign-blob --yes {}/SHA256SUMS --output-signature {}/SHA256SUMS.sig",
+        "cosign sign-blob --yes {}/SHA256SUMS --bundle {}/SHA256SUMS.sigstore.json",
         dist.display(),
         dist.display()
     )) {
@@ -1835,7 +1836,7 @@ jobs:
             "error names the missing dependency: {err}"
         );
         assert!(
-            !dist.join("SHA256SUMS.sig").exists(),
+            !dist.join("SHA256SUMS.sigstore.json").exists(),
             "no signature file on the failure path"
         );
         let _ = std::fs::remove_dir_all(&base);

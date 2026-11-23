@@ -1,6 +1,8 @@
 # Weekly maintenance PRs (capped). cargo bumps must keep
 # `cargo deny --config denylist.toml check` green: deny pins exact
 # duplicate-version lines, so each bump PR re-adjudicates or drops skips.
+# Minor+patch land as one PR per ecosystem so a batch of routine bumps does not
+# consume the five-PR budget; majors stay individual because they need review.
 version: 2
 updates:
   - package-ecosystem: cargo
@@ -8,8 +10,32 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    commit-message:
+      prefix: deps
+    # Security updates ignore cooldown; this only delays routine bumps, so a
+    # release pulled minutes ago cannot land before its yank window closes.
+    cooldown:
+      default-days: 3
+    groups:
+      cargo-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    commit-message:
+      prefix: deps
+    cooldown:
+      default-days: 3
+    groups:
+      actions-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch

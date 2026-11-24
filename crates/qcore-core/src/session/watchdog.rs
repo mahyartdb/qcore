@@ -3425,7 +3425,10 @@ mod tests {
         );
         // Our own lock still stamps fine.
         let lock2 = SessionLock::acquire(&dirs).expect_err("the lock is still held");
-        assert!(lock2.contains("session.lock"), "{lock2}");
+        assert!(
+            lock2.contains("session lock is held"),
+            "names the held lock in the contract wording: {lock2}"
+        );
         std::fs::write(
             session_lock_path(&dirs),
             format!("{}\ns-mine", lock.token()),

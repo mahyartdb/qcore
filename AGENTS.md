@@ -2,6 +2,23 @@
 
 Rust workspace (edition 2021, pinned toolchain `1.97.1` via `rust-toolchain.toml`). Multi-protocol VPN tunnel core: engine + plugin transports + CLI + C/JNI FFI.
 
+## A note from Mahyar
+
+I like ambitious ideas, simple systems, and software that feels obvious. Do not preserve complexity just because it already exists. Do not introduce machinery because it looks architecturally impressive. Understand the real constraint, then fight for the smallest model that makes the correct behavior unsurprising. Channel both "measure twice, cut once" and yagni. Fight scope creep. Honor the dev's intent in a minimal and realistic fashion.
+
+qcore's edge is the data plane: per-packet pumps, scan loops, session rebuilds. A regression there is a bug, not a tradeoff — keep hot paths allocation-light, never put `std` locks on async paths, and treat fail-closed as the default posture, not a style.
+
+The rest of this document is good defaults, not hard rules. My preferences override anything here.
+
+## A small glossary
+
+We need to be on the same page with terminology. When communicating, use this language:
+
+- **you** means the agent reading this file and changing qcore.
+- **me, i, us** mean Mahyar and the people building qcore. These are who you are talking to now.
+- **user** means a person running `qcore` or embedding the engine through the FFI (an *embedder*).
+- **hop** is one transport leg; a **chain** is ordered hops whose last hop exits; a **session** is one running chain owned by the session lock; **profile dirs** are the on-disk state root.
+
 ## Commands (use these exact forms)
 
 - Local gate (fast CI subset): `cargo xtask ci` — runs `fmt --check` → `clippy --workspace --all-targets --all-features -- -D warnings` → `nextest --workspace --all-features --exclude tests-conformance` → `nextest -p tests-conformance` → `deny-sync` → `notices --check` → `abi-diff` → `smoke --target native`.
@@ -28,17 +45,44 @@ Rust workspace (edition 2021, pinned toolchain `1.97.1` via `rust-toolchain.toml
 - Transport impl rules: timeout on every dial/handshake/readiness path; `tokio::Mutex` may be held across await, `std` locks never on async paths; `HopFactory::build` must be cancellation-safe (engine races it with `timeout`; partial sockets/sidecars owned by the future, released on drop); parse boundary into typed configs, fail closed naming the field; bare `unwrap()` → `expect(reason)`; bind via `unspecified_bind(dst)`, never parse `"0.0.0.0:0"` literals. New `HopFactory` trait methods get defaults, never breaking.
 - Per-area conventions + fastest verify commands: `docs/rust-practices.md` (constitution wins on conflict).
 
+## Hit every surface
+
+The most common defect in this repo is a change that works on the path you tested and is missing everywhere else. Before calling CLI/engine work done, walk this list and say which entries applied:
+
+- **Output modes.** Text and `--json` are two contracts: exactly one JSON document vs `qcore: <msg> (exit N)` on stderr. Fixing one is not fixing the feature.
+- **Exit codes.** A new failure mode is a new exit-code decision — `contracts/cli.md` §2 is the source of truth; move the contract and the code in the same change.
+- **Redaction.** Every new message or field flows through every sink: stdout, stderr, exports, reports, verbose traces. The `secret_hygiene` conformance suite exists because this was missed once.
+- **Platforms.** Linux and Windows take different syscall paths for the same on-disk state (the held-lock wording diverged before the contract test caught it). Cross-platform wording is contract-pinned; keep both sides in step.
+- **FFI parity.** A CLI-visible behavior usually has an FFI/conformance twin (`qcore.h` symbols, `abi_consumer`); a knob the CLI validates must fail closed through the FFI too.
+- **Reverse states.** If you added a way in, add the way out and the way to see it: start needs stop, a scanned candidate needs a verdict, a stored record needs a converge path. A one-way door is a bug.
+- **Docs.** If the change makes `contracts/cli.md`, `docs/transport-authoring.md` or `docs/rust-practices.md` inaccurate, fix the doc in the same commit.
+
+## Branch names
+
+Use a short branch name of at most three words, separated by hyphens. Do not use slashes or type prefixes such as `feat/` or `fix/`.
+
+Examples: `session-lock-wording`, `add-musl-target`, `parallel-ci-gates`.
+
+## Commits and PR titles
+
+Use conventional commit-style messages and PR titles: `type(scope): summary`.
+
+Valid types are `feat`, `fix`, `docs`, `chore`, `refactor`, `test`, and `perf`. Scopes are optional; use the affected crate or area when helpful, e.g. `cli`, `session`, `ffi`, `ci`.
+
+Subject ≤ 50 characters, imperative. Blank line, body wrapped at 72, explaining what and why — the diff shows how. One logical change per commit; never amend; no AI attribution trailers.
+
 ## Release (do not improvise)
 
 - `xtask/src/targets.toml` is the 9-target contract (Windows MSVC native; Linux via cross-rs; Android via cargo-ndk; musl: future — no musl triple in targets.toml yet, the cargo-zigbuild backend exists for it in xtask/src/build.rs). Removing/demoting a target needs a constitution amendment.
-- `release.yml` runs all 9 contract targets on a tag push or a `workflow_dispatch` dry run: Windows native MSVC, linux-gnu via cross-rs 0.2.5, android via cargo-ndk 3.2.0 + NDK r27. Each leg runs `cargo xtask build|smoke|package --target <triple>` and uploads only its own archive; `finalize` signs the merged set, and `publish` is skipped unless `github.ref` is a tag. Coverage is parsed from that file at compile time and diffed both ways against `targets.toml`, so editing one side alone fails closed.
+- `release.yml` runs all 9 contract targets on a tag push or a `workflow_dispatch` dry run: Windows native MSVC, linux-gnu via cross-rs 0.2.5, android via cargo-ndk 3.2.0 + the image's NDK r27.3.13750724. Each leg runs `cargo xtask build|smoke|package --target <triple>` and uploads only its own archive; `finalize` signs the merged set, and `publish` is skipped unless `github.ref` is a tag. Coverage is parsed from that file at compile time and diffed both ways against `targets.toml`, so editing one side alone fails closed.
 - **Do not tag `v*`** until one green `workflow_dispatch` run of `release.yml` shows all nine legs building, smoking and packaging (it publishes nothing). `cargo xtask release` fails closed when `release.yml` and `targets.toml` disagree; `--allow-partial-matrix` only acknowledges a deliberately partial matrix.
-- Disk: CI wipes `target/` + registry cache before semver baseline builds (~14 GB runner limit) and prunes `target/semver-checks` after; replicate if adding heavy jobs.
+- Disk: `release.yml`'s gates job wipes `target/` + the registry cache before semver baseline builds (~14 GB runner limit; ci.yml's split jobs each get fresh disks and need no wipe) and prunes `target/semver-checks` after; replicate if adding heavy jobs.
 
 ## CI/CD process (2026-11 normalization)
 
 - Branch model: `main` is the only long-lived branch (`dev` and `master` are retired); PRs target `main`. Renaming or reshaping a CI job means updating branch protection's required checks in the same change.
 - Required checks on `main`: `supply`, `clippy`, `test`, `conformance (1/2)`, `conformance (2/2)`, `semver`, `gate-windows`, `go-consumer` — 1:1 with jobs in `.github/workflows/ci.yml`, so a rename must be paired with a GitHub settings change.
+- Branch protection enforcement: the 8 required checks + "require branches to be up to date" are on; required approving reviews are **0** and admin bypass is allowed (2026-11-24: the 1-review gate blocked the sole maintainer — an author cannot approve their own PR — so it was dropped). Do not reintroduce a review count while the repo has one maintainer.
 - Merge queue is not available on this repo: the rule is absent from both the branch-protection form and the rulesets UI on a personal Free account, and the REST ruleset API rejects `merge_queue`. Do not try to enable it by API or browser. "Require branches to be up to date" is on instead and gives the same never-break-main guarantee. `ci.yml` already listens on `merge_group`, so the queue works with no code change if the plan is upgraded.
 - Release gate: `publish` is gated by the `release` environment (required reviewer), and a `v*` tag ruleset blocks updates/deletions. Never tag until one green `workflow_dispatch` run of `release.yml` shows all nine targets building, smoking and packaging. These settings live in GitHub, not the repo.
 - Tool pins are load-bearing: `nextest-version = "0.9.150"` in `.config/nextest.toml` fails closed below that version, so every workflow installing nextest must use >= 0.9.150 (currently 0.9.152); cargo-deny 0.22.0 and cargo-semver-checks 0.51.0 must match across `ci.yml` and `release.yml`. All `uses:` are SHA-pinned with trailing `# vX.Y.Z` comments so Dependabot can still update them — keep the comments.
@@ -48,3 +92,28 @@ Rust workspace (edition 2021, pinned toolchain `1.97.1` via `rust-toolchain.toml
 - Local gates: `cargo xtask ci` (fmt, clippy, nextest, conformance, deny-sync, notices, abi-diff, smoke) plus `cargo deny --config denylist.toml check`. The local `abi-diff` semver fallback fails on Windows/boringtun and is non-blocking by design; CI uses the pinned git baseline instead.
 - Scanner downloads: gitleaks and trufflehog tarballs must be checksum-verified against their same-release `*_checksums.txt` before install, in both the CI supply and release gates; keep findings redacted.
 - Dependabot: minor/patch updates are grouped per ecosystem with a 3-day cooldown (security updates exempt). SHA-pinned actions need their version comments to stay updatable.
+
+## Documentation
+
+Most code changes do not need a documentation change. Agents can read the code.
+
+- `docs/rust-practices.md` — per-area conventions and the fastest verify commands; the constitution wins on conflict.
+- `contracts/cli.md` — the CLI's wire contract (stdout/stderr shapes, exit codes); behavior and contract move together.
+- `docs/transport-authoring.md` — the 7 edit points for adding a transport.
+- Before adding a paragraph anywhere, ask what a maintainer would get wrong without it. If reading the relevant code answers the question, leave it out. When a documented decision or constraint changes, rewrite or remove the affected text — do not append another account of the new behavior.
+
+## Work artifacts
+
+Plans, hunt reports, and research notes exist while work is in flight and are consumed when it lands. They are working material, not records.
+
+- Never commit scratch notes, progress boards, or `.planning/`-style directories; keep temporary working material outside the worktree.
+- A landed outcome that leaves its board behind is not landed: git history keeps the full text.
+- Research that must outlive the work needs a distinct, durable reason to live in `docs/` — otherwise it does not get a file.
+
+## Taste
+
+- Complexity belongs at the transport boundary: the engine never matches on a transport kind, the facade stays pure re-exports, and orchestration logic has no business in a transport crate.
+- Fail closed and name the field. Errors say what failed, the likely cause at the caller's level, and the next step.
+- Comments say why: a constraint, an external quirk, or an invariant the code can't show. Don't restate names or signatures, narrate steps, or record history.
+- Don't verify with browsers or computer use unless I explicitly agree or request it. Security matters, but don't over-index it on maintainer-only or dev-mode paths.
+- If a rule here fights the task in front of you, say so loudly and get my sign-off before breaking it.
